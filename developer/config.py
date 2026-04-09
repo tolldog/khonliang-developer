@@ -112,7 +112,16 @@ class Config:
             raise ConfigError(f"config file not found: {config_path}")
 
         with open(config_path) as f:
-            data: dict[str, Any] = yaml.safe_load(f) or {}
+            data: Any = yaml.safe_load(f) or {}
+
+        # YAML can legally hold a top-level list, scalar, or null. Reject
+        # anything that is not a mapping with a clean ConfigError instead
+        # of letting ``data.get(...)`` raise AttributeError further down.
+        if not isinstance(data, dict):
+            raise ConfigError(
+                f"config file {config_path} must contain a YAML mapping at "
+                f"the top level (got {type(data).__name__})"
+            )
 
         config_dir = config_path.parent
 

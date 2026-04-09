@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -183,3 +182,18 @@ def test_load_example_config_file():
     assert config.bus.enabled is False
     assert config.researcher_mcp.transport == "stdio"
     assert "developer" in config.projects
+
+
+def test_load_rejects_non_mapping_yaml(tmp_path):
+    """YAML can hold a list/scalar at top level — must raise ConfigError, not AttributeError."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("- just a list\n- of items\n")
+    with pytest.raises(ConfigError, match="mapping at the top level"):
+        Config.load(cfg)
+
+
+def test_load_rejects_scalar_yaml(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("just a string\n")
+    with pytest.raises(ConfigError, match="mapping at the top level"):
+        Config.load(cfg)

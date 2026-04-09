@@ -102,6 +102,18 @@ class MilestoneChain:
     unresolved_links: list[str] = field(default_factory=list)
 
 
+class PathNotAllowedError(ValueError):
+    """Raised when a caller-supplied path falls outside configured project repos.
+
+    The developer MCP server is intended for trusted local use over stdio,
+    but the spec/milestone tools accept caller-supplied paths and would
+    otherwise read any file on disk. This guard limits reads to markdown
+    files inside the configured ``projects[*].repo`` set so an outside
+    caller cannot exfiltrate arbitrary files via path traversal or
+    absolute paths.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Reader
 # ---------------------------------------------------------------------------
@@ -121,12 +133,49 @@ class SpecReader:
         self._researcher = researcher
 
     # ------------------------------------------------------------------
+    # Path boundary
+    # ------------------------------------------------------------------
+
+    def _resolve_within_projects(self, path: str | Path) -> Path:
+        """Resolve a path and verify it's under a configured project repo.
+
+        Raises :class:`PathNotAllowedError` if ``path`` resolves outside
+        every ``projects[*].repo`` configured for this server. The check
+        runs after ``Path.resolve()`` so symlinks and ``..`` segments
+        cannot be used to escape.
+        """
+        resolved = Path(path).resolve()
+        for proj in self._projects.values():
+            try:
+                resolved.relative_to(proj.repo.resolve())
+                return resolved
+            except ValueError:
+                continue
+        raise PathNotAllowedError(
+            f"path {resolved} is not under any configured project repo "
+            f"({', '.join(sorted(self._projects)) or 'none'})"
+        )
+
+    # ------------------------------------------------------------------
     # Read
     # ------------------------------------------------------------------
 
     def read(self, path: str) -> DocContent:
-        """Passthrough to LocalDocReader.read() — keeps the seam thin."""
-        return self._reader.read(path)
+        """Read a spec/milestone markdown file.
+
+        The path is resolved against ``Path.resolve()`` and must land
+        under a configured project repo (``PathNotAllowedError`` otherwise),
+        and must end in ``.md``. Both checks fire before any filesystem
+        read so a malicious caller cannot probe for the existence of
+        arbitrary files.
+        """
+        resolved = self._resolve_within_projects(path)
+        if resolved.suffix.lower() != ".md":
+            raise PathNotAllowedError(
+                f"path {resolved} does not have a .md extension; SpecReader "
+                "only reads markdown files"
+            )
+        return self._reader.read(str(resolved))
 
     def summarize(self, path: str) -> SpecSummary:
         """Parse a spec/milestone file's bold-line metadata into a typed summary.
@@ -135,8 +184,11 @@ class SpecReader:
         from the body. The first ``# Title`` heading becomes ``title``.
         Unknown bold-line keys land in ``extras`` so callers can introspect
         without losing data.
+
+        Goes through :meth:`read` so the same path-boundary and
+        ``.md``-only checks apply.
         """
-        doc = self._reader.read(path)
+        doc = self.read(path)
         title = _extract_title(doc.text)
         meta = _parse_bold_metadata(doc.text)
 
@@ -198,11 +250,18 @@ class SpecReader:
         Acceptance #6 verifies the call path is exercised and the
         unresolved markers render correctly.
         """
-        milestone_doc = self._reader.read(path)
-        milestone_summary = self.summarize(path)
+        milestone_path = self._resolve_within_projects(path)
+        milestone_doc = self.read(str(milestone_path))
+        milestone_summary = self.summarize(str(milestone_path))
 
+        # Constrain link resolution to the same set of project repos that
+        # ``read`` allows, so a crafted milestone cannot use ``../`` or
+        # absolute markdown links to escape the workspace.
+        allowed_roots = [proj.repo.resolve() for proj in self._projects.values()]
         spec_paths, unresolved_links = _resolve_doc_links(
-            base=Path(path).resolve().parent, links=_find_md_links(milestone_doc.text)
+            base=milestone_path.parent,
+            links=_find_md_links(milestone_doc.text),
+            allowed_roots=allowed_roots,
         )
 
         # Use the strict FR pattern, not LocalDocReader's default — the
@@ -271,12 +330,18 @@ def _find_md_links(text: str) -> list[str]:
 
 
 def _resolve_doc_links(
-    base: Path, links: list[str]
+    base: Path,
+    links: list[str],
+    allowed_roots: list[Path],
 ) -> tuple[list[Path], list[str]]:
     """Resolve markdown link targets relative to ``base``.
 
     Returns ``(existing_paths, unresolved_link_strings)``. Duplicates are
-    collapsed; only paths that exist on disk land in ``existing_paths``.
+    collapsed; only paths that exist on disk **and** resolve to a location
+    inside one of ``allowed_roots`` land in ``existing_paths``. Links that
+    fail either check are reported in ``unresolved_link_strings`` so a
+    crafted markdown file cannot use ``../`` traversal or absolute paths
+    to escape the configured project repos.
     """
     seen: set[Path] = set()
     found: list[Path] = []
@@ -287,10 +352,24 @@ def _resolve_doc_links(
         if not clean:
             continue
         candidate = (base / clean).resolve()
-        if candidate.exists() and candidate.is_file():
-            if candidate not in seen:
-                seen.add(candidate)
-                found.append(candidate)
-        else:
+        if not (candidate.exists() and candidate.is_file()):
             missing.append(link)
+            continue
+        if not _is_under_any(candidate, allowed_roots):
+            missing.append(link)
+            continue
+        if candidate not in seen:
+            seen.add(candidate)
+            found.append(candidate)
     return found, missing
+
+
+def _is_under_any(path: Path, roots: list[Path]) -> bool:
+    """Return True if ``path`` is contained in any directory in ``roots``."""
+    for root in roots:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False

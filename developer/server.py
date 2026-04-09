@@ -29,6 +29,7 @@ from khonliang.mcp import (
 
 from developer.config import Config
 from developer.pipeline import Pipeline
+from developer.specs import PathNotAllowedError
 
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,8 @@ def create_developer_server(pipeline: Pipeline):
         try:
             doc = pipeline.specs.read(path)
             summary = pipeline.specs.summarize(path)
+        except PathNotAllowedError as e:
+            return f"error: {e}"
         except FileNotFoundError:
             return f"error: file not found: {path}"
         except OSError as e:
@@ -113,6 +116,8 @@ def create_developer_server(pipeline: Pipeline):
         """
         try:
             chain = await pipeline.specs.traverse_milestone(path)
+        except PathNotAllowedError as e:
+            return f"error: {e}"
         except FileNotFoundError:
             return f"error: file not found: {path}"
         except OSError as e:
