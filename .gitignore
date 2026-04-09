@@ -18,6 +18,10 @@ data/*.db
 data/*.db-shm
 data/*.db-wal
 
+# Local config — contains absolute, machine-specific paths.
+# Copy config.example.yaml to config.yaml and edit for your environment.
+config.yaml
+
 # Editor / OS noise
 .vscode/
 .idea/
