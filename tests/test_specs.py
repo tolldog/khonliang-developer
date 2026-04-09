@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from developer.specs import FR_ID_PATTERN
+from developer.specs import FR_ID_PATTERN, PathNotAllowedError
 from tests.conftest import MILESTONE_PATH, REPO_ROOT, SPEC_PATH
 
 
@@ -105,3 +105,79 @@ def test_fr_id_pattern_rejects_prose_identifiers():
     assert not re.search(FR_ID_PATTERN, "fr_id")
     assert not re.search(FR_ID_PATTERN, "fr_lifecycle")
     assert not re.search(FR_ID_PATTERN, "frontmatter")
+
+
+# ---------------------------------------------------------------------------
+# Path-boundary hardening (PR #1 review feedback)
+# ---------------------------------------------------------------------------
+
+
+def test_read_rejects_absolute_path_outside_projects(pipeline):
+    """Absolute paths outside any configured project repo must be rejected."""
+    with pytest.raises(PathNotAllowedError, match="not under any configured project"):
+        pipeline.specs.read("/etc/passwd")
+
+
+def test_read_rejects_traversal_escape(pipeline, tmp_path):
+    """``..``-based escapes from a project repo must be rejected after resolve()."""
+    # A path that looks like it's inside a project but resolves outside.
+    crafted = REPO_ROOT / "specs" / ".." / ".." / ".." / "etc" / "passwd"
+    with pytest.raises(PathNotAllowedError):
+        pipeline.specs.read(str(crafted))
+
+
+def test_read_rejects_non_markdown_extension(pipeline, tmp_path):
+    """SpecReader.read should refuse non-.md files even when they're in a project."""
+    # Drop a .txt file inside the developer repo (under specs/MS-01/) so it
+    # passes the project-boundary check but fails the .md check.
+    txt_path = REPO_ROOT / "specs" / "MS-01" / "_test_only.txt"
+    try:
+        txt_path.write_text("not a markdown file")
+        with pytest.raises(PathNotAllowedError, match="\\.md extension"):
+            pipeline.specs.read(str(txt_path))
+    finally:
+        txt_path.unlink(missing_ok=True)
+
+
+def test_read_accepts_legit_path_inside_project(pipeline):
+    """The happy path still works after the boundary check is in place."""
+    doc = pipeline.specs.read(str(SPEC_PATH))
+    assert doc.text  # actually read the file
+
+
+@pytest.mark.asyncio
+async def test_traverse_milestone_rejects_path_outside_projects(pipeline):
+    with pytest.raises(PathNotAllowedError):
+        await pipeline.specs.traverse_milestone("/etc/passwd")
+
+
+@pytest.mark.asyncio
+async def test_traverse_milestone_skips_links_outside_projects(pipeline, tmp_path):
+    """A crafted milestone with an outside-the-workspace link must drop it.
+
+    Stage a milestone file inside the developer repo whose only link is to
+    a markdown file outside any configured project. The traversal should
+    succeed but report the outside link as unresolved.
+    """
+    # Create an "outside" markdown file (in tmp_path, not under any project).
+    outside_md = tmp_path / "outside.md"
+    outside_md.write_text("# outside\n")
+
+    # Create a crafted milestone inside the developer project.
+    crafted_dir = REPO_ROOT / "milestones" / "_TEST_TRAVERSE"
+    crafted_dir.mkdir(parents=True, exist_ok=True)
+    crafted_path = crafted_dir / "milestone.md"
+    try:
+        crafted_path.write_text(
+            "# Test milestone\n\n"
+            f"**FR:** `fr_developer_28a11ce2`\n\n"
+            f"See [outside]({outside_md.as_posix()}) for details.\n"
+        )
+        chain = await pipeline.specs.traverse_milestone(str(crafted_path))
+        # The outside link must NOT appear in resolved specs.
+        assert all(str(outside_md) not in s.path for s in chain.specs)
+        # And it should be reported as unresolved instead.
+        assert any("outside" in link or str(outside_md) in link for link in chain.unresolved_links)
+    finally:
+        crafted_path.unlink(missing_ok=True)
+        crafted_dir.rmdir()
