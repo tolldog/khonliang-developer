@@ -1,0 +1,43 @@
+[project]
+name = "khonliang-developer"
+version = "0.1.0"
+description = "Development lifecycle MCP server — consumes the khonliang corpus to produce specs, milestones, FRs, worktrees, and dispatched work units"
+requires-python = ">=3.11"
+# Dependency pinning convention (MS-01):
+#
+#   - ``ollama-khonliang``  → pulled from github @main, mirroring researcher's
+#     pyproject. Same upstream package, same loose pin.
+#   - ``khonliang-researcher-lib``  → bare dependency name. RESOLVED VIA LOCAL
+#     EDITABLE INSTALL at /mnt/dev/ttoll/dev/khonliang-researcher-lib. This
+#     repo and researcher-lib are co-developed in the same monorepo-style
+#     workspace, so editable installs are the working pattern. The reference
+#     SHA recorded against MS-01 is in milestones/MS-01/milestone.md (Task 1
+#     "Decision recorded at branch-cut" block) and serves as the
+#     regression-debugging anchor — if tests start failing later, check
+#     whether researcher-lib has moved past that SHA.
+#
+# Bootstrap (in a fresh venv):
+#   pip install -e /mnt/dev/ttoll/dev/khonliang-researcher-lib -e .
+#
+# When researcher-lib eventually tags a release, this can switch to
+# ``khonliang-researcher-lib @ git+https://github.com/tolldog/khonliang-researcher-lib.git@<tag>``
+# without changing any developer code — the import surface stays the same.
+dependencies = [
+    "ollama-khonliang @ git+https://github.com/tolldog/ollama-khonliang.git@main",
+    "khonliang-researcher-lib",
+    "pyyaml>=6.0",
+    "mcp>=1.0.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+
+[project.scripts]
+khonliang-developer = "developer.server:main"
+
+[tool.setuptools.packages.find]
+include = ["developer*"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
