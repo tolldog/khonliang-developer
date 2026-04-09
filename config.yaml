@@ -1,0 +1,58 @@
+# khonliang-developer config — MS-01
+#
+# All path fields below are relative to this file's directory and are
+# resolved to absolute paths at load time by `developer.config.Config.load`.
+# Architectural isolation: `db_path` MUST point at developer's own SQLite
+# file. The pipeline refuses to start if any store opens a different DB.
+
+db_path: data/developer.db
+workspace_root: /mnt/dev/ttoll/dev
+prompts_dir: prompts
+
+# Projects developer manages. Each entry needs an absolute `repo` path and
+# an optional `specs_dir` (relative to the repo, defaults to "specs").
+projects:
+  developer:
+    repo: /mnt/dev/ttoll/dev/khonliang-developer
+    specs_dir: specs
+  researcher:
+    repo: /mnt/dev/ttoll/dev/khonliang-researcher
+    specs_dir: specs
+  researcher-lib:
+    repo: /mnt/dev/ttoll/dev/khonliang-researcher-lib
+    specs_dir: specs
+
+# ---------------------------------------------------------------------------
+# Forward-looking blocks: validated at load time, but no clients are
+# constructed in MS-01. See milestones/MS-01/milestone.md §Config block
+# shapes for the rationale and validation rules.
+# ---------------------------------------------------------------------------
+
+# MS-02 will populate these with Ollama model names for best-of-N spec
+# evaluation. MS-01 just validates that the keys are present.
+models:
+  summarizer: ""
+  extractor: ""
+  assessor: ""
+  idea_parser: ""
+  embedder: ""
+  reviewer: ""
+
+# MS-06 will flip enabled=true and connect to khonliang-bus. MS-01
+# refuses to start if enabled=true.
+bus:
+  url: http://localhost:8787
+  enabled: false
+
+# Stub for the ResearcherClient seam. MS-02 wires the real transport;
+# MS-01 just validates that the block exists with required keys.
+researcher_mcp:
+  transport: stdio
+  command: /mnt/dev/ttoll/dev/khonliang-researcher/.venv/bin/python
+  args:
+    - "-m"
+    - "researcher.server"
+    - "--config"
+    - "/mnt/dev/ttoll/dev/khonliang-researcher/config.yaml"
+  url: ""
+  timeout: 30

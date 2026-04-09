@@ -71,6 +71,7 @@ Tasks are ordered by dependency. Each one has a clear "done when" check. Tasks m
 - **`khonliang-researcher-lib` pinning strategy:** the 3 precondition primitives just landed and no tag exists yet. Approach:
   1. Before this task starts, check if `khonliang-researcher-lib` has been tagged (e.g. `v0.2.0`). If yes, pin to the tag in `pyproject.toml`.
   2. If no tag exists, pin to the merge commit SHA that landed `LocalDocReader`/`BaseIdeaParser`/`select_best_of_n`. The implementer captures the SHA in this milestone doc when the task starts.
+- **Decision recorded at branch-cut (2026-04-09):** No tag exists on `khonliang-researcher-lib`. Following researcher's monorepo pattern, `pyproject.toml` declares `khonliang-researcher-lib` as a bare dependency (resolved via local editable install at `/mnt/dev/ttoll/dev/khonliang-researcher-lib`). The reference SHA at branch-cut is `8672401a9b61b6b22bd297ded42b6c9731ddb949` (latest commit on `main`, includes the 3 primitives + Copilot review feedback). This SHA is the regression-debugging anchor — if MS-01 tests start failing later, check whether `khonliang-researcher-lib` has moved past this SHA.
 - **Done when:** `pip install -e .` succeeds in a fresh venv, `python -c "import developer"` works, and the dependency is pinned (tag or SHA, recorded here).
 
 ### 2. Config layer **[critical path]**
@@ -194,14 +195,14 @@ None blocking. Spec's two open questions (`ResearcherClient` transport, `develop
 
 Task 10 (smoke validation) ticks each box after manual verification against a running server. Each entry maps to its acceptance criterion in [`specs/MS-01/spec.md`](../../specs/MS-01/spec.md).
 
-- [ ] **#1** Repo structure: `pyproject.toml`, `developer/` package (server/pipeline/specs/researcher_client/config), `tests/`, `config.yaml`, `prompts/developer_guide.md`, `data/` directory
-- [ ] **#2** `python -m developer.server --config /mnt/dev/ttoll/dev/khonliang-developer/config.yaml` starts and exposes its tools
-- [ ] **#3** `Config.load()` resolves all relative path fields against config-file dir (verified by `tests/test_config.py` from non-cwd)
-- [ ] **#4** `developer_guide` registered via `add_guide()` AND exposed as `developer_guide()` MCP tool returning loaded markdown; catalog assertion in `tests/test_server.py`
-- [ ] **#5** `read_spec` parses `specs/MS-01/spec.md`, returns frontmatter + sections + FR ref `fr_developer_28a11ce2` in brief/full/compact
-- [ ] **#6** `traverse_milestone` walks milestone → specs → FRs; FR records come back `(unresolved)` because `ResearcherClient` is stubbed
-- [ ] **#7** `list_specs(project='developer')` discovers `specs/MS-01/spec.md` using `projects[developer].specs_dir` (no hardcoded `specs/`)
-- [ ] **#8** `health_check` reports DB path/size, `workspace_root` presence, `ResearcherClient` config validity; **no Ollama checks**
-- [ ] **#9** No file handles shared between developer and researcher: stores all point at `developer.db` (Task 5 unit assertion); optionally verified by `lsof` in Task 10
-- [ ] **#10** `pytest` passes — `test_config.py`, `test_specs.py`, `test_pipeline.py`, `test_server.py`, `test_researcher_client.py`
-- [ ] **#11** No bus integration, no eval pipeline, no FR lifecycle, no worktrees; `ResearcherClient` is interface-complete but stubbed
+- [x] **#1** Repo structure: `pyproject.toml`, `developer/` package (server/pipeline/specs/researcher_client/config), `tests/`, `config.yaml`, `prompts/developer_guide.md`, `data/` directory
+- [x] **#2** `python -m developer.server --config /mnt/dev/ttoll/dev/khonliang-developer/config.yaml` starts and exposes its tools
+- [x] **#3** `Config.load()` resolves all relative path fields against config-file dir (verified by `tests/test_config.py::test_load_resolves_relative_paths_against_config_dir` from non-cwd)
+- [x] **#4** `developer_guide` registered via `add_guide()` AND exposed as `developer_guide()` MCP tool returning loaded markdown; catalog assertion in `tests/test_server.py::test_catalog_lists_developer_guide`
+- [x] **#5** `read_spec` parses `specs/MS-01/spec.md`, returns frontmatter + sections + FR ref `fr_developer_28a11ce2` in brief/full/compact (compact: `path=...|fr=fr_developer_28a11ce2|sections=22|refs=1`)
+- [x] **#6** `traverse_milestone` walks milestone → specs → FRs; FR records come back `(unresolved)` because `ResearcherClient` is stubbed (verified by `tests/test_specs.py::test_traverse_milestone_resolves_frs_via_stub`)
+- [x] **#7** `list_specs(project='developer')` discovers `specs/MS-01/spec.md` using `projects[developer].specs_dir` (no hardcoded `specs/`)
+- [x] **#8** `health_check` reports DB path/size, `workspace_root` presence, `ResearcherClient` config validity; **no Ollama checks** (verified by `tests/test_server.py::test_health_check_skips_ollama_in_ms01`)
+- [x] **#9** No file handles shared between developer and researcher: stores all point at `developer.db` (`tests/test_pipeline.py::test_stores_are_isolated`). Belt-and-braces lsof check during smoke validation confirmed only `developer.db`/`developer.db-shm`/`developer.db-wal` were open and zero handles to `researcher.db`.
+- [x] **#10** `pytest` passes — 41/41 across `test_config.py` (12), `test_specs.py` (9), `test_pipeline.py` (4), `test_server.py` (10), `test_researcher_client.py` (6)
+- [x] **#11** No bus integration, no eval pipeline, no FR lifecycle, no worktrees; `ResearcherClient` is interface-complete but stubbed
