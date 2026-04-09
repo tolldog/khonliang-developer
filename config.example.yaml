@@ -1,25 +1,30 @@
-# khonliang-developer config — MS-01
+# khonliang-developer config — example template
 #
-# All path fields below are relative to this file's directory and are
-# resolved to absolute paths at load time by `developer.config.Config.load`.
-# Architectural isolation: `db_path` MUST point at developer's own SQLite
-# file. The pipeline refuses to start if any store opens a different DB.
+# Copy this file to config.yaml and edit the paths for your environment.
+# The actual config.yaml is git-ignored because it contains absolute,
+# machine-specific paths. Only this example template is committed.
+#
+# All path fields below are resolved against this file's directory at
+# load time by `developer.config.Config.load`. Architectural isolation:
+# `db_path` MUST point at developer's own SQLite file. The pipeline
+# refuses to start if any store opens a different DB.
 
 db_path: data/developer.db
-workspace_root: /mnt/dev/ttoll/dev
+workspace_root: /path/to/dev
 prompts_dir: prompts
 
-# Projects developer manages. Each entry needs an absolute `repo` path and
-# an optional `specs_dir` (relative to the repo, defaults to "specs").
+# Projects developer manages. Each entry needs an absolute `repo` path
+# and an optional `specs_dir` (relative to the repo, defaults to "specs").
+# Edit these to match your local checkout layout.
 projects:
   developer:
-    repo: /mnt/dev/ttoll/dev/khonliang-developer
+    repo: /path/to/khonliang-developer
     specs_dir: specs
   researcher:
-    repo: /mnt/dev/ttoll/dev/khonliang-researcher
+    repo: /path/to/khonliang-researcher
     specs_dir: specs
   researcher-lib:
-    repo: /mnt/dev/ttoll/dev/khonliang-researcher-lib
+    repo: /path/to/khonliang-researcher-lib
     specs_dir: specs
 
 # ---------------------------------------------------------------------------
@@ -46,13 +51,14 @@ bus:
 
 # Stub for the ResearcherClient seam. MS-02 wires the real transport;
 # MS-01 just validates that the block exists with required keys.
+# Edit `command` and `args` to point at your local researcher checkout.
 researcher_mcp:
   transport: stdio
-  command: /mnt/dev/ttoll/dev/khonliang-researcher/.venv/bin/python
+  command: /path/to/khonliang-researcher/.venv/bin/python
   args:
     - "-m"
     - "researcher.server"
     - "--config"
-    - "/mnt/dev/ttoll/dev/khonliang-researcher/config.yaml"
+    - "/path/to/khonliang-researcher/config.yaml"
   url: ""
   timeout: 30

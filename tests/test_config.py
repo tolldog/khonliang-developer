@@ -171,10 +171,15 @@ def test_load_rejects_unknown_transport(temp_config_file):
         Config.load(cfg)
 
 
-def test_load_real_config_file():
-    """The repo's actual config.yaml must always parse cleanly."""
-    real = Path(__file__).resolve().parent.parent / "config.yaml"
-    config = Config.load(real)
+def test_load_example_config_file():
+    """The committed config.example.yaml must always parse cleanly.
+
+    The real ``config.yaml`` is git-ignored (machine-specific paths), so
+    fresh clones only have ``config.example.yaml``. This test verifies
+    the example template stays valid against the schema as it evolves.
+    """
+    example = Path(__file__).resolve().parent.parent / "config.example.yaml"
+    config = Config.load(example)
     assert config.bus.enabled is False
     assert config.researcher_mcp.transport == "stdio"
     assert "developer" in config.projects
