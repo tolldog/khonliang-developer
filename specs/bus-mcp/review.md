@@ -107,7 +107,7 @@ This is conceptually clean but operationally complex:
 
 ### The single-MCP model has a discovery problem
 
-The architecture doc proposes Claude connects to one bus MCP that exposes all skills from all agents. With 46 researcher skills + 8 developer skills + future autostock skills, Claude's tool catalog could exceed 100 entries.
+The architecture doc proposes Claude connects to one bus MCP that exposes all skills from all agents. With 46 researcher skills + 8 developer skills + future private-app skills, Claude's tool catalog could exceed 100 entries.
 
 - **MCP-Zero** (in the corpus) and our own FR `fr_khonliang_a802360f` (Lazy MCP Tool Registration) address this: load tool schemas on-demand, not all at once. The bus MCP would need the same pattern — expose a compact catalog of agent capabilities, load full tool schemas only when Claude indicates intent to use a skill.
 
@@ -161,9 +161,9 @@ The architecture doc's skill registration (Layer 2) and collaborative skills (La
 - Natural task decomposition (leads decompose and delegate)
 - Fault containment (a specialist failure only affects its team, not the whole network)
 
-The architecture doc's model is flat — all agents are peers on the bus. For 2-3 agents this is fine. For autostock's 6 specialists + researcher + developer + future agents, a flat model means O(N²) potential interactions.
+The architecture doc's model is flat — all agents are peers on the bus. For 2-3 agents this is fine. For private-app's 6 specialists + researcher + developer + future agents, a flat model means O(N²) potential interactions.
 
-**Recommendation:** The bus's team concept (§Agent Registration Layer 3) is already a partial answer — teams group agents into units. Extend this to support hierarchical teams where a team lead agent routes requests to specialists. The lead is the only agent that appears in the outer catalog; specialists are internal to the team. This maps to autostock's natural structure: "autostock" as a team lead, with quant/risk/macro/sentiment/compliance/execution as specialists that the lead coordinates.
+**Recommendation:** The bus's team concept (§Agent Registration Layer 3) is already a partial answer — teams group agents into units. Extend this to support hierarchical teams where a team lead agent routes requests to specialists. The lead is the only agent that appears in the outer catalog; specialists are internal to the team. This maps to private-app's natural structure: "private-app" as a team lead, with quant/risk/macro/sentiment/compliance/execution as specialists that the lead coordinates.
 
 ### Proactive agents (not just reactive)
 
@@ -188,7 +188,7 @@ The architecture doc crystallizes several threads from today's session:
 | "Bus is the agreed-upon protocol, everything else is internal" | §Design principle: independent storage + MCP-to-MCP for narrow interfaces | Decided. Spec rev 2 adopted Architecture A. |
 | "Multiple services sharing the bus, not just two" | §Everything Is an Agent: bus as central nervous system | Decided. Informs all migration steps. |
 | "Recovery, not bypass when bus is down" | Not in doc | **Gap.** Should add a §Resilience section covering recovery runbook exposure via the bus MCP's initial handshake. |
-| "Autostock agents could migrate from monolith to bus" | §Agents Without Containers: "The summarizer isn't researcher's summarizer" | Implied. The autostock migration path should be explicit — same incremental approach as the 8-step migration, applied to autostock's 6 specialists. |
+| "Private-app agents could migrate from monolith to bus" | §Agents Without Containers: "The summarizer isn't researcher's summarizer" | Implied. The private-app migration path should be explicit — same incremental approach as the 8-step migration, applied to private-app's 6 specialists. |
 | "The spec review pipeline — local LLMs evaluate, Claude just codes" | §Context Distillation + §Dynamic Model Routing | Extends. The spec review pipeline is a specific instance of the general pattern: local LLMs handle evaluation, Claude handles implementation. The architecture doc generalizes this beyond specs to all agent work. |
 | "Every idea → research → FR → spec → milestone → implement" | Not in doc | **Gap.** The research-first workflow is a process, not an architecture feature. But it should be referenced as the intended usage pattern for the developer agent's collaborative skills. |
 
