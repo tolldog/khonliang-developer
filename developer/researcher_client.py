@@ -1,25 +1,24 @@
-"""Thin client wrapping researcher's data as remote objects.
+"""Client for calling researcher skills through the bus.
 
-This is the seam between developer and researcher per spec rev 2's
-Architecture A. MS-01 stubs every method so the call paths are exercised
-without any cross-app coupling. Real implementations land in:
+Replaces the MS-01 stub with real bus-backed calls. The developer
+agent never talks to researcher directly — all communication goes
+through the bus. This is the architectural seam from spec rev 2.
 
-- MS-02: ``get_paper_context`` (spec evaluation needs evidence)
-- MS-02/03: ``get_fr`` / ``list_frs`` (FR lifecycle needs FR records)
-- MS-03: ``update_fr_status`` (FR lifecycle status writes)
-- MS-06: bus-backed cache invalidation on top of all of the above
-
-The transport choice (MCP-to-MCP vs direct read) is deferred to MS-02.
-The stub is transport-agnostic so changing it later does not require
-touching any caller.
+When the bus isn't available (e.g., running developer standalone
+for local spec reading), the client falls back to returning empty
+results so local-only tools still work.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from developer.config import ResearcherMCPConfig
+import httpx
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -29,14 +28,7 @@ from developer.config import ResearcherMCPConfig
 
 @dataclass
 class FRRecord:
-    """A single feature request record as exposed to developer.
-
-    Mirrors the shape researcher stores in its ``KnowledgeStore``
-    (``Tier.DERIVED`` entries with ``"fr"`` and ``"target:<name>"`` tags,
-    status in ``entry.metadata["fr_status"]``). MS-01 never instantiates
-    one of these — the stub always returns ``None``. MS-02 will populate
-    them from real lookups.
-    """
+    """A single feature request record as exposed to developer."""
 
     fr_id: str
     title: str
@@ -53,41 +45,110 @@ class FRRecord:
 
 
 class ResearcherClient:
-    """MS-01 stub. Interface-complete; methods return placeholder values.
+    """Calls researcher skills through the bus.
 
-    The constructor accepts the parsed ``researcher_mcp`` config block but
-    does **not** open any connection. This guarantees that booting the
-    developer MCP server in MS-01 cannot accidentally reach into
-    researcher's storage or process — the architectural isolation from
-    spec rev 2 is enforced at the seam itself.
+    Uses the bus's ``/v1/request`` endpoint to route requests to the
+    researcher agent. The bus handles agent discovery, WebSocket routing,
+    retry, and tracing.
+
+    If the bus is unreachable, methods return empty/None results instead
+    of crashing — this lets local-only developer tools (read_spec,
+    list_specs) still work without the bus running.
     """
 
-    def __init__(self, config: ResearcherMCPConfig):
-        self._config = config
+    def __init__(self, bus_url: str, researcher_id: str = "researcher-primary"):
+        self.bus_url = bus_url.rstrip("/")
+        self.researcher_id = researcher_id
+        self._http = httpx.AsyncClient(timeout=30.0)
 
-    @property
-    def config(self) -> ResearcherMCPConfig:
-        return self._config
+    async def _request(self, operation: str, args: dict[str, Any] | None = None) -> dict:
+        """Send a request to the researcher agent via the bus."""
+        try:
+            r = await self._http.post(
+                f"{self.bus_url}/v1/request",
+                json={
+                    "agent_id": self.researcher_id,
+                    "operation": operation,
+                    "args": args or {},
+                    "timeout": 30,
+                },
+            )
+            data = r.json()
+            if "error" in data:
+                logger.warning("Researcher request %s failed: %s", operation, data["error"])
+                return {}
+            return data.get("result", {})
+        except Exception as e:
+            logger.warning("Bus unreachable for %s: %s", operation, e)
+            return {}
 
     async def get_fr(self, fr_id: str) -> FRRecord | None:
-        """Look up a single FR by ID. MS-01 stub: always returns None.
-
-        MS-02 wires this to either ``researcher.feature_requests`` over
-        MCP or a direct ``KnowledgeStore.get(fr_id)`` against researcher's
-        DB (transport TBD per spec §Open questions).
-        """
-        return None
+        """Look up a single FR by ID via researcher's knowledge_search."""
+        result = await self._request("knowledge_search", {
+            "query": fr_id,
+            "detail": "full",
+            "max_results": 1,
+        })
+        # Parse the researcher's response into an FRRecord
+        text = result.get("result", "") if isinstance(result, dict) else str(result)
+        if not text or fr_id not in text:
+            return None
+        # Best-effort parse from the text response
+        return FRRecord(
+            fr_id=fr_id,
+            title=fr_id,
+            target="",
+            priority="",
+            status="",
+            description=text,
+        )
 
     async def list_frs(self, target: str) -> list[FRRecord]:
-        """List all FRs for a target project. MS-01 stub: always returns []."""
-        return []
+        """List all FRs for a target project."""
+        result = await self._request("feature_requests", {
+            "target": target,
+            "detail": "brief",
+        })
+        text = result.get("result", "") if isinstance(result, dict) else str(result)
+        if not text or "No FRs" in text:
+            return []
+        # Parse FR lines: "fr_xxx | [priority] title -> target (status)"
+        records = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or not line.startswith("fr_"):
+                continue
+            parts = line.split(" | ", 1)
+            fr_id = parts[0].strip()
+            rest = parts[1] if len(parts) > 1 else ""
+            records.append(FRRecord(
+                fr_id=fr_id,
+                title=rest,
+                target=target,
+                priority="",
+                status="",
+                description=rest,
+            ))
+        return records
 
     async def get_paper_context(self, query: str, max_papers: int = 5) -> str:
-        """Build a paper-context string for spec evaluation. MS-01 stub: empty."""
-        return ""
+        """Build a paper-context string for spec evaluation."""
+        result = await self._request("paper_context", {
+            "query": query,
+            "detail": "full",
+        })
+        text = result.get("result", "") if isinstance(result, dict) else str(result)
+        return text
 
-    async def update_fr_status(self, fr_id: str, status: str) -> bool:
-        """Promote/demote an FR through its lifecycle. Not in MS-01."""
-        raise NotImplementedError(
-            "ResearcherClient.update_fr_status lands in MS-03 (FR lifecycle)"
-        )
+    async def update_fr_status(self, fr_id: str, status: str, notes: str = "") -> bool:
+        """Update an FR's lifecycle status via researcher."""
+        result = await self._request("update_fr_status", {
+            "fr_id": fr_id,
+            "status": status,
+            "notes": notes,
+        })
+        text = result.get("result", "") if isinstance(result, dict) else str(result)
+        return bool(text and "→" in text)
+
+    async def close(self) -> None:
+        await self._http.aclose()

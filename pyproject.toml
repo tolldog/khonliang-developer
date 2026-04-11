@@ -27,6 +27,7 @@ dependencies = [
     "khonliang-researcher-lib",
     "pyyaml>=6.0",
     "mcp>=1.0.0",
+    "khonliang-bus-lib",
 ]
 
 [project.optional-dependencies]

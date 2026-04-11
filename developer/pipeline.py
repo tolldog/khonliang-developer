@@ -77,7 +77,9 @@ class Pipeline:
         # up python identifiers like ``fr_status`` from prose. SpecReader's
         # FR_ID_PATTERN matches only ``fr_<target>_<8 hex chars>``.
         reader = LocalDocReader(reference_pattern=FR_ID_PATTERN)
-        researcher = ResearcherClient(config.researcher_mcp)
+        # Wire ResearcherClient through the bus (or fallback gracefully if bus is down)
+        bus_url = f"http://localhost:{config.bus.url.split(':')[-1]}" if config.bus.url else "http://localhost:8787"
+        researcher = ResearcherClient(bus_url=bus_url)
         specs = SpecReader(reader=reader, projects=config.projects, researcher=researcher)
 
         guide_text = _load_developer_guide(config.prompts_dir)

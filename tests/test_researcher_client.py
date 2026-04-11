@@ -1,47 +1,42 @@
-"""Tests for developer.researcher_client — MS-01 stub guarantees."""
+"""Tests for developer.researcher_client — bus-backed calls with graceful fallback."""
 
 from __future__ import annotations
 
 import pytest
 
-from developer.config import ResearcherMCPConfig
 from developer.researcher_client import FRRecord, ResearcherClient
 
 
 @pytest.fixture
 def client():
-    return ResearcherClient(
-        ResearcherMCPConfig(
-            transport="stdio", command="python", args=["-m", "researcher.server"]
-        )
-    )
+    """Client pointing at a non-existent bus — tests graceful fallback."""
+    return ResearcherClient(bus_url="http://localhost:1", researcher_id="researcher-test")
 
 
 @pytest.mark.asyncio
-async def test_get_fr_returns_none(client):
-    assert await client.get_fr("fr_developer_28a11ce2") is None
-    assert await client.get_fr("anything") is None
+async def test_get_fr_returns_none_when_bus_down(client):
+    """When bus is unreachable, get_fr returns None instead of crashing."""
+    result = await client.get_fr("fr_developer_28a11ce2")
+    assert result is None
 
 
 @pytest.mark.asyncio
-async def test_list_frs_returns_empty(client):
+async def test_list_frs_returns_empty_when_bus_down(client):
     assert await client.list_frs("developer") == []
-    assert await client.list_frs("anything") == []
 
 
 @pytest.mark.asyncio
-async def test_get_paper_context_returns_empty_string(client):
-    assert await client.get_paper_context("foo") == ""
-    assert await client.get_paper_context("foo", max_papers=10) == ""
+async def test_get_paper_context_returns_empty_when_bus_down(client):
+    assert await client.get_paper_context("consensus") == ""
 
 
 @pytest.mark.asyncio
-async def test_update_fr_status_raises_not_implemented(client):
-    with pytest.raises(NotImplementedError, match="MS-03"):
-        await client.update_fr_status("fr_developer_28a11ce2", "planned")
+async def test_update_fr_status_returns_false_when_bus_down(client):
+    result = await client.update_fr_status("fr_x_12345678", "planned")
+    assert result is False
 
 
-def test_fr_record_dataclass_has_all_fields():
+def test_fr_record_dataclass():
     record = FRRecord(
         fr_id="fr_x_12345678",
         title="t",
@@ -54,9 +49,7 @@ def test_fr_record_dataclass_has_all_fields():
     assert record.metadata == {}
 
 
-def test_constructor_does_not_open_connection(client):
-    """MS-01 guarantee: ResearcherClient construction is purely structural."""
-    # If the constructor opened a connection, we'd have a side effect to
-    # tear down here. The fact that this fixture builds cleanly without
-    # any cleanup is the test.
-    assert client.config.transport == "stdio"
+def test_client_construction():
+    c = ResearcherClient(bus_url="http://localhost:8788")
+    assert c.bus_url == "http://localhost:8788"
+    assert c.researcher_id == "researcher-primary"

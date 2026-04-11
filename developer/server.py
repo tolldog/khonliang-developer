@@ -174,20 +174,14 @@ def create_developer_server(pipeline: Pipeline):
         db_path = Path(pipeline.config.db_path)
         db_size = db_path.stat().st_size if db_path.exists() else 0
         workspace = pipeline.config.workspace_root
-        rc = pipeline.researcher.config
-        rc_ok = bool(
-            rc.transport in ("stdio", "http")
-            and (rc.command if rc.transport == "stdio" else rc.url)
-        )
         lines = [
             f"db: {db_path} ({db_size:,} bytes)",
             f"workspace_root: {workspace} ({'ok' if workspace.exists() else 'MISSING'})",
             f"prompts_dir: {pipeline.config.prompts_dir} "
             f"({'ok' if pipeline.config.prompts_dir.exists() else 'MISSING'})",
             f"projects: {len(pipeline.config.projects)} configured",
-            f"researcher_mcp: transport={rc.transport} "
-            f"{'ok' if rc_ok else 'MISCONFIGURED'} (stub — no connection in MS-01)",
-            f"bus: enabled={pipeline.config.bus.enabled} (MS-06)",
+            f"researcher: bus_url={pipeline.researcher.bus_url}",
+            f"bus: url={pipeline.config.bus.url}",
             "models: parsed but unused (MS-02)",
         ]
         return "\n".join(lines)
