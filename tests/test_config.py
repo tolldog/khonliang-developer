@@ -133,11 +133,12 @@ def test_load_requires_bus_block(temp_config_file):
         Config.load(cfg)
 
 
-def test_load_refuses_bus_enabled_true(temp_config_file):
-    """MS-01 must refuse enabled=true so no client is constructed."""
+def test_load_accepts_bus_enabled_true(temp_config_file):
+    """bus.enabled=True is now valid — the bus URL is used for ResearcherClient."""
     cfg = temp_config_file({"bus": {"url": "http://x", "enabled": True}})
-    with pytest.raises(ConfigError, match="enabled.*MS-06"):
-        Config.load(cfg)
+    config = Config.load(cfg)
+    assert config.bus.enabled is True
+    assert config.bus.url == "http://x"
 
 
 def test_load_requires_researcher_mcp_block(temp_config_file):

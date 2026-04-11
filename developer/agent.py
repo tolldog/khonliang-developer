@@ -56,11 +56,7 @@ def create_developer_agent(
     except Exception:
         agent.version = "0.1.0"
 
-    logger.info(
-        "Developer agent %s created with %d skills",
-        agent_id,
-        len(agent.register_skills()),
-    )
+    logger.info("Developer agent %s created", agent_id)
 
     return agent
 

@@ -11,7 +11,6 @@ results so local-only tools still work.
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -73,6 +72,7 @@ class ResearcherClient:
                     "timeout": 30,
                 },
             )
+            r.raise_for_status()
             data = r.json()
             if "error" in data:
                 logger.warning("Researcher request %s failed: %s", operation, data["error"])
@@ -136,6 +136,7 @@ class ResearcherClient:
         result = await self._request("paper_context", {
             "query": query,
             "detail": "full",
+            "max_results": max_papers,
         })
         text = result.get("result", "") if isinstance(result, dict) else str(result)
         return text

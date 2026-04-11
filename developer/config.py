@@ -4,9 +4,9 @@ Mirrors khonliang-researcher's config-loading pattern (load YAML, resolve
 relative paths against the config-file directory, write resolved values
 back) and adds typed dataclass wrappers for the structured blocks.
 
-MS-01 validates the forward-looking ``models``, ``bus`` and ``researcher_mcp``
-blocks but does not construct any clients from them — those land in MS-02
-(models), MS-02/03 (researcher_mcp), and MS-06 (bus).
+Validates ``models``, ``bus`` and ``researcher_mcp`` config blocks.
+The bus URL is used by :class:`~developer.researcher_client.ResearcherClient`
+to reach the researcher agent; model construction lands in MS-02.
 """
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ class ModelsConfig:
 
 @dataclass
 class BusConfig:
-    """khonliang-bus connection. Inert in MS-01 (enabled must be False)."""
+    """khonliang-bus connection settings."""
 
     url: str = "http://localhost:8787"
     enabled: bool = False
@@ -216,18 +216,13 @@ def _parse_models(block: Any) -> ModelsConfig:
 def _parse_bus(block: Any) -> BusConfig:
     if block is None:
         raise ConfigError(
-            "missing 'bus' block — MS-01 requires {url, enabled} to exist "
-            "(enabled must be false; bus integration lands in MS-06)"
+            "missing 'bus' block — requires {url, enabled} to exist"
         )
     if not isinstance(block, dict):
         raise ConfigError("'bus' must be a mapping")
     if "url" not in block or "enabled" not in block:
         raise ConfigError("'bus' block requires both 'url' and 'enabled' keys")
     enabled = bool(block["enabled"])
-    if enabled:
-        raise ConfigError(
-            "'bus.enabled' must be false in MS-01; bus integration lands in MS-06"
-        )
     return BusConfig(url=str(block["url"]), enabled=enabled)
 
 
