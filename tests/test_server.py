@@ -149,7 +149,7 @@ async def test_health_check_skips_ollama_in_ms01(mcp):
 
     assert "db:" in text
     assert "workspace_root" in text
-    assert "researcher_mcp" in text
+    assert "researcher:" in text
     assert "models: parsed but unused (MS-02)" in text
 
     # Check the non-db lines for Ollama-style markers — skip the first
