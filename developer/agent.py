@@ -9,7 +9,7 @@ exposes cross-agent workflows as single tools.
 
 Usage::
 
-    python -m developer.agent --id developer-primary --bus http://localhost:8788 --config config.yaml
+    python -m developer.agent --id developer-primary --bus http://localhost:8787 --config config.yaml
 """
 
 from __future__ import annotations
@@ -55,10 +55,10 @@ class DeveloperAgent(BaseAgent):
                   {"path": {"type": "string", "required": True}, "detail": {"type": "string", "default": "brief"}},
                   since="0.1.0"),
             Skill("list_specs", "Discover spec files for a project",
-                  {"project": {"type": "string", "required": True}, "detail": {"type": "string", "default": "brief"}},
+                  {"project": {"type": "string", "required": True}},
                   since="0.1.0"),
             Skill("traverse_milestone", "Walk milestone → specs → FRs with evidence chain",
-                  {"path": {"type": "string", "required": True}, "detail": {"type": "string", "default": "brief"}},
+                  {"path": {"type": "string", "required": True}},
                   since="0.1.0"),
             Skill("health_check", "DB, workspace, researcher connection status",
                   since="0.1.0"),
@@ -169,13 +169,19 @@ class DeveloperAgent(BaseAgent):
 
     @handler("health_check")
     async def handle_health_check(self, args):
-        config = self.pipeline.config
-        db_path = Path(config.db_path)
+        try:
+            config = self.pipeline.config
+            db_path = Path(config.db_path)
+            db_size = db_path.stat().st_size if db_path.exists() else 0
+            workspace_ok = config.workspace_root.exists()
+        except Exception as e:
+            await self.report_gap("health_check", f"Failed to check health: {e}")
+            raise
         return {
             "db_path": str(db_path),
-            "db_size_bytes": db_path.stat().st_size if db_path.exists() else 0,
+            "db_size_bytes": db_size,
             "workspace_root": str(config.workspace_root),
-            "workspace_exists": config.workspace_root.exists(),
+            "workspace_exists": workspace_ok,
             "projects": len(config.projects),
             "bus_url": self.bus_url,
             "agent_id": self.agent_id,
