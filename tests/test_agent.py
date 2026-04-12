@@ -7,15 +7,9 @@ from khonliang_bus.testing import AgentTestHarness
 from developer.agent import DeveloperAgent
 
 
-REPO_ROOT = __import__("pathlib").Path(__file__).resolve().parent.parent
-# Use config.yaml if it exists (local dev), fall back to config.example.yaml (fresh clone)
-_cfg = REPO_ROOT / "config.yaml"
-CONFIG_PATH = str(_cfg if _cfg.exists() else REPO_ROOT / "config.example.yaml")
-
-
 @pytest.fixture
-def harness():
-    return AgentTestHarness(DeveloperAgent, config_path=CONFIG_PATH)
+def harness(temp_config_file):
+    return AgentTestHarness(DeveloperAgent, config_path=str(temp_config_file()))
 
 
 # -- skills --
