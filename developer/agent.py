@@ -37,17 +37,14 @@ class DeveloperAgent(BaseAgent):
         except Exception:
             self.version = "0.1.0"
 
-    def _get_pipeline(self):
+    @property
+    def pipeline(self):
         if self._pipeline is None:
             from developer.config import Config
             from developer.pipeline import Pipeline
             config = Config.load(self.config_path)
             self._pipeline = Pipeline.from_config(config)
         return self._pipeline
-
-    @property
-    def pipeline(self):
-        return self._get_pipeline()
 
     def register_skills(self):
         return [

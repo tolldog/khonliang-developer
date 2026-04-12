@@ -115,6 +115,24 @@ async def test_read_spec_returns_dict(harness):
     assert isinstance(result["references"], list)
 
 
+@pytest.mark.asyncio
+async def test_read_spec_full_detail(harness):
+    """detail='full' adds 'text' key with the raw markdown body."""
+    from tests.conftest import SPEC_PATH
+    result = await harness.call("read_spec", {"path": str(SPEC_PATH), "detail": "full"})
+    assert "text" in result
+    assert isinstance(result["text"], str)
+    assert len(result["text"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_read_spec_brief_detail_omits_text(harness):
+    """default (brief) detail does not include the raw body."""
+    from tests.conftest import SPEC_PATH
+    result = await harness.call("read_spec", {"path": str(SPEC_PATH)})
+    assert "text" not in result
+
+
 # -- registration --
 
 def test_registration_metadata(harness):
