@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import sys
 from pathlib import Path
 
@@ -32,6 +31,11 @@ class DeveloperAgent(BaseAgent):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._pipeline = None  # lazy init
+        try:
+            from importlib.metadata import version
+            self.version = version("khonliang-developer")
+        except Exception:
+            self.version = "0.1.0"
 
     def _get_pipeline(self):
         if self._pipeline is None:
@@ -46,12 +50,6 @@ class DeveloperAgent(BaseAgent):
         return self._get_pipeline()
 
     def register_skills(self):
-        try:
-            from importlib.metadata import version
-            self.version = version("khonliang-developer")
-        except Exception:
-            self.version = "0.1.0"
-
         return [
             Skill("read_spec", "Parse a spec file — metadata, sections, FR references",
                   {"path": {"type": "string", "required": True}, "detail": {"type": "string", "default": "brief"}},
@@ -98,16 +96,15 @@ class DeveloperAgent(BaseAgent):
     async def handle_read_spec(self, args):
         path = args.get("path", "")
         detail = args.get("detail", "brief")
-        response_mode = args.get("response_mode", "raw")
 
         try:
             doc = self.pipeline.specs.read(path)
             summary = self.pipeline.specs.summarize(path)
         except Exception as e:
-            await self.report_gap("read_spec", f"Failed to read {path}: {e}")
+            await self.report_gap("read_spec", f"Failed to read or summarize {path}: {e}")
             raise
 
-        return {
+        result = {
             "path": doc.path,
             "title": summary.title,
             "fr": summary.fr,
@@ -117,13 +114,19 @@ class DeveloperAgent(BaseAgent):
             "sections": list(doc.sections.keys()),
             "references": doc.references,
             "section_count": len(doc.sections),
-            "text": doc.text if detail == "full" or response_mode == "raw" else None,
         }
+        if detail == "full":
+            result["text"] = doc.text
+        return result
 
     @handler("list_specs")
     async def handle_list_specs(self, args):
         project = args.get("project", "")
-        specs = self.pipeline.specs.list_specs(project)
+        try:
+            specs = self.pipeline.specs.list_specs(project)
+        except Exception as e:
+            await self.report_gap("list_specs", f"Failed to list specs for {project}: {e}")
+            raise
         return {
             "project": project,
             "count": len(specs),
