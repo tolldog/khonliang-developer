@@ -15,7 +15,7 @@ def harness(temp_config_file):
 # -- skills --
 
 def test_skill_count(harness):
-    assert len(harness.skills) == 8
+    assert len(harness.skills) == 10
 
 
 def test_skills_registered(harness):
@@ -23,6 +23,7 @@ def test_skills_registered(harness):
         "read_spec", "list_specs", "traverse_milestone",
         "health_check", "developer_guide",
         "get_fr", "list_frs", "get_paper_context",
+        "next_work_unit", "work_units",
     }
     assert harness.skill_names == expected
 
@@ -154,5 +155,67 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 8
+    assert len(reg.skills) == 10
     assert len(reg.collaborations) == 2
+
+
+# -- cluster parsing + ranking --
+
+def test_parse_clusters():
+    from developer.agent import DeveloperAgent
+    agent = DeveloperAgent(agent_id="test", bus_url="http://x", config_path="")
+    text = """# FR Clusters (3 clusters, 10 FRs)
+
+## Cluster 1 (4 FRs, targets: khonliang,developer)
+  [fr_a_12345678] Implement AutoGen Framework → khonliang [high]
+  [fr_b_12345678] Build Developer AutoGen → developer [high]
+  [fr_c_12345678] Create Template → developer [medium]
+  [fr_d_12345678] Domain Agents → developer [medium]
+
+## Cluster 2 (3 FRs, targets: khonliang)
+  [fr_e_12345678] EvoAgent Generation → khonliang [high]
+  [fr_f_12345678] EvoAgent Optimization → khonliang [medium]
+  [fr_g_12345678] Dynamic Optimization → khonliang [medium]
+
+## Cluster 3 (3 FRs, targets: khonliang)
+  [fr_h_12345678] GRA Framework → khonliang [high]
+  [fr_i_12345678] GRA Collaborative → khonliang [medium]
+  [fr_j_12345678] GRA Synthesis → khonliang [medium]
+"""
+    units = agent._parse_and_rank_clusters(text, "developer")
+    assert len(units) == 3
+    # Cluster 1 should rank highest: same max priority (high), largest (4), most targets (2), matches target
+    assert units[0]["size"] == 4
+    assert "developer" in units[0]["targets"]
+    assert units[0]["rank"] == 1
+
+
+def test_parse_clusters_ranks_by_priority():
+    from developer.agent import DeveloperAgent
+    agent = DeveloperAgent(agent_id="test", bus_url="http://x", config_path="")
+    text = """## Cluster 1 (2 FRs, targets: khonliang)
+  [fr_a_12345678] Low thing → khonliang [low]
+  [fr_b_12345678] Low thing 2 → khonliang [low]
+
+## Cluster 2 (2 FRs, targets: khonliang)
+  [fr_c_12345678] High thing → khonliang [high]
+  [fr_d_12345678] Medium thing → khonliang [medium]
+"""
+    units = agent._parse_and_rank_clusters(text, "")
+    assert units[0]["max_priority"] == "high"
+    assert units[1]["max_priority"] == "low"
+
+
+def test_parse_empty_clusters():
+    from developer.agent import DeveloperAgent
+    agent = DeveloperAgent(agent_id="test", bus_url="http://x", config_path="")
+    units = agent._parse_and_rank_clusters("No clusters found", "")
+    assert units == []
+
+
+def test_work_units_skill_exists(harness):
+    harness.assert_skill_exists("work_units")
+
+
+def test_next_work_unit_skill_exists(harness):
+    harness.assert_skill_exists("next_work_unit")

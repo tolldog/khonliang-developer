@@ -71,6 +71,15 @@ class DeveloperAgent(BaseAgent):
             Skill("get_paper_context", "Get research evidence for a query via researcher",
                   {"query": {"type": "string", "required": True}},
                   since="0.2.0"),
+            # Clustered FR work planning
+            Skill("next_work_unit", "Get the highest-ranked FR cluster as a work unit",
+                  {"target": {"type": "string", "default": ""},
+                   "threshold": {"type": "number", "default": 0.85}},
+                  since="0.2.0"),
+            Skill("work_units", "List all FR clusters ranked by importance",
+                  {"target": {"type": "string", "default": ""},
+                   "threshold": {"type": "number", "default": 0.85}},
+                  since="0.2.0"),
         ]
 
     def register_collaborations(self):
@@ -241,6 +250,153 @@ class DeveloperAgent(BaseAgent):
             await self.report_gap("get_paper_context", f"Bus request failed for {query!r}: {e}")
             raise
         return (result and result.get("result")) or {"error": "no result from researcher"}
+
+    # -- clustered FR work planning --
+
+    @handler("work_units")
+    async def handle_work_units(self, args):
+        """Pull FR clusters from researcher, rank by aggregate importance."""
+        target = args.get("target", "")
+        threshold = args.get("threshold", 0.85)
+
+        # Get clusters from researcher via bus
+        try:
+            cluster_result = await self.request(
+                agent_type="researcher",
+                operation="cluster_frs",
+                args={"target": target, "threshold": threshold, "detail": "full"},
+            )
+        except Exception as e:
+            await self.report_gap("work_units", f"Failed to get clusters: {e}")
+            raise
+
+        cluster_text = ""
+        if cluster_result and cluster_result.get("result"):
+            r = cluster_result["result"]
+            cluster_text = r.get("result", "") if isinstance(r, dict) else str(r)
+
+        if not cluster_text or "No clusters" in cluster_text:
+            # Fall back to flat FR list
+            try:
+                fr_result = await self.request(
+                    agent_type="researcher",
+                    operation="feature_requests",
+                    args={"target": target, "detail": "full"},
+                )
+            except Exception:
+                return {"work_units": [], "source": "none", "error": "no clusters and no FRs available"}
+
+            return {
+                "work_units": [{"type": "flat", "description": "No clusters found — flat FR list",
+                                "frs": (fr_result and fr_result.get("result")) or {}}],
+                "source": "flat_list",
+            }
+
+        # Parse clusters from the text response
+        work_units = self._parse_and_rank_clusters(cluster_text, target)
+        return {
+            "work_units": work_units,
+            "source": "clusters",
+            "threshold": threshold,
+            "count": len(work_units),
+        }
+
+    @handler("next_work_unit")
+    async def handle_next_work_unit(self, args):
+        """Get the single highest-ranked work unit."""
+        result = await self.handle_work_units(args)
+        units = result.get("work_units", [])
+        if not units:
+            return {"error": "no work units available"}
+        return {
+            "work_unit": units[0],
+            "remaining": len(units) - 1,
+            "source": result.get("source", "unknown"),
+        }
+
+    def _parse_and_rank_clusters(self, cluster_text: str, target: str) -> list[dict]:
+        """Parse cluster_frs output and rank by aggregate importance.
+
+        Ranking signals (highest to lowest weight):
+          1. Cluster size (more FRs = more evidence of need)
+          2. Highest priority in the cluster
+          3. Number of targets touched (cross-cutting = higher value)
+          4. Whether any FRs mention the requested target
+        """
+        PRIORITY_SCORE = {"high": 3, "medium": 2, "low": 1}
+        clusters = []
+        current_cluster = None
+
+        for line in cluster_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            # Detect cluster headers like "## Cluster 1 (4 FRs, targets: khonliang,developer)"
+            # Skip summary lines like "# FR Clusters (3 clusters, 10 FRs)"
+            if "Cluster" in line and "FRs" in line and "clusters" not in line.lower():
+                if current_cluster:
+                    clusters.append(current_cluster)
+                # Extract size and targets from header
+                # Format: "## Cluster 1 (4 FRs, targets: khonliang,developer)"
+                size = 0
+                targets = set()
+                if "(" in line:
+                    meta = line.split("(", 1)[1].rstrip(")")
+                    # Size is before "FRs"
+                    import re
+                    size_match = re.search(r"(\d+)\s*FRs?", meta)
+                    if size_match:
+                        size = int(size_match.group(1))
+                    # Targets are after "targets:"
+                    if "targets:" in meta:
+                        targets_str = meta.split("targets:")[1].strip()
+                        targets = {t.strip() for t in targets_str.split(",") if t.strip()}
+                current_cluster = {
+                    "name": line.lstrip("#").strip(),
+                    "size": size,
+                    "targets": sorted(targets),
+                    "frs": [],
+                    "max_priority": "low",
+                }
+                continue
+
+            # Detect FR lines like "  [fr_xxx] Title → target [priority]"
+            if current_cluster and line.startswith("[fr_"):
+                fr_id = line.split("]")[0].lstrip("[")
+                rest = line.split("]", 1)[1].strip() if "]" in line else ""
+                priority = "medium"
+                for p in ("high", "medium", "low"):
+                    if f"[{p}]" in rest:
+                        priority = p
+                        break
+                current_cluster["frs"].append({
+                    "fr_id": fr_id,
+                    "description": rest,
+                    "priority": priority,
+                })
+                if PRIORITY_SCORE.get(priority, 0) > PRIORITY_SCORE.get(current_cluster["max_priority"], 0):
+                    current_cluster["max_priority"] = priority
+
+        if current_cluster:
+            clusters.append(current_cluster)
+
+        # Rank clusters
+        def rank_key(c):
+            return (
+                PRIORITY_SCORE.get(c["max_priority"], 0),  # highest priority first
+                c["size"],                                   # larger clusters first
+                len(c["targets"]),                           # cross-cutting first
+                1 if target and target in c["targets"] else 0,  # matching target first
+            )
+
+        clusters.sort(key=rank_key, reverse=True)
+
+        # Add rank
+        for i, c in enumerate(clusters, 1):
+            c["rank"] = i
+
+        return clusters
 
 
 # ---------------------------------------------------------------------------
