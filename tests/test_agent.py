@@ -219,3 +219,63 @@ def test_work_units_skill_exists(harness):
 
 def test_next_work_unit_skill_exists(harness):
     harness.assert_skill_exists("next_work_unit")
+
+
+# -- handler flow tests (mock self.request) --
+
+@pytest.mark.asyncio
+async def test_work_units_with_clusters(harness):
+    """work_units returns ranked clusters when researcher provides them."""
+    cluster_response = {"result": {"result": """## Cluster 1 (3 FRs, targets: khonliang)
+  [fr_a_12345678] Thing A → khonliang [high]
+  [fr_b_12345678] Thing B → khonliang [medium]
+  [fr_c_12345678] Thing C → khonliang [low]
+"""}}
+
+    async def mock_request(**kwargs):
+        if kwargs.get("operation") == "cluster_frs":
+            return cluster_response
+        return {"result": {}}
+
+    harness.agent.request = mock_request
+    result = await harness.call("work_units", {"target": "khonliang"})
+    assert result["source"] == "clusters"
+    assert result["count"] == 1
+    assert result["work_units"][0]["size"] == 3
+
+
+@pytest.mark.asyncio
+async def test_work_units_falls_back_to_flat(harness):
+    """work_units falls back to flat FR list when no clusters found."""
+    async def mock_request(**kwargs):
+        if kwargs.get("operation") == "cluster_frs":
+            return {"result": {"result": "No clusters of 2+ FRs at 85% threshold."}}
+        if kwargs.get("operation") == "feature_requests":
+            return {"result": {"result": "fr_x | [high] Some FR"}}
+        return {"result": {}}
+
+    harness.agent.request = mock_request
+    result = await harness.call("work_units", {"target": "developer"})
+    assert result["source"] == "flat_list"
+
+
+@pytest.mark.asyncio
+async def test_next_work_unit_returns_top(harness):
+    """next_work_unit returns the highest-ranked cluster."""
+    cluster_response = {"result": {"result": """## Cluster 1 (2 FRs, targets: khonliang)
+  [fr_a_12345678] Low → khonliang [low]
+  [fr_b_12345678] Low → khonliang [low]
+
+## Cluster 2 (2 FRs, targets: developer)
+  [fr_c_12345678] High → developer [high]
+  [fr_d_12345678] Med → developer [medium]
+"""}}
+
+    async def mock_request(**kwargs):
+        return cluster_response
+
+    harness.agent.request = mock_request
+    result = await harness.call("next_work_unit", {"target": "developer"})
+    assert "work_unit" in result
+    assert result["work_unit"]["max_priority"] == "high"
+    assert result["remaining"] == 1

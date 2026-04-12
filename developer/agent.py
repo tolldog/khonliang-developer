@@ -276,8 +276,12 @@ class DeveloperAgent(BaseAgent):
             r = cluster_result["result"]
             cluster_text = r.get("result", "") if isinstance(r, dict) else str(r)
 
-        if not cluster_text or "No clusters" in cluster_text:
-            # Fall back to flat FR list
+        # Parse clusters — if parsing yields nothing, fall back to flat list.
+        # This handles: empty text, "No clusters" message, or a format
+        # change that doesn't produce any parseable cluster headers.
+        work_units = self._parse_and_rank_clusters(cluster_text, target) if cluster_text else []
+
+        if not work_units:
             try:
                 fr_result = await self.request(
                     agent_type="researcher",
@@ -293,8 +297,6 @@ class DeveloperAgent(BaseAgent):
                 "source": "flat_list",
             }
 
-        # Parse clusters from the text response
-        work_units = self._parse_and_rank_clusters(cluster_text, target)
         return {
             "work_units": work_units,
             "source": "clusters",
