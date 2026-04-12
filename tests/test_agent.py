@@ -8,7 +8,9 @@ from developer.agent import DeveloperAgent
 
 
 REPO_ROOT = __import__("pathlib").Path(__file__).resolve().parent.parent
-CONFIG_PATH = str(REPO_ROOT / "config.yaml")
+# Use config.yaml if it exists (local dev), fall back to config.example.yaml (fresh clone)
+_cfg = REPO_ROOT / "config.yaml"
+CONFIG_PATH = str(_cfg if _cfg.exists() else REPO_ROOT / "config.example.yaml")
 
 
 @pytest.fixture
