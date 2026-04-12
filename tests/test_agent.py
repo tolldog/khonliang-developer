@@ -39,6 +39,18 @@ def test_traverse_milestone_skill(harness):
     harness.assert_skill_exists("traverse_milestone", description="milestone")
 
 
+def test_get_fr_skill(harness):
+    harness.assert_skill_exists("get_fr", description="researcher")
+
+
+def test_list_frs_skill(harness):
+    harness.assert_skill_exists("list_frs", description="researcher")
+
+
+def test_get_paper_context_skill(harness):
+    harness.assert_skill_exists("get_paper_context", description="researcher")
+
+
 # -- collaborations --
 
 def test_collaborations_declared(harness):

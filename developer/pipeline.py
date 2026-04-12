@@ -51,7 +51,22 @@ class Pipeline:
 
     @classmethod
     def from_config(cls, config: Config) -> "Pipeline":
-        """Wire all components from a loaded :class:`Config`."""
+        """Wire all components from a loaded :class:`Config`.
+
+        Steps:
+          1. Construct the three stores against ``config.db_path``.
+          2. **Assert store isolation** — every store's ``db_path`` must
+             equal the resolved ``developer.db`` path. Refuse to start
+             otherwise (acceptance #9).
+          3. Construct the LocalDocReader, ResearcherClient, SpecReader.
+          4. Load ``prompts/developer_guide.md`` into ``developer_guide_text``
+             at startup so the ``developer_guide`` MCP tool can return it
+             without re-reading the file on every call.
+
+        Note: ``ResearcherClient`` is wired here for the MCP server path
+        (standalone stdio usage). The bus-agent path (``DeveloperAgent``)
+        uses ``self.request()`` from bus-lib for cross-agent calls instead.
+        """
         db_path = str(config.db_path)
 
         knowledge = KnowledgeStore(db_path)
@@ -62,6 +77,9 @@ class Pipeline:
             expected=db_path, knowledge=knowledge, triples=triples, digest=digest
         )
 
+        # Use the strict FR pattern so DocContent.references doesn't pick
+        # up python identifiers like ``fr_status`` from prose. SpecReader's
+        # FR_ID_PATTERN matches only ``fr_<target>_<8 hex chars>``.
         reader = LocalDocReader(reference_pattern=FR_ID_PATTERN)
         # ResearcherClient for the MCP server path (standalone, uses config bus URL).
         # The bus agent path uses self.request() from bus-lib instead.
