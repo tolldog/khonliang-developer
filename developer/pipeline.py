@@ -77,9 +77,9 @@ class Pipeline:
             expected=db_path, knowledge=knowledge, triples=triples, digest=digest
         )
 
-        # Use the strict FR pattern so DocContent.references doesn't pick
-        # up python identifiers like ``fr_status`` from prose. SpecReader's
-        # FR_ID_PATTERN matches only ``fr_<target>_<8 hex chars>``.
+        # FR_ID_PATTERN is imported from specs and applied to LocalDocReader so that
+        # reference extraction doesn't pick up python identifiers like ``fr_status``
+        # from prose. It matches only ``fr_<target>_<8 hex chars>``.
         reader = LocalDocReader(reference_pattern=FR_ID_PATTERN)
         # ResearcherClient for the MCP server path (standalone, uses config bus URL).
         # The bus agent path uses self.request() from bus-lib instead.
