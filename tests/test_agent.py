@@ -279,3 +279,30 @@ async def test_next_work_unit_returns_top(harness):
     assert "work_unit" in result
     assert result["work_unit"]["max_priority"] == "high"
     assert result["remaining"] == 1
+
+
+@pytest.mark.asyncio
+async def test_work_units_no_clusters_and_no_frs(harness):
+    """Returns source='none' with error when both cluster and FR requests fail."""
+    async def mock_request(**kwargs):
+        if kwargs.get("operation") == "cluster_frs":
+            return {"result": None}  # empty result, no exception
+        raise RuntimeError("researcher unavailable")
+
+    harness.agent.request = mock_request
+    result = await harness.call("work_units", {})
+    assert result["source"] == "none"
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_next_work_unit_no_units_returns_error(harness):
+    """next_work_unit returns an error dict when no work units are available."""
+    async def mock_request(**kwargs):
+        if kwargs.get("operation") == "cluster_frs":
+            return {"result": None}
+        raise RuntimeError("no FRs")
+
+    harness.agent.request = mock_request
+    result = await harness.call("next_work_unit", {})
+    assert "error" in result
