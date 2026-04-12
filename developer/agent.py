@@ -212,9 +212,7 @@ class DeveloperAgent(BaseAgent):
         except Exception as e:
             await self.report_gap("get_fr", f"Bus request failed for {fr_id}: {e}")
             raise
-        if not result:
-            return {"error": "no result from researcher"}
-        return result.get("result", {"error": "no result from researcher"})
+        return (result and result.get("result")) or {"error": "no result from researcher"}
 
     @handler("list_frs")
     async def handle_list_frs(self, args):
@@ -228,9 +226,7 @@ class DeveloperAgent(BaseAgent):
         except Exception as e:
             await self.report_gap("list_frs", f"Bus request failed for {target}: {e}")
             raise
-        if not result:
-            return {"error": "no result from researcher"}
-        return result.get("result", {"error": "no result from researcher"})
+        return (result and result.get("result")) or {"error": "no result from researcher"}
 
     @handler("get_paper_context")
     async def handle_get_paper_context(self, args):
@@ -244,9 +240,7 @@ class DeveloperAgent(BaseAgent):
         except Exception as e:
             await self.report_gap("get_paper_context", f"Bus request failed for {query!r}: {e}")
             raise
-        if not result:
-            return {"error": "no result from researcher"}
-        return result.get("result", {"error": "no result from researcher"})
+        return (result and result.get("result")) or {"error": "no result from researcher"}
 
 
 # ---------------------------------------------------------------------------
