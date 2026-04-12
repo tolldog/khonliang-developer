@@ -61,6 +61,16 @@ class DeveloperAgent(BaseAgent):
                   since="0.1.0"),
             Skill("developer_guide", "Development workflow guide",
                   since="0.1.0"),
+            # Cross-agent skills (use self.request() via bus-lib)
+            Skill("get_fr", "Look up an FR via researcher on the bus",
+                  {"fr_id": {"type": "string", "required": True}},
+                  since="0.2.0"),
+            Skill("list_frs", "List FRs for a target via researcher on the bus",
+                  {"target": {"type": "string", "required": True}},
+                  since="0.2.0"),
+            Skill("get_paper_context", "Get research evidence for a query via researcher",
+                  {"query": {"type": "string", "required": True}},
+                  since="0.2.0"),
         ]
 
     def register_collaborations(self):
@@ -187,6 +197,38 @@ class DeveloperAgent(BaseAgent):
     @handler("developer_guide")
     async def handle_developer_guide(self, args):
         return {"guide": self.pipeline.developer_guide_text}
+
+    # -- cross-agent skills (via bus-lib self.request) --
+
+    @handler("get_fr")
+    async def handle_get_fr(self, args):
+        fr_id = args.get("fr_id", "")
+        result = await self.request(
+            agent_type="researcher",
+            operation="knowledge_search",
+            args={"query": fr_id, "detail": "full", "max_results": 1},
+        )
+        return result.get("result", {"error": "no result from researcher"})
+
+    @handler("list_frs")
+    async def handle_list_frs(self, args):
+        target = args.get("target", "")
+        result = await self.request(
+            agent_type="researcher",
+            operation="feature_requests",
+            args={"target": target, "detail": "brief"},
+        )
+        return result.get("result", {"error": "no result from researcher"})
+
+    @handler("get_paper_context")
+    async def handle_get_paper_context(self, args):
+        query = args.get("query", "")
+        result = await self.request(
+            agent_type="researcher",
+            operation="paper_context",
+            args={"query": query, "detail": "full"},
+        )
+        return result.get("result", {"error": "no result from researcher"})
 
 
 # ---------------------------------------------------------------------------

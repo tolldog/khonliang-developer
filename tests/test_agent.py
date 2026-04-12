@@ -15,11 +15,15 @@ def harness(temp_config_file):
 # -- skills --
 
 def test_skill_count(harness):
-    assert len(harness.skills) == 5
+    assert len(harness.skills) == 8
 
 
 def test_skills_registered(harness):
-    expected = {"read_spec", "list_specs", "traverse_milestone", "health_check", "developer_guide"}
+    expected = {
+        "read_spec", "list_specs", "traverse_milestone",
+        "health_check", "developer_guide",
+        "get_fr", "list_frs", "get_paper_context",
+    }
     assert harness.skill_names == expected
 
 
@@ -138,5 +142,5 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 5
+    assert len(reg.skills) == 8
     assert len(reg.collaborations) == 2
