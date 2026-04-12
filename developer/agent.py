@@ -57,7 +57,7 @@ class DeveloperAgent(BaseAgent):
             Skill("traverse_milestone", "Walk milestone → specs → FRs with evidence chain",
                   {"path": {"type": "string", "required": True}},
                   since="0.1.0"),
-            Skill("health_check", "DB, workspace, researcher connection status",
+            Skill("health_check", "DB, workspace, and bus configuration status",
                   since="0.1.0"),
             Skill("developer_guide", "Development workflow guide",
                   since="0.1.0"),
@@ -203,31 +203,49 @@ class DeveloperAgent(BaseAgent):
     @handler("get_fr")
     async def handle_get_fr(self, args):
         fr_id = args.get("fr_id", "")
-        result = await self.request(
-            agent_type="researcher",
-            operation="knowledge_search",
-            args={"query": fr_id, "detail": "full", "max_results": 1},
-        )
+        try:
+            result = await self.request(
+                agent_type="researcher",
+                operation="knowledge_search",
+                args={"query": fr_id, "detail": "full", "max_results": 1},
+            )
+        except Exception as e:
+            await self.report_gap("get_fr", f"Bus request failed for {fr_id}: {e}")
+            raise
+        if not result:
+            return {"error": "no result from researcher"}
         return result.get("result", {"error": "no result from researcher"})
 
     @handler("list_frs")
     async def handle_list_frs(self, args):
         target = args.get("target", "")
-        result = await self.request(
-            agent_type="researcher",
-            operation="feature_requests",
-            args={"target": target, "detail": "brief"},
-        )
+        try:
+            result = await self.request(
+                agent_type="researcher",
+                operation="feature_requests",
+                args={"target": target, "detail": "brief"},
+            )
+        except Exception as e:
+            await self.report_gap("list_frs", f"Bus request failed for {target}: {e}")
+            raise
+        if not result:
+            return {"error": "no result from researcher"}
         return result.get("result", {"error": "no result from researcher"})
 
     @handler("get_paper_context")
     async def handle_get_paper_context(self, args):
         query = args.get("query", "")
-        result = await self.request(
-            agent_type="researcher",
-            operation="paper_context",
-            args={"query": query, "detail": "full"},
-        )
+        try:
+            result = await self.request(
+                agent_type="researcher",
+                operation="paper_context",
+                args={"query": query, "detail": "full"},
+            )
+        except Exception as e:
+            await self.report_gap("get_paper_context", f"Bus request failed for {query!r}: {e}")
+            raise
+        if not result:
+            return {"error": "no result from researcher"}
         return result.get("result", {"error": "no result from researcher"})
 
 
