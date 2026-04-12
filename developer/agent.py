@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -318,8 +319,8 @@ class DeveloperAgent(BaseAgent):
         """Parse cluster_frs output and rank by aggregate importance.
 
         Ranking signals (highest to lowest weight):
-          1. Cluster size (more FRs = more evidence of need)
-          2. Highest priority in the cluster
+          1. Highest priority in the cluster
+          2. Cluster size (more FRs = more evidence of need)
           3. Number of targets touched (cross-cutting = higher value)
           4. Whether any FRs mention the requested target
         """
@@ -344,7 +345,6 @@ class DeveloperAgent(BaseAgent):
                 if "(" in line:
                     meta = line.split("(", 1)[1].rstrip(")")
                     # Size is before "FRs"
-                    import re
                     size_match = re.search(r"(\d+)\s*FRs?", meta)
                     if size_match:
                         size = int(size_match.group(1))
