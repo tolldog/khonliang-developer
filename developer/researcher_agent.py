@@ -10,7 +10,7 @@ it needs. Changes to the filter don't require a PR to the researcher repo.
 
 Usage::
 
-    python -m developer.researcher_agent --id developer-researcher --bus http://localhost:8788 --config config.yaml
+    python -m developer.researcher_agent --id developer-researcher --bus http://localhost:8787 --config config.yaml
 """
 
 from __future__ import annotations
@@ -77,8 +77,22 @@ class DeveloperResearcher(BaseResearchAgent):
     )
 
     def register_skills(self) -> list[Skill]:
-        """Filter base skills to the evidence subset."""
+        """Filter base skills to the evidence subset.
+
+        Fails fast at startup if `INCLUDED_SKILLS` references a name the
+        base agent no longer provides — a silent drop would leave the
+        agent partially functional with no obvious signal.
+        """
         all_skills = super().register_skills()
+        available = {s.name for s in all_skills}
+        missing = INCLUDED_SKILLS - available
+        if missing:
+            raise RuntimeError(
+                "developer-researcher INCLUDED_SKILLS references skills "
+                f"not provided by BaseResearchAgent: {sorted(missing)}. "
+                "Either the base renamed/removed a skill, or the filter "
+                "has a typo. Fix the filter to re-sync."
+            )
         filtered = [s for s in all_skills if s.name in INCLUDED_SKILLS]
         logger.info(
             "developer-researcher: %d/%d skills (filtered to evidence subset)",
@@ -96,7 +110,7 @@ def main():
     )
     parser.add_argument("command", nargs="?", choices=["install", "uninstall"])
     parser.add_argument("--id", default="developer-researcher")
-    parser.add_argument("--bus", default="http://localhost:8788")
+    parser.add_argument("--bus", default="http://localhost:8787")
     parser.add_argument("--config", default="config.yaml")
     args = parser.parse_args()
 
