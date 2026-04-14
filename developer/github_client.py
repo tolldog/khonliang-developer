@@ -319,7 +319,14 @@ class GithubClient:
 
     @staticmethod
     def _split_repo(repo: str) -> tuple[str, str]:
+        repo = (repo or "").strip()
         if "/" not in repo:
             raise GithubClientError(f"repo must be 'owner/name', got {repo!r}")
         owner, _, name = repo.partition("/")
+        owner = owner.strip()
+        name = name.strip()
+        if not owner or not name:
+            raise GithubClientError(
+                f"repo must be 'owner/name' with both halves non-empty, got {repo!r}"
+            )
         return owner, name

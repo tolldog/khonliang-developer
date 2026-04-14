@@ -415,7 +415,9 @@ class DeveloperAgent(BaseAgent):
         """Run pytest in a configured project and return a distilled digest.
 
         Pay the test-run cost locally, serve a compact digest to Claude.
-        Raw pytest output is still available via ``detail=full``.
+        ``detail=full`` adds per-failure trace excerpts (5–10 lines each)
+        on top of ``brief``; raw pytest output is only inlined as a fallback
+        when parsing fails entirely.
         """
         from developer import tests_runner
 

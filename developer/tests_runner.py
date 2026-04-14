@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -70,7 +71,7 @@ class RunResult:
     collected: int = 0
     failures: list[FailureRecord] = field(default_factory=list)
     parsed: bool = False
-    raw_output: str = ""  # included when parsed is False OR caller asks for detail=full
+    raw_output: str = ""  # preserved for fallback when parsing fails
     timed_out: bool = False
 
 
@@ -82,21 +83,47 @@ class RunResult:
 DEFAULT_TIMEOUT_SECONDS = 300
 
 
+def _resolve_python_exe(cwd: Path) -> str:
+    """Pick the Python interpreter for a pytest run.
+
+    Prefers the target project's in-tree ``.venv/bin/python`` so tests run
+    under the project's own dependencies rather than developer's venv.
+    Falls back to ``sys.executable`` if no local venv is found, which is
+    still better than bare ``"python"`` from PATH (non-deterministic).
+
+    Callers may override via the ``python_exe`` parameter on
+    :func:`run_pytest` when they know better.
+    """
+    local_venv = cwd / ".venv" / "bin" / "python"
+    if local_venv.exists():
+        return str(local_venv)
+    return sys.executable
+
+
 async def run_pytest(
     cwd: str | Path,
     target: str = "",
     *,
     timeout_s: float = DEFAULT_TIMEOUT_SECONDS,
     extra_args: list[str] | None = None,
+    python_exe: str | None = None,
 ) -> RunResult:
     """Run pytest in ``cwd`` and return a parsed :class:`RunResult`.
 
     ``target`` is an optional path or pytest node id (``tests/test_foo.py``
     or ``tests/test_foo.py::test_bar``); empty runs the whole suite.
+
+    ``python_exe`` overrides interpreter selection. When unset, defaults
+    to ``<cwd>/.venv/bin/python`` if present, else ``sys.executable``.
+    Never uses bare ``"python"`` from PATH — that's non-deterministic
+    and undermines per-project venv isolation.
     """
     cwd_path = Path(cwd)
+    if python_exe is None:
+        python_exe = _resolve_python_exe(cwd_path)
+
     cmd = [
-        "python",
+        python_exe,
         "-m",
         "pytest",
         "--tb=short",
