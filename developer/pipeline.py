@@ -23,6 +23,7 @@ from khonliang.knowledge.triples import TripleStore
 from khonliang_researcher.doc_reader import LocalDocReader
 
 from developer.config import Config
+from developer.fr_store import FRStore
 from developer.researcher_client import ResearcherClient
 from developer.specs import FR_ID_PATTERN, SpecReader
 
@@ -48,6 +49,7 @@ class Pipeline:
     specs: SpecReader
     researcher: ResearcherClient
     developer_guide_text: str
+    frs: FRStore
 
     @classmethod
     def from_config(cls, config: Config) -> "Pipeline":
@@ -88,6 +90,8 @@ class Pipeline:
 
         guide_text = _load_developer_guide(config.prompts_dir)
 
+        frs = FRStore(knowledge=knowledge)
+
         return cls(
             config=config,
             knowledge=knowledge,
@@ -97,6 +101,7 @@ class Pipeline:
             specs=specs,
             researcher=researcher,
             developer_guide_text=guide_text,
+            frs=frs,
         )
 
 

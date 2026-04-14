@@ -15,7 +15,7 @@ def harness(temp_config_file):
 # -- skills --
 
 def test_skill_count(harness):
-    assert len(harness.skills) == 11
+    assert len(harness.skills) == 16
 
 
 def test_skills_registered(harness):
@@ -25,6 +25,9 @@ def test_skills_registered(harness):
         "get_fr", "list_frs", "get_paper_context",
         "next_work_unit", "work_units",
         "run_tests",
+        # developer-owned FR lifecycle (Bundle A PR 1)
+        "promote_fr", "update_fr_status", "set_fr_dependency",
+        "get_fr_local", "list_frs_local",
     }
     assert harness.skill_names == expected
 
@@ -156,7 +159,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 11
+    assert len(reg.skills) == 16
     assert len(reg.collaborations) == 2
 
 
