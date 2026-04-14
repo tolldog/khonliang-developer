@@ -465,6 +465,12 @@ class FRStore:
                 "merge requires at least 2 source FRs; "
                 f"got {len(source_ids)}"
             )
+        title = (title or "").strip()
+        description = (description or "").strip()
+        if not title:
+            raise FRError("merge requires a non-empty title")
+        if not description:
+            raise FRError("merge requires a non-empty description")
         if priority is not None and priority not in ALLOWED_PRIORITIES:
             raise FRError(
                 f"priority must be one of {sorted(ALLOWED_PRIORITIES)}, got {priority!r}"
@@ -547,6 +553,23 @@ class FRStore:
                     continue
                 if resolved_dep not in combined_deps:
                     combined_deps.append(resolved_dep)
+
+        # Cycle check: a combined_deps entry that (transitively) depends on
+        # any source FR would become a cycle after _redirect_dependents
+        # rewrites those edges to new_id. Example that would cycle:
+        #   A depends on X (so combined_deps includes X)
+        #   X depends on B (a source)
+        # After the merge: new depends on X, and X's dep on B gets
+        # rewritten to new → new ↔ X cycle. Reject up front so we never
+        # commit that state to the store.
+        for dep in combined_deps:
+            offending = self._transitive_dep_hits(dep, source_id_set)
+            if offending is not None:
+                raise FRError(
+                    f"merge would create a dependency cycle: {dep!r} "
+                    f"transitively depends on source {offending!r}. "
+                    "Resolve the dependency before merging."
+                )
 
         now = time.time()
         # New FR starts `open`; the merge doesn't imply the combined work is
@@ -787,6 +810,34 @@ class FRStore:
                 if dep not in visited:
                     stack.append(dep)
         return False
+
+    def _transitive_dep_hits(
+        self, start: str, targets: set[str], *, _visited: Optional[set[str]] = None,
+    ) -> Optional[str]:
+        """Return the first target id reachable from ``start`` via deps, or None.
+
+        Used by :meth:`merge` to pre-validate that combined_deps don't
+        transitively depend on any source FR — such a dep would become
+        a cycle once _redirect_dependents rewrites source-pointing edges
+        to ``new_id``.
+        """
+        if _visited is None:
+            _visited = set()
+        if start in _visited:
+            return None
+        _visited.add(start)
+        entry = self.knowledge.get(start)
+        if entry is None:
+            return None
+        deps = (entry.metadata or {}).get("depends_on") or []
+        for dep in deps:
+            resolved = self.resolve_id(dep)
+            if resolved in targets:
+                return resolved
+            hit = self._transitive_dep_hits(resolved, targets, _visited=_visited)
+            if hit is not None:
+                return hit
+        return None
 
     def _redirect_dependents(self, source_ids: Iterable[str], new_id: str) -> None:
         """Rewrite depends_on edges that point at any source to point at new_id.

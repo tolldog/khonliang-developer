@@ -745,6 +745,48 @@ def test_merge_capability_marks_sources_abandoned(store):
     assert caps_after[a.id]["status"] == "abandoned"
 
 
+def test_merge_rejects_empty_title(store):
+    a = store.promote(target="developer", title="A", description="d", concept="c1")
+    b = store.promote(target="developer", title="B", description="d", concept="c2")
+    with pytest.raises(FRError, match="title"):
+        store.merge(source_ids=[a.id, b.id], title="", description="d")
+    with pytest.raises(FRError, match="title"):
+        store.merge(source_ids=[a.id, b.id], title="   ", description="d")
+
+
+def test_merge_rejects_empty_description(store):
+    a = store.promote(target="developer", title="A", description="d", concept="c1")
+    b = store.promote(target="developer", title="B", description="d", concept="c2")
+    with pytest.raises(FRError, match="description"):
+        store.merge(source_ids=[a.id, b.id], title="ok", description="")
+
+
+def test_merge_rejects_cycle_via_transitive_dep(store):
+    """A depends on X, X depends on B — merging A+B would produce a cycle
+    (new depends on X; X's dep on B gets redirected to new). Reject upfront."""
+    a = store.promote(target="developer", title="A", description="d", concept="c1")
+    b = store.promote(target="developer", title="B", description="d", concept="c2")
+    x = store.promote(target="developer", title="X", description="d")
+    store.set_dependency(a.id, [x.id])
+    store.set_dependency(x.id, [b.id])
+    with pytest.raises(FRError, match="dependency cycle"):
+        store.merge(source_ids=[a.id, b.id], title="AB", description="d")
+
+
+def test_merge_allows_deps_that_do_not_loop_back(store):
+    """X depends on Y (an unrelated FR) — merging A+B with X in combined_deps
+    is fine because X's transitive deps don't loop back to A or B."""
+    a = store.promote(target="developer", title="A", description="d", concept="c1")
+    b = store.promote(target="developer", title="B", description="d", concept="c2")
+    x = store.promote(target="developer", title="X", description="d")
+    y = store.promote(target="developer", title="Y", description="d")
+    store.set_dependency(a.id, [x.id])
+    store.set_dependency(x.id, [y.id])  # X depends on unrelated Y
+    # Merge should succeed
+    new = store.merge(source_ids=[a.id, b.id], title="AB", description="d")
+    assert x.id in new.depends_on
+
+
 def test_merge_ignores_empty_and_whitespace_source_ids(store):
     a = store.promote(target="developer", title="A", description="d", concept="c1")
     b = store.promote(target="developer", title="B", description="d", concept="c2")
