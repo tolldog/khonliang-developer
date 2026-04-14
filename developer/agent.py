@@ -81,6 +81,14 @@ class DeveloperAgent(BaseAgent):
                   {"target": {"type": "string", "default": ""},
                    "threshold": {"type": "number", "default": 0.85}},
                   since="0.2.0"),
+            # Test run + distill (token-arbitrage: pay local pytest cost once,
+            # serve cheap digest to Claude instead of raw pytest output)
+            Skill("run_tests", "Run project pytest suite and return a distilled digest",
+                  {"project": {"type": "string", "required": True},
+                   "target": {"type": "string", "default": ""},
+                   "detail": {"type": "string", "default": "brief"},
+                   "timeout_s": {"type": "number", "default": 300}},
+                  since="0.3.0"),
         ]
 
     def register_collaborations(self):
@@ -399,6 +407,60 @@ class DeveloperAgent(BaseAgent):
             c["rank"] = i
 
         return clusters
+
+    # -- test run + distill --
+
+    @handler("run_tests")
+    async def handle_run_tests(self, args):
+        """Run pytest in a configured project and return a distilled digest.
+
+        Pay the test-run cost locally, serve a compact digest to Claude.
+        ``detail=full`` adds per-failure trace excerpts (5–10 lines each)
+        on top of ``brief``; raw pytest output is only inlined as a fallback
+        when parsing fails entirely.
+        """
+        from developer import tests_runner
+
+        project = args.get("project", "")
+        if not project:
+            return {"error": "project is required (must be a configured project name)"}
+
+        config = self.pipeline.config
+        if project not in config.projects:
+            return {
+                "error": f"unknown project {project!r}",
+                "known_projects": sorted(config.projects.keys()),
+            }
+
+        target = args.get("target", "")
+        detail = args.get("detail", "brief")
+        try:
+            timeout_s = float(args.get("timeout_s", tests_runner.DEFAULT_TIMEOUT_SECONDS))
+        except (TypeError, ValueError):
+            timeout_s = tests_runner.DEFAULT_TIMEOUT_SECONDS
+
+        cwd = config.projects[project].repo
+        try:
+            result = await tests_runner.run_pytest(
+                cwd=cwd, target=target, timeout_s=timeout_s,
+            )
+        except Exception as e:
+            await self.report_gap("run_tests", f"pytest launch failed in {cwd}: {e}")
+            raise
+
+        return {
+            "project": project,
+            "cwd": str(cwd),
+            "returncode": result.returncode,
+            "elapsed_s": round(result.elapsed_s, 3),
+            "passed": result.passed,
+            "failed": result.failed,
+            "errors": result.errors,
+            "skipped": result.skipped,
+            "timed_out": result.timed_out,
+            "parsed": result.parsed,
+            "digest": tests_runner.format_response(result, detail=detail),
+        }
 
 
 # ---------------------------------------------------------------------------
