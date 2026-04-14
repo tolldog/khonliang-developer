@@ -516,6 +516,287 @@ def test_full_lifecycle_roundtrip(store):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# merge — the write op that produces the state the read-side framework handles
+# ---------------------------------------------------------------------------
+
+
+def test_merge_creates_new_fr_and_marks_sources_merged(store):
+    a = store.promote(target="developer", title="A", description="aa", concept="c1")
+    b = store.promote(target="developer", title="B", description="bb", concept="c2")
+    new = store.merge(
+        source_ids=[a.id, b.id],
+        title="A+B",
+        description="combined",
+        merge_note="bundled",
+    )
+    # New FR in open state with merged_from populated
+    assert new.status == FR_STATUS_OPEN
+    assert sorted(new.merged_from) == sorted([a.id, b.id])
+    assert new.merge_note == "bundled"
+
+    # Sources are now terminal and point at the new FR
+    src_a = store.get(a.id, follow_redirect=False)
+    src_b = store.get(b.id, follow_redirect=False)
+    assert src_a.status == FR_STATUS_MERGED
+    assert src_b.status == FR_STATUS_MERGED
+    assert src_a.merged_into == new.id
+    assert src_b.merged_into == new.id
+
+    # Content on sources is preserved verbatim — merge never rewrites them
+    assert src_a.title == "A"
+    assert src_a.description == "aa"
+
+
+def test_merge_follows_redirect_to_resolve_sources(store):
+    """Merging already-merged ids walks to their terminal FRs."""
+    a = store.promote(target="developer", title="A", description="d", concept="c1")
+    b = store.promote(target="developer", title="B", description="d", concept="c2")
+    # First merge: a+b → ab
+    ab = store.merge(source_ids=[a.id, b.id], title="A+B", description="d")
+    # Now promote a third, and try to merge with the old `a.id` (which is
+    # already merged into ab). The merge should resolve `a.id` to `ab.id`
+    # and then merge ab with c.
+    c = store.promote(target="developer", title="C", description="d", concept="c3")
+    combined = store.merge(
+        source_ids=[a.id, c.id],  # a.id will resolve to ab.id
+        title="ABC",
+        description="d",
+    )
+    # ab and c are the actual sources
+    assert sorted(combined.merged_from) == sorted([ab.id, c.id])
+
+
+def test_merge_rejects_fewer_than_two_sources(store):
+    a = store.promote(target="developer", title="Only", description="d")
+    with pytest.raises(FRError, match="at least 2"):
+        store.merge(source_ids=[a.id], title="x", description="d")
+
+
+def test_merge_rejects_fewer_than_two_distinct_post_redirect(store):
+    """Duplicate ids that resolve to the same FR don't count as 2 sources."""
+    a = store.promote(target="developer", title="Dup", description="d")
+    with pytest.raises(FRError, match="2\\+ distinct"):
+        store.merge(source_ids=[a.id, a.id], title="x", description="d")
+
+
+def test_merge_rejects_unknown_source(store):
+    a = store.promote(target="developer", title="A", description="d")
+    with pytest.raises(FRError, match="unknown source"):
+        store.merge(
+            source_ids=[a.id, "fr_developer_missing"],
+            title="x",
+            description="d",
+        )
+
+
+def test_merge_rejects_terminal_source(store):
+    a = store.promote(target="developer", title="A", description="d")
+    b = store.promote(target="developer", title="B", description="d")
+    store.update_status(a.id, FR_STATUS_ARCHIVED)
+    with pytest.raises(FRError, match="already terminal"):
+        store.merge(source_ids=[a.id, b.id], title="x", description="d")
+
+
+def test_merge_rejects_different_targets(store):
+    a = store.promote(target="developer", title="A", description="d")
+    b = store.promote(target="researcher", title="B", description="d")
+    with pytest.raises(FRError, match="different targets"):
+        store.merge(source_ids=[a.id, b.id], title="x", description="d")
+
+
+def test_merge_rejects_invalid_priority(store):
+    a = store.promote(target="developer", title="A", description="d")
+    b = store.promote(target="developer", title="B", description="d")
+    with pytest.raises(FRError, match="priority"):
+        store.merge(source_ids=[a.id, b.id], title="x", description="d", priority="urgent")
+
+
+def test_merge_inherits_max_priority_when_not_specified(store):
+    low = store.promote(target="developer", title="Low", description="d", priority="low", concept="c1")
+    high = store.promote(target="developer", title="High", description="d", priority="high", concept="c2")
+    new = store.merge(source_ids=[low.id, high.id], title="Mixed", description="d")
+    assert new.priority == "high"
+
+
+def test_merge_explicit_priority_overrides_inheritance(store):
+    low = store.promote(target="developer", title="Low1", description="d", priority="low", concept="c1")
+    high = store.promote(target="developer", title="High1", description="d", priority="high", concept="c2")
+    new = store.merge(
+        source_ids=[low.id, high.id], title="Fixed", description="d", priority="medium"
+    )
+    assert new.priority == "medium"
+
+
+def test_merge_combines_backing_papers_deduped(store):
+    a = store.promote(target="developer", title="A", description="d", backing_papers=["p1", "p2"], concept="c1")
+    b = store.promote(target="developer", title="B", description="d", backing_papers=["p2", "p3"], concept="c2")
+    new = store.merge(source_ids=[a.id, b.id], title="Combined", description="d")
+    assert new.backing_papers == ["p1", "p2", "p3"]
+
+
+def test_merge_combines_depends_on_deduped(store):
+    dep1 = store.promote(target="developer", title="Dep1", description="d")
+    dep2 = store.promote(target="developer", title="Dep2", description="d")
+    a = store.promote(target="developer", title="A", description="d", concept="c1")
+    b = store.promote(target="developer", title="B", description="d", concept="c2")
+    store.set_dependency(a.id, [dep1.id])
+    store.set_dependency(b.id, [dep1.id, dep2.id])
+    new = store.merge(source_ids=[a.id, b.id], title="C", description="d")
+    assert new.depends_on == [dep1.id, dep2.id]
+
+
+def test_merge_drops_self_references_from_combined_deps(store):
+    """If A depends on B and we merge A+B, the new FR shouldn't depend on itself."""
+    a = store.promote(target="developer", title="A", description="d", concept="c1")
+    b = store.promote(target="developer", title="B", description="d", concept="c2")
+    store.set_dependency(a.id, [b.id])
+    new = store.merge(source_ids=[a.id, b.id], title="C", description="d")
+    assert new.depends_on == []
+
+
+def test_merge_redirects_dependents(store):
+    """Other FRs that depended on a source now depend on the merged FR."""
+    a = store.promote(target="developer", title="A", description="d", concept="c1")
+    b = store.promote(target="developer", title="B", description="d", concept="c2")
+    downstream = store.promote(target="developer", title="Down", description="d")
+    store.set_dependency(downstream.id, [a.id])  # depends on A
+    new = store.merge(source_ids=[a.id, b.id], title="AB", description="d")
+
+    # Downstream's dep edge is now the merged FR
+    reread = store.get(downstream.id, follow_redirect=False)
+    assert reread.depends_on == [new.id]
+
+
+def test_merge_redirect_dedupes_when_dependent_already_had_both(store):
+    """If a downstream FR depends on both A and B, after merging A+B it depends on new only once."""
+    a = store.promote(target="developer", title="A", description="d", concept="c1")
+    b = store.promote(target="developer", title="B", description="d", concept="c2")
+    downstream = store.promote(target="developer", title="Down", description="d")
+    store.set_dependency(downstream.id, [a.id, b.id])
+    new = store.merge(source_ids=[a.id, b.id], title="AB", description="d")
+    reread = store.get(downstream.id, follow_redirect=False)
+    assert reread.depends_on == [new.id]
+
+
+def test_merge_records_roles_per_source(store):
+    a = store.promote(target="developer", title="A", description="d", concept="c1")
+    b = store.promote(target="developer", title="B", description="d", concept="c2")
+    store.merge(
+        source_ids=[a.id, b.id],
+        title="AB", description="d",
+        merge_roles={a.id: "first half", b.id: "second half"},
+    )
+    src_a = store.get(a.id, follow_redirect=False)
+    src_b = store.get(b.id, follow_redirect=False)
+    assert src_a.merge_role == "first half"
+    assert src_b.merge_role == "second half"
+
+
+def test_merge_reads_through_redirect_after_merge(store):
+    """Callers of get() with the old id resolve to the new FR."""
+    a = store.promote(target="developer", title="A", description="d", concept="c1")
+    b = store.promote(target="developer", title="B", description="d", concept="c2")
+    new = store.merge(source_ids=[a.id, b.id], title="AB", description="d")
+    resolved = store.get(a.id)  # follows redirect by default
+    assert resolved.id == new.id
+    assert resolved.redirected_from == a.id
+
+
+def test_merge_is_deterministic_on_id(store):
+    """Same sources → same new id. Re-merge rejects cleanly."""
+    a = store.promote(target="developer", title="A", description="d", concept="c1")
+    b = store.promote(target="developer", title="B", description="d", concept="c2")
+    new = store.merge(source_ids=[a.id, b.id], title="AB", description="d")
+    # Re-merge: sources are already merged, so resolve_id walks to `new`,
+    # which means only one distinct source, which fails the 2+-distinct check
+    # before we even hit the already-exists check. But the id derivation
+    # itself should be deterministic.
+    from developer.fr_store import _derive_merge_id
+    assert _derive_merge_id("developer", [a.id, b.id]) == new.id
+    assert _derive_merge_id("developer", [b.id, a.id]) == new.id  # order-independent
+
+
+def test_merge_source_ordering_stable(store):
+    """source_ids order doesn't affect the new FR id (ids are sorted internally)."""
+    a = store.promote(target="developer", title="Aa", description="d", concept="cA")
+    b = store.promote(target="developer", title="Bb", description="d", concept="cB")
+    c = store.promote(target="developer", title="Cc", description="d", concept="cC")
+    # Merge in one order, verify same id would result from different order
+    new1 = store.merge(source_ids=[a.id, b.id, c.id], title="ABC", description="d")
+    from developer.fr_store import _derive_merge_id
+    alternate_id = _derive_merge_id("developer", [c.id, a.id, b.id])
+    assert alternate_id == new1.id
+
+
+def test_merge_capability_marks_sources_abandoned(store):
+    """Source FRs' capability entries go to `abandoned` after merge."""
+    a = store.promote(target="developer", title="CapA", description="d", concept="c1")
+    b = store.promote(target="developer", title="CapB", description="d", concept="c2")
+    # Put A into planned so it has a capability entry first
+    store.update_status(a.id, FR_STATUS_PLANNED)
+    caps_before = store.capabilities_for("developer")
+    assert caps_before[0]["status"] == "planned"
+
+    store.merge(source_ids=[a.id, b.id], title="AB", description="d")
+
+    # After merge: the capability entry for A is now `abandoned`
+    caps_after = {c["fr_id"]: c for c in store.capabilities_for("developer")}
+    assert caps_after[a.id]["status"] == "abandoned"
+
+
+def test_merge_rejects_empty_title(store):
+    a = store.promote(target="developer", title="A", description="d", concept="c1")
+    b = store.promote(target="developer", title="B", description="d", concept="c2")
+    with pytest.raises(FRError, match="title"):
+        store.merge(source_ids=[a.id, b.id], title="", description="d")
+    with pytest.raises(FRError, match="title"):
+        store.merge(source_ids=[a.id, b.id], title="   ", description="d")
+
+
+def test_merge_rejects_empty_description(store):
+    a = store.promote(target="developer", title="A", description="d", concept="c1")
+    b = store.promote(target="developer", title="B", description="d", concept="c2")
+    with pytest.raises(FRError, match="description"):
+        store.merge(source_ids=[a.id, b.id], title="ok", description="")
+
+
+def test_merge_rejects_cycle_via_transitive_dep(store):
+    """A depends on X, X depends on B — merging A+B would produce a cycle
+    (new depends on X; X's dep on B gets redirected to new). Reject upfront."""
+    a = store.promote(target="developer", title="A", description="d", concept="c1")
+    b = store.promote(target="developer", title="B", description="d", concept="c2")
+    x = store.promote(target="developer", title="X", description="d")
+    store.set_dependency(a.id, [x.id])
+    store.set_dependency(x.id, [b.id])
+    with pytest.raises(FRError, match="dependency cycle"):
+        store.merge(source_ids=[a.id, b.id], title="AB", description="d")
+
+
+def test_merge_allows_deps_that_do_not_loop_back(store):
+    """X depends on Y (an unrelated FR) — merging A+B with X in combined_deps
+    is fine because X's transitive deps don't loop back to A or B."""
+    a = store.promote(target="developer", title="A", description="d", concept="c1")
+    b = store.promote(target="developer", title="B", description="d", concept="c2")
+    x = store.promote(target="developer", title="X", description="d")
+    y = store.promote(target="developer", title="Y", description="d")
+    store.set_dependency(a.id, [x.id])
+    store.set_dependency(x.id, [y.id])  # X depends on unrelated Y
+    # Merge should succeed
+    new = store.merge(source_ids=[a.id, b.id], title="AB", description="d")
+    assert x.id in new.depends_on
+
+
+def test_merge_ignores_empty_and_whitespace_source_ids(store):
+    a = store.promote(target="developer", title="A", description="d", concept="c1")
+    b = store.promote(target="developer", title="B", description="d", concept="c2")
+    new = store.merge(
+        source_ids=["", "  ", a.id, "", b.id],
+        title="AB", description="d",
+    )
+    assert sorted(new.merged_from) == sorted([a.id, b.id])
+
+
 def test_to_public_dict_includes_all_fields(store):
     fr = store.promote(
         target="developer", title="Ser", description="d",

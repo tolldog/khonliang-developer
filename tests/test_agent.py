@@ -15,7 +15,9 @@ def harness(temp_config_file):
 # -- skills --
 
 def test_skill_count(harness):
-    assert len(harness.skills) == 21
+    # 11 (MS-01 skills + bus proxies) + 5 FR-lifecycle (PR #10) + 1 merge_frs
+    # (PR #11) + 5 git_* (this PR) = 22
+    assert len(harness.skills) == 22
 
 
 def test_skills_registered(harness):
@@ -25,10 +27,12 @@ def test_skills_registered(harness):
         "get_fr", "list_frs", "get_paper_context",
         "next_work_unit", "work_units",
         "run_tests",
-        # developer-owned FR lifecycle (Bundle A PR 1)
+        # developer-owned FR lifecycle (PR #10)
         "promote_fr", "update_fr_status", "set_fr_dependency",
         "get_fr_local", "list_frs_local",
-        # native git operations (fr_developer_e778b9bf)
+        # merge write op (PR #11)
+        "merge_frs",
+        # native git operations (this PR — fr_developer_e778b9bf)
         "git_status", "git_log", "git_diff", "git_branches", "git_commit",
     }
     assert harness.skill_names == expected
@@ -77,6 +81,106 @@ def test_full_fr_review_requires_researcher(harness):
         "full_fr_review",
         requires={"researcher": ">=0.1.0"},
     )
+
+
+# -- git_* handler tests (fr_developer_e778b9bf) --
+#
+# Integration-style: use a temp git repo fixture and drive the full handler
+# path (arg parsing, GitClient invocation, error mapping, dict return).
+
+
+@pytest.fixture
+def git_repo(tmp_path):
+    # Use a subdir so we don't collide with the temp_config_file fixture
+    # which writes config.yaml into the same tmp_path; git would see it
+    # as untracked and the status tests would fail spuriously.
+    import subprocess as _sub
+    repo_dir = tmp_path / "gitrepo"
+    repo_dir.mkdir()
+
+    def _g(*args):
+        _sub.run(["git", *args], cwd=str(repo_dir), check=True,
+                 stdout=_sub.DEVNULL, stderr=_sub.DEVNULL)
+
+    _g("init", "-b", "main")
+    _g("config", "user.email", "t@example.com")
+    _g("config", "user.name", "T")
+    (repo_dir / "a.txt").write_text("first\n")
+    _g("add", "a.txt")
+    _g("commit", "-m", "initial")
+    return repo_dir
+
+
+@pytest.mark.asyncio
+async def test_git_status_handler_clean(harness, git_repo):
+    result = await harness.call("git_status", {"cwd": str(git_repo)})
+    assert result["branch"] == "main"
+    assert result["is_dirty"] is False
+    assert result["modified"] == []
+
+
+@pytest.mark.asyncio
+async def test_git_status_handler_requires_cwd(harness):
+    result = await harness.call("git_status", {"cwd": ""})
+    assert "error" in result
+    assert "cwd is required" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_git_status_handler_reports_error_for_non_repo(harness, tmp_path):
+    result = await harness.call("git_status", {"cwd": str(tmp_path)})
+    assert "error" in result
+    assert "not a git repository" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_git_log_handler(harness, git_repo):
+    result = await harness.call("git_log", {"cwd": str(git_repo), "limit": 5})
+    assert result["count"] == 1
+    assert result["commits"][0]["message"] == "initial"
+
+
+@pytest.mark.asyncio
+async def test_git_log_handler_non_int_limit_defaults(harness, git_repo):
+    """Non-integer limit shouldn't crash the handler."""
+    result = await harness.call("git_log", {"cwd": str(git_repo), "limit": "not-a-number"})
+    assert "commits" in result  # returned successfully with default
+
+
+@pytest.mark.asyncio
+async def test_git_branches_handler(harness, git_repo):
+    result = await harness.call("git_branches", {"cwd": str(git_repo)})
+    assert result["count"] >= 1
+    names = {b["name"] for b in result["branches"]}
+    assert "main" in names
+
+
+@pytest.mark.asyncio
+async def test_git_diff_handler(harness, git_repo):
+    (git_repo / "a.txt").write_text("changed\n")
+    result = await harness.call("git_diff", {"cwd": str(git_repo)})
+    assert "a.txt" in result["diff"]
+
+
+@pytest.mark.asyncio
+async def test_git_commit_handler(harness, git_repo):
+    (git_repo / "b.txt").write_text("new\n")
+    import subprocess as _sub
+    _sub.run(["git", "add", "b.txt"], cwd=str(git_repo), check=True)
+    result = await harness.call("git_commit", {
+        "cwd": str(git_repo), "message": "add b",
+    })
+    assert result["message"] == "add b"
+    assert result["sha"]
+
+
+@pytest.mark.asyncio
+async def test_git_commit_handler_empty_staging_returns_error(harness, git_repo):
+    result = await harness.call("git_commit", {
+        "cwd": str(git_repo), "message": "nothing",
+    })
+    assert "error" in result
+    assert "no staged" in result["error"].lower()
 
 
 # -- handlers --
@@ -161,7 +265,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 21
+    assert len(reg.skills) == 22
     assert len(reg.collaborations) == 2
 
 

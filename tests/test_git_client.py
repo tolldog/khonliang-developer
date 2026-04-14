@@ -245,6 +245,15 @@ def test_checkout_dirty_tree_raises_uncommitted(client, repo_path):
         client.checkout("feat/x")
 
 
+def test_checkout_untracked_files_raises_uncommitted(client, repo_path):
+    """Matches git's own safety behavior — untracked files could be
+    clobbered on switch, so refuse."""
+    (repo_path / "new.txt").write_text("untracked\n")
+    client.create_branch("feat/y")
+    with pytest.raises(GitUncommittedError, match="untracked"):
+        client.checkout("feat/y")
+
+
 def test_checkout_unknown_ref_raises_not_found(client):
     with pytest.raises(GitNotFoundError):
         client.checkout("totally-not-a-ref")
@@ -394,6 +403,39 @@ def test_pull_ff_only_is_default(client, repo_path):
     with patch.object(_GitCmd, "pull", _fake_pull, create=True):
         client.pull(remote="origin")
     assert "--ff-only" in calls[0]
+
+
+def test_pull_remote_only_uses_current_branch(client, repo_path):
+    """With remote but no branch, pull my current branch from remote —
+    NOT git pull <remote> alone (which would merge remote's HEAD)."""
+    calls: list[tuple] = []
+    def _fake_pull(self_git, *args, **kwargs):
+        calls.append(args)
+        return ""
+    with patch.object(_GitCmd, "pull", _fake_pull, create=True):
+        client.pull(remote="origin")
+    # Args should include both 'origin' and 'main' (the current branch)
+    assert "origin" in calls[0]
+    assert "main" in calls[0]
+
+
+def test_pull_no_args_follows_upstream(client, repo_path):
+    """With neither remote nor branch, rely on git's configured upstream."""
+    calls: list[tuple] = []
+    def _fake_pull(self_git, *args, **kwargs):
+        calls.append(args)
+        return ""
+    with patch.object(_GitCmd, "pull", _fake_pull, create=True):
+        client.pull()
+    # Only --ff-only should be in args; no remote/branch
+    assert calls[0] == ("--ff-only",)
+
+
+def test_pull_detached_head_requires_branch(client, repo_path):
+    sha = client.rev_parse("HEAD")
+    _run("checkout", sha, cwd=repo_path)
+    with pytest.raises(GitClientError, match="detached HEAD"):
+        client.pull(remote="origin")
 
 
 def test_pull_conflict_raises_conflict_error(client, repo_path):

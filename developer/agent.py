@@ -111,6 +111,19 @@ class DeveloperAgent(BaseAgent):
                   {"fr_id": {"type": "string", "required": True},
                    "depends_on": {"type": "string", "required": True}},
                   since="0.4.0"),
+            Skill("merge_frs", "Merge multiple FRs into a new one. Old FRs go "
+                  "to terminal 'merged' state; dep edges redirect to the new FR.",
+                  {"source_ids": {"type": "string", "required": True,
+                                  "description": "comma-separated FR ids"},
+                   "title": {"type": "string", "required": True},
+                   "description": {"type": "string", "required": True},
+                   "priority": {"type": "string", "default": ""},
+                   "concept": {"type": "string", "default": ""},
+                   "classification": {"type": "string", "default": "app"},
+                   "merge_note": {"type": "string", "default": ""},
+                   "merge_roles": {"type": "string", "default": "",
+                                   "description": "optional; 'id1=role1,id2=role2'"}},
+                  since="0.5.0"),
             Skill("get_fr_local", "Look up an FR from developer's own store "
                   "(follows merge redirects by default)",
                   {"fr_id": {"type": "string", "required": True},
@@ -549,6 +562,59 @@ class DeveloperAgent(BaseAgent):
             raise
         return {"fr_id": fr.id, "depends_on": fr.depends_on}
 
+    @handler("merge_frs")
+    async def handle_merge_frs(self, args):
+        """Merge multiple FRs into a new consolidated FR.
+
+        ``source_ids`` is a comma-separated id list. ``merge_roles`` is an
+        optional ``id1=role description 1, id2=role description 2`` map.
+        Priority empty → inherit max priority across sources.
+        """
+        from developer.fr_store import FRError
+
+        raw_ids = args.get("source_ids", "")
+        if isinstance(raw_ids, list):
+            source_ids = [str(i).strip() for i in raw_ids if str(i).strip()]
+        else:
+            source_ids = [i.strip() for i in str(raw_ids).split(",") if i.strip()]
+
+        # Parse merge_roles from "id1=role1, id2=role2" format.
+        merge_roles: dict[str, str] = {}
+        raw_roles = args.get("merge_roles", "")
+        if raw_roles:
+            for part in str(raw_roles).split(","):
+                part = part.strip()
+                if "=" not in part:
+                    continue
+                key, _, value = part.partition("=")
+                merge_roles[key.strip()] = value.strip()
+
+        priority = args.get("priority") or None
+
+        try:
+            fr = self.pipeline.frs.merge(
+                source_ids=source_ids,
+                title=args.get("title", ""),
+                description=args.get("description", ""),
+                priority=priority,
+                concept=args.get("concept", ""),
+                classification=args.get("classification", "app"),
+                merge_note=args.get("merge_note", ""),
+                merge_roles=merge_roles or None,
+            )
+        except FRError as e:
+            await self.report_gap("merge_frs", str(e))
+            return {"error": str(e)}
+        except Exception as e:
+            await self.report_gap("merge_frs", f"unexpected failure: {e}")
+            raise
+        return {
+            "fr_id": fr.id,
+            "merged_from": list(fr.merged_from),
+            "priority": fr.priority,
+            "status": fr.status,
+        }
+
     @handler("get_fr_local")
     async def handle_get_fr_local(self, args):
         from developer.fr_store import FRError
@@ -592,6 +658,20 @@ class DeveloperAgent(BaseAgent):
     # caller needs them they call the Python API directly; the bus skill
     # surface stays safe by default.
 
+    async def _safe_report_gap(self, operation: str, reason: str) -> None:
+        """Report a gap, swallowing 'not connected' errors.
+
+        Git handlers return {'error': ...} on every GitClientError path, so
+        callers always see the failure. The report_gap is audit signal on
+        top of that — if the bus isn't connected (tests, standalone runs)
+        we still want the handler to return its error dict cleanly.
+        """
+        try:
+            await self.report_gap(operation, reason)
+        except RuntimeError:
+            # Not connected to bus — handler still returns the error dict
+            pass
+
     @handler("git_status")
     async def handle_git_status(self, args):
         from developer.git_client import GitClient, GitClientError
@@ -601,7 +681,7 @@ class DeveloperAgent(BaseAgent):
         try:
             s = GitClient(cwd).status()
         except GitClientError as e:
-            await self.report_gap("git_status", str(e))
+            await self._safe_report_gap("git_status", str(e))
             return {"error": str(e)}
         return {
             "branch": s.branch,
@@ -621,13 +701,20 @@ class DeveloperAgent(BaseAgent):
         cwd = args.get("cwd", "")
         if not cwd:
             return {"error": "cwd is required"}
+        # Defensive int parse — callers that come in over the bus may
+        # pass limit as a string; ``int(...)`` would ValueError and
+        # escape our GitClientError catch.
+        try:
+            limit = int(args.get("limit", 20))
+        except (TypeError, ValueError):
+            limit = 20
         try:
             commits = GitClient(cwd).log(
                 ref=args.get("ref", "HEAD"),
-                limit=int(args.get("limit", 20)),
+                limit=limit,
             )
         except GitClientError as e:
-            await self.report_gap("git_log", str(e))
+            await self._safe_report_gap("git_log", str(e))
             return {"error": str(e)}
         return {
             "count": len(commits),
@@ -656,7 +743,7 @@ class DeveloperAgent(BaseAgent):
                 ref_b=ref_b,
             )
         except GitClientError as e:
-            await self.report_gap("git_diff", str(e))
+            await self._safe_report_gap("git_diff", str(e))
             return {"error": str(e)}
         return {"diff": diff}
 
@@ -672,7 +759,7 @@ class DeveloperAgent(BaseAgent):
                 remote=bool(args.get("remote", False)),
             )
         except GitClientError as e:
-            await self.report_gap("git_branches", str(e))
+            await self._safe_report_gap("git_branches", str(e))
             return {"error": str(e)}
         return {
             "count": len(branches),
@@ -701,7 +788,7 @@ class DeveloperAgent(BaseAgent):
                 co_authors=co_authors or None,
             )
         except GitClientError as e:
-            await self.report_gap("git_commit", str(e))
+            await self._safe_report_gap("git_commit", str(e))
             return {"error": str(e)}
         return {
             "sha": commit.sha,

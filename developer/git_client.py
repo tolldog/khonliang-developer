@@ -22,7 +22,6 @@ switch on the specific cause without parsing messages.
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -331,14 +330,16 @@ class GitClient:
     def checkout(self, ref: str, *, new_branch: bool = False) -> str:
         """Check out ``ref``. With ``new_branch=True``, create + switch.
 
-        Refuses to switch when the working tree is dirty (raises
-        :class:`GitUncommittedError`) — matching git's own behavior but
-        with a typed error.
+        Refuses to switch when the working tree has **any** changes
+        (tracked or untracked) that could be lost or clobbered — matches
+        git's own safety behavior and raises :class:`GitUncommittedError`.
+        Commit or stash (or delete the untracked files) before switching.
         """
         repo = self._get_repo()
-        if repo.is_dirty(untracked_files=False):
+        if repo.is_dirty(untracked_files=True):
             raise GitUncommittedError(
-                "working tree has uncommitted changes; commit or stash before checkout"
+                "working tree has uncommitted or untracked changes; "
+                "commit, stash, or clean them before checkout"
             )
         try:
             if new_branch:
@@ -469,15 +470,21 @@ class GitClient:
                 # After amend, HEAD is the new commit — fetch it
                 commit = repo.head.commit
             else:
-                # Use the Python API for non-amend for better structured error handling
-                kwargs: dict[str, Any] = {}
+                # If an author override is supplied, use GitPython's Actor
+                # object rather than mutating os.environ (which would leak
+                # into unrelated operations in a long-running agent).
+                commit_kwargs: dict[str, Any] = {}
                 if author:
-                    # GitPython accepts this via git.commit() with env vars
-                    os.environ["GIT_AUTHOR_NAME"] = author.split("<")[0].strip()
-                    email = author.split("<")[-1].rstrip(">").strip() if "<" in author else ""
-                    if email:
-                        os.environ["GIT_AUTHOR_EMAIL"] = email
-                commit = repo.index.commit(full_message)
+                    from git import Actor
+                    name = author.split("<")[0].strip() or "Unknown"
+                    email = (
+                        author.split("<")[-1].rstrip(">").strip()
+                        if "<" in author else ""
+                    )
+                    actor = Actor(name, email)
+                    commit_kwargs["author"] = actor
+                    commit_kwargs["committer"] = actor
+                commit = repo.index.commit(full_message, **commit_kwargs)
         except Exception as e:
             msg = str(e).lower()
             if "nothing to commit" in msg or "no changes" in msg:
@@ -497,24 +504,46 @@ class GitClient:
         return remote
 
     def pull(
-        self, remote: str = "origin", branch: Optional[str] = None, *, ff_only: bool = True,
+        self, remote: Optional[str] = None, branch: Optional[str] = None, *,
+        ff_only: bool = True,
     ) -> str:
-        """Pull from ``remote`` into the current branch.
+        """Pull into the current branch.
 
-        ``ff_only=True`` (default) refuses to merge or rebase — the safest
-        option; matches `git pull --ff-only`. Set False if a merge/rebase
-        is genuinely wanted.
+        - Neither ``remote`` nor ``branch`` specified (default):
+          ``git pull`` follows the configured upstream of the current
+          branch. Correct default behavior.
+        - Both specified: ``git pull <remote> <branch>``.
+        - ``remote`` specified without ``branch``: ``git pull <remote>
+          <current-branch>``. This matches what the caller intends
+          (pull my branch from that remote), not ``git pull <remote>``
+          alone (which would merge the remote's HEAD — almost never what's
+          wanted).
+
+        ``ff_only=True`` (default) refuses to merge or rebase — safest;
+        matches ``git pull --ff-only``. Set False for merge/rebase flows.
         """
         repo = self._get_repo()
         try:
             args = []
             if ff_only:
                 args.append("--ff-only")
-            if branch:
+            if remote and branch:
                 args.extend([remote, branch])
-            else:
-                args.append(remote)
+            elif remote:
+                # Explicit remote but no branch: use the current branch as
+                # the remote ref, which is what the caller almost certainly
+                # means. "git pull <remote>" alone would pull the remote's
+                # HEAD regardless of our current branch.
+                current = self.current_branch()
+                if current == "HEAD":
+                    raise GitClientError(
+                        "cannot pull on detached HEAD without an explicit branch"
+                    )
+                args.extend([remote, current])
+            # else: no remote specified — git pull follows configured upstream
             repo.git.pull(*args)
+        except GitClientError:
+            raise
         except Exception as e:
             msg = str(e).lower()
             if "not possible to fast-forward" in msg:
