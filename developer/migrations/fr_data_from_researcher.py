@@ -44,7 +44,6 @@ import json
 import logging
 import re
 import sqlite3
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -52,14 +51,11 @@ from typing import Any, Optional
 from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, KnowledgeStore, Tier
 
 from developer.fr_store import (
-    ACTIVE_STATUSES,
-    ALL_STATUSES,
     FR_STATUS_ARCHIVED,
     FR_STATUS_COMPLETED,
     FR_STATUS_MERGED,
     FR_STATUS_OPEN,
     FRStore,
-    _fr_from_entry,
 )
 
 
