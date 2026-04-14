@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from khonliang.knowledge.store import KnowledgeStore, Tier, EntryStatus
+from khonliang.knowledge.store import KnowledgeStore, Tier
 
 from developer.fr_store import (
     FR_STATUS_ARCHIVED,
@@ -25,7 +25,6 @@ from developer.fr_store import (
     FRStore,
 )
 from developer.migrations.fr_data_from_researcher import (
-    MigrationReport,
     _extract_fr_status_and_merge,
     migrate,
 )

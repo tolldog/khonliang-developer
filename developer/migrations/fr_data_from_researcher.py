@@ -15,8 +15,9 @@ over to developer's so developer becomes the single source of truth.
   we log and skip rather than overwrite, so the caller can triage).
 - Dry-run mode by default (call with ``apply=True`` to actually write).
 - Records migrated:
-  - Every ``tier=DERIVED`` entry tagged ``fr`` — gets written through
-    :class:`FRStore` so its metadata normalization applies
+  - Every ``tier=DERIVED`` entry tagged ``fr`` — converted into the
+    FRStore-compatible KnowledgeEntry shape and written directly to the
+    target KnowledgeStore, preserving researcher-specific extra metadata
   - Every ``tier=DERIVED`` entry tagged ``capability`` — copied via
     the underlying KnowledgeStore (FRStore's own capability tracking
     re-fires when status transitions, but we preserve pre-migration
