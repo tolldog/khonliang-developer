@@ -33,6 +33,11 @@ dependencies = [
     # fr_developer_d5642f3e). githubkit is async-native and type-forward,
     # which aligns with the rest of developer's async code.
     "githubkit>=0.11",
+    # Native git operations — SDK over subprocess for status, branch, commit,
+    # push, etc. Used by git_client (fr_developer_e778b9bf), which consumers
+    # (PR watcher, stacked PR workflow, dispatched-Claude) call instead of
+    # shelling out to `git`.
+    "gitpython>=3.1",
 ]
 
 [project.optional-dependencies]

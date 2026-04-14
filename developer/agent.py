@@ -122,6 +122,32 @@ class DeveloperAgent(BaseAgent):
                    "status": {"type": "string", "default": ""},
                    "include_all": {"type": "boolean", "default": False}},
                   since="0.4.0"),
+            # Native git operations (fr_developer_e778b9bf). Each takes a
+            # `cwd` (repo path); destructive ops require explicit flags.
+            Skill("git_status", "Working-tree status for a repo",
+                  {"cwd": {"type": "string", "required": True}},
+                  since="0.5.0"),
+            Skill("git_log", "Recent commits for a repo",
+                  {"cwd": {"type": "string", "required": True},
+                   "ref": {"type": "string", "default": "HEAD"},
+                   "limit": {"type": "integer", "default": 20}},
+                  since="0.5.0"),
+            Skill("git_diff", "Diff working-tree vs ref, or between two refs",
+                  {"cwd": {"type": "string", "required": True},
+                   "ref_a": {"type": "string", "default": "HEAD"},
+                   "ref_b": {"type": "string", "default": ""}},
+                  since="0.5.0"),
+            Skill("git_branches", "List local and/or remote branches",
+                  {"cwd": {"type": "string", "required": True},
+                   "local": {"type": "boolean", "default": True},
+                   "remote": {"type": "boolean", "default": False}},
+                  since="0.5.0"),
+            Skill("git_commit", "Commit staged changes",
+                  {"cwd": {"type": "string", "required": True},
+                   "message": {"type": "string", "required": True},
+                   "co_authors": {"type": "string", "default": "",
+                                  "description": "comma-separated Name <email> list"}},
+                  since="0.5.0"),
         ]
 
     def register_collaborations(self):
@@ -556,6 +582,131 @@ class DeveloperAgent(BaseAgent):
         return {
             "count": len(frs),
             "frs": [f.to_public_dict() for f in frs],
+        }
+
+    # -- native git operations (fr_developer_e778b9bf) --
+    #
+    # Each handler takes an explicit `cwd` since developer can operate
+    # on multiple project workspaces. Destructive flags (force, amend)
+    # are deliberately NOT surfaced via these initial skills — if a
+    # caller needs them they call the Python API directly; the bus skill
+    # surface stays safe by default.
+
+    @handler("git_status")
+    async def handle_git_status(self, args):
+        from developer.git_client import GitClient, GitClientError
+        cwd = args.get("cwd", "")
+        if not cwd:
+            return {"error": "cwd is required"}
+        try:
+            s = GitClient(cwd).status()
+        except GitClientError as e:
+            await self.report_gap("git_status", str(e))
+            return {"error": str(e)}
+        return {
+            "branch": s.branch,
+            "is_dirty": s.is_dirty,
+            "untracked": s.untracked,
+            "modified": s.modified,
+            "staged": s.staged,
+            "deleted": s.deleted,
+            "ahead": s.ahead,
+            "behind": s.behind,
+            "detached": s.detached,
+        }
+
+    @handler("git_log")
+    async def handle_git_log(self, args):
+        from developer.git_client import GitClient, GitClientError
+        cwd = args.get("cwd", "")
+        if not cwd:
+            return {"error": "cwd is required"}
+        try:
+            commits = GitClient(cwd).log(
+                ref=args.get("ref", "HEAD"),
+                limit=int(args.get("limit", 20)),
+            )
+        except GitClientError as e:
+            await self.report_gap("git_log", str(e))
+            return {"error": str(e)}
+        return {
+            "count": len(commits),
+            "commits": [
+                {
+                    "sha": c.sha,
+                    "short_sha": c.short_sha,
+                    "author": c.author,
+                    "committed_at": c.committed_at,
+                    "message": c.message,
+                }
+                for c in commits
+            ],
+        }
+
+    @handler("git_diff")
+    async def handle_git_diff(self, args):
+        from developer.git_client import GitClient, GitClientError
+        cwd = args.get("cwd", "")
+        if not cwd:
+            return {"error": "cwd is required"}
+        ref_b = args.get("ref_b") or None
+        try:
+            diff = GitClient(cwd).diff(
+                ref_a=args.get("ref_a", "HEAD"),
+                ref_b=ref_b,
+            )
+        except GitClientError as e:
+            await self.report_gap("git_diff", str(e))
+            return {"error": str(e)}
+        return {"diff": diff}
+
+    @handler("git_branches")
+    async def handle_git_branches(self, args):
+        from developer.git_client import GitClient, GitClientError
+        cwd = args.get("cwd", "")
+        if not cwd:
+            return {"error": "cwd is required"}
+        try:
+            branches = GitClient(cwd).list_branches(
+                local=bool(args.get("local", True)),
+                remote=bool(args.get("remote", False)),
+            )
+        except GitClientError as e:
+            await self.report_gap("git_branches", str(e))
+            return {"error": str(e)}
+        return {
+            "count": len(branches),
+            "branches": [
+                {"name": b.name, "is_remote": b.is_remote, "head_sha": b.head_sha,
+                 "is_current": b.is_current}
+                for b in branches
+            ],
+        }
+
+    @handler("git_commit")
+    async def handle_git_commit(self, args):
+        from developer.git_client import GitClient, GitClientError
+        cwd = args.get("cwd", "")
+        message = args.get("message", "")
+        if not cwd or not message:
+            return {"error": "cwd and message are required"}
+        co_raw = args.get("co_authors", "")
+        if isinstance(co_raw, list):
+            co_authors = [str(c).strip() for c in co_raw if str(c).strip()]
+        else:
+            co_authors = [c.strip() for c in str(co_raw).split(",") if c.strip()]
+        try:
+            commit = GitClient(cwd).commit(
+                message=message,
+                co_authors=co_authors or None,
+            )
+        except GitClientError as e:
+            await self.report_gap("git_commit", str(e))
+            return {"error": str(e)}
+        return {
+            "sha": commit.sha,
+            "short_sha": commit.short_sha,
+            "message": commit.message,
         }
 
     # -- test run + distill --

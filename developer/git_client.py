@@ -1,0 +1,590 @@
+"""Native git client for developer.
+
+Parallel to ``github_client.py``: per ``feedback_prefer_python_modules_over_execs``,
+developer reaches for the Python SDK (``GitPython``) rather than shelling
+out to ``git``. Single entry point so authentication, error normalization,
+and destructive-op guardrails live in one place.
+
+**Scope of this module:** common git operations a dispatched-Claude,
+PR watcher, or stacked-PR workflow would run. Everything here calls
+into ``git.Repo`` under the hood; we normalize into small dataclasses
+so callers don't touch GitPython types directly.
+
+**Destructive-op pattern** (mirrors ``admin_bypass`` on ``github_client.merge_pr``):
+- ``delete_branch(force=False)``: refuses unmerged branches without force
+- ``push(force=False)``: refuses ``--force`` without explicit opt-in
+- ``amend`` / hard reset / force push: all require explicit flags, logged at INFO
+
+**Typed errors** (mirrors github_client's typed exceptions) so callers can
+switch on the specific cause without parsing messages.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses — normalized shapes so consumers don't touch GitPython types
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RepoStatus:
+    """Working-tree status summary."""
+    branch: str                        # current branch (detached → "HEAD")
+    is_dirty: bool                     # any uncommitted changes
+    untracked: list[str] = field(default_factory=list)
+    modified: list[str] = field(default_factory=list)
+    staged: list[str] = field(default_factory=list)
+    deleted: list[str] = field(default_factory=list)
+    ahead: int = 0                     # commits ahead of upstream (if tracking)
+    behind: int = 0                    # commits behind upstream
+    detached: bool = False
+
+
+@dataclass
+class GitCommit:
+    """A commit in the repository."""
+    sha: str
+    short_sha: str
+    author: str                        # "Name <email>"
+    committed_at: str                  # ISO8601
+    message: str                       # first line (subject)
+    full_message: str                  # subject + body
+
+
+@dataclass
+class GitBranch:
+    """A branch (local or remote)."""
+    name: str                          # e.g. "main" or "origin/feat/x"
+    is_remote: bool
+    head_sha: str
+    is_current: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Errors — typed so callers can handle specific cases
+# ---------------------------------------------------------------------------
+
+
+class GitClientError(RuntimeError):
+    """Base class for git client errors."""
+
+
+class GitNotFoundError(GitClientError):
+    """Ref / branch / remote / repo doesn't exist."""
+
+
+class GitUncommittedError(GitClientError):
+    """Destructive op attempted against a dirty working tree."""
+
+
+class GitConflictError(GitClientError):
+    """Merge / rebase / cherry-pick produced a conflict."""
+
+
+class GitUpstreamError(GitClientError):
+    """Push rejected (non-fast-forward without --force, missing upstream, etc.)."""
+
+
+class GitDestructiveError(GitClientError):
+    """Destructive op attempted without the required explicit flag."""
+
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
+
+class GitClient:
+    """Thin wrapper over ``git.Repo``.
+
+    Lazy-imports GitPython so the module stays cheap to import and tests
+    that don't touch git can skip the dependency.
+
+    One client per repository path. Each public method takes simple
+    arguments and returns normalized dataclasses or plain dicts — callers
+    don't need to know GitPython's object model.
+    """
+
+    def __init__(self, cwd: str | Path):
+        self.cwd = Path(cwd).resolve()
+        self._repo: Any = None  # lazy: git.Repo
+
+    def _get_repo(self) -> Any:
+        if self._repo is None:
+            try:
+                from git import Repo
+                from git.exc import InvalidGitRepositoryError, NoSuchPathError
+            except ImportError as e:
+                raise GitClientError(
+                    "GitPython is not installed; add it to pyproject.toml or "
+                    "remove the git_client dependency."
+                ) from e
+
+            if not self.cwd.exists():
+                raise GitNotFoundError(f"path does not exist: {self.cwd}")
+            try:
+                self._repo = Repo(str(self.cwd))
+            except InvalidGitRepositoryError as e:
+                raise GitNotFoundError(f"not a git repository: {self.cwd}") from e
+            except NoSuchPathError as e:
+                raise GitNotFoundError(f"path does not exist: {self.cwd}") from e
+        return self._repo
+
+    # ------------------------------------------------------------------
+    # Introspection — safe, read-only
+    # ------------------------------------------------------------------
+
+    def status(self) -> RepoStatus:
+        """Return a structured working-tree status snapshot.
+
+        Uses ``git status --porcelain=v1`` under the hood for stable
+        parseable output — cleaner than GitPython's index-diff semantics
+        (which reverse direction conventions depending on how you call
+        them). Porcelain v1 is a documented, stable format.
+        """
+        repo = self._get_repo()
+
+        detached = repo.head.is_detached
+        branch_name = "HEAD" if detached else repo.active_branch.name
+
+        # Parse porcelain v1: two-char status + space + path (or two paths for rename).
+        # XY format: X=index status, Y=working-tree status.
+        # "??" = untracked. Space = unmodified.
+        raw = repo.git.status("--porcelain=v1", "-z")
+        untracked: list[str] = []
+        modified: list[str] = []
+        staged: list[str] = []
+        deleted: list[str] = []
+
+        if raw:
+            # -z uses \0 separators; rename/copy entries have two paths \0-separated.
+            entries = raw.split("\x00")
+            i = 0
+            while i < len(entries):
+                entry = entries[i]
+                if not entry:
+                    i += 1
+                    continue
+                # status code is first 2 chars, then space, then path
+                if len(entry) < 3:
+                    i += 1
+                    continue
+                code = entry[:2]
+                path = entry[3:]
+                # Rename entries have X in 'R'/'C'; the old path comes in the next entry
+                if code[0] in ("R", "C"):
+                    i += 1  # skip the old path entry
+                if code == "??":
+                    untracked.append(path)
+                else:
+                    index_status, wt_status = code[0], code[1]
+                    # X (index) = staged changes; Y (working-tree) = unstaged
+                    if index_status == "D":
+                        deleted.append(path)
+                    elif index_status != " " and index_status != "?":
+                        staged.append(path)
+                    if wt_status == "D":
+                        if path not in deleted:
+                            deleted.append(path)
+                    elif wt_status != " " and wt_status != "?":
+                        if path not in modified:
+                            modified.append(path)
+                i += 1
+
+        # ahead / behind against the tracking branch, if any.
+        ahead = behind = 0
+        if not detached:
+            try:
+                tracking = repo.active_branch.tracking_branch()
+                if tracking is not None:
+                    # ahead = our commits not in upstream; behind = upstream not in us
+                    ahead_count = sum(1 for _ in repo.iter_commits(
+                        f"{tracking}..{repo.active_branch}"
+                    ))
+                    behind_count = sum(1 for _ in repo.iter_commits(
+                        f"{repo.active_branch}..{tracking}"
+                    ))
+                    ahead = ahead_count
+                    behind = behind_count
+            except Exception:
+                pass
+
+        is_dirty = bool(untracked or modified or staged or deleted)
+        return RepoStatus(
+            branch=branch_name,
+            is_dirty=is_dirty,
+            untracked=untracked,
+            modified=modified,
+            staged=staged,
+            deleted=deleted,
+            ahead=ahead,
+            behind=behind,
+            detached=detached,
+        )
+
+    def current_branch(self) -> str:
+        """Return the active branch name, or 'HEAD' if detached."""
+        repo = self._get_repo()
+        if repo.head.is_detached:
+            return "HEAD"
+        return repo.active_branch.name
+
+    def list_branches(self, *, local: bool = True, remote: bool = False) -> list[GitBranch]:
+        """List branches. Pass local=True, remote=True, or both."""
+        repo = self._get_repo()
+        out: list[GitBranch] = []
+
+        current = None if repo.head.is_detached else repo.active_branch.name
+
+        if local:
+            for head in repo.heads:
+                out.append(GitBranch(
+                    name=head.name,
+                    is_remote=False,
+                    head_sha=head.commit.hexsha,
+                    is_current=(head.name == current),
+                ))
+        if remote:
+            for r in repo.remotes:
+                for ref in r.refs:
+                    # Skip the symbolic HEAD ref (e.g. "origin/HEAD")
+                    if ref.name.endswith("/HEAD"):
+                        continue
+                    out.append(GitBranch(
+                        name=ref.name,
+                        is_remote=True,
+                        head_sha=ref.commit.hexsha,
+                        is_current=False,
+                    ))
+        return out
+
+    def log(
+        self, *, ref: str = "HEAD", limit: int = 20, paths: Optional[list[str]] = None,
+    ) -> list[GitCommit]:
+        """Return commits reachable from ``ref`` (newest first).
+
+        ``paths`` restricts to commits touching those paths.
+        """
+        repo = self._get_repo()
+        try:
+            iter_kwargs: dict[str, Any] = {"max_count": limit}
+            if paths:
+                iter_kwargs["paths"] = paths
+            commits = list(repo.iter_commits(ref, **iter_kwargs))
+        except Exception as e:
+            raise GitClientError(f"log failed for {ref}: {e}") from e
+        return [_to_commit(c) for c in commits]
+
+    def show(self, ref: str) -> GitCommit:
+        """Return the commit ``ref`` resolves to."""
+        repo = self._get_repo()
+        try:
+            commit = repo.commit(ref)
+        except Exception as e:
+            raise GitNotFoundError(f"unknown ref: {ref}") from e
+        return _to_commit(commit)
+
+    def rev_parse(self, ref: str) -> str:
+        """Return the full sha that ``ref`` resolves to."""
+        repo = self._get_repo()
+        try:
+            return repo.git.rev_parse(ref)
+        except Exception as e:
+            raise GitNotFoundError(f"unknown ref: {ref}") from e
+
+    def diff(
+        self, ref_a: str = "HEAD", ref_b: Optional[str] = None,
+        *, paths: Optional[list[str]] = None,
+    ) -> str:
+        """Return a unified diff string.
+
+        - ``diff(ref_a)`` → working tree vs ref_a
+        - ``diff(ref_a, ref_b)`` → ref_a..ref_b
+        - ``paths`` restricts to those files
+        """
+        repo = self._get_repo()
+        try:
+            if ref_b is None:
+                args = [ref_a]
+            else:
+                args = [f"{ref_a}..{ref_b}"]
+            if paths:
+                args.append("--")
+                args.extend(paths)
+            return repo.git.diff(*args)
+        except Exception as e:
+            raise GitClientError(f"diff failed: {e}") from e
+
+    # ------------------------------------------------------------------
+    # Mutating operations — with guardrails on destructive ones
+    # ------------------------------------------------------------------
+
+    def checkout(self, ref: str, *, new_branch: bool = False) -> str:
+        """Check out ``ref``. With ``new_branch=True``, create + switch.
+
+        Refuses to switch when the working tree is dirty (raises
+        :class:`GitUncommittedError`) — matching git's own behavior but
+        with a typed error.
+        """
+        repo = self._get_repo()
+        if repo.is_dirty(untracked_files=False):
+            raise GitUncommittedError(
+                "working tree has uncommitted changes; commit or stash before checkout"
+            )
+        try:
+            if new_branch:
+                new = repo.create_head(ref)
+                new.checkout()
+            else:
+                repo.git.checkout(ref)
+        except Exception as e:
+            msg = str(e)
+            if "already exists" in msg.lower():
+                raise GitClientError(f"branch {ref!r} already exists") from e
+            if "did not match" in msg.lower() or "unknown revision" in msg.lower():
+                raise GitNotFoundError(f"unknown ref: {ref}") from e
+            raise GitClientError(f"checkout failed: {e}") from e
+        return self.current_branch()
+
+    def create_branch(self, name: str, *, base: Optional[str] = None) -> str:
+        """Create (but don't check out) a new branch.
+
+        ``base`` defaults to current HEAD.
+        """
+        repo = self._get_repo()
+        if name in [h.name for h in repo.heads]:
+            raise GitClientError(f"branch {name!r} already exists")
+        try:
+            if base:
+                repo.create_head(name, base)
+            else:
+                repo.create_head(name)
+        except Exception as e:
+            raise GitClientError(f"create_branch failed: {e}") from e
+        return name
+
+    def delete_branch(self, name: str, *, force: bool = False) -> str:
+        """Delete a local branch.
+
+        ``force=False`` refuses to delete unmerged branches (matches
+        ``git branch -d`` behavior). ``force=True`` forces deletion and
+        is logged at INFO for audit.
+        """
+        repo = self._get_repo()
+        if name not in [h.name for h in repo.heads]:
+            raise GitNotFoundError(f"local branch {name!r} does not exist")
+        if name == self.current_branch():
+            raise GitClientError(f"cannot delete the current branch {name!r}")
+
+        try:
+            if force:
+                logger.info("delete_branch(force=True): %s in %s", name, self.cwd)
+                repo.delete_head(name, force=True)
+            else:
+                try:
+                    repo.delete_head(name)
+                except Exception as e:
+                    if "not fully merged" in str(e).lower():
+                        raise GitClientError(
+                            f"branch {name!r} is not fully merged; "
+                            f"pass force=True to delete anyway"
+                        ) from e
+                    raise
+        except GitClientError:
+            raise
+        except Exception as e:
+            raise GitClientError(f"delete_branch failed: {e}") from e
+        return name
+
+    def stage(self, paths: list[str]) -> list[str]:
+        """Stage the given paths (relative to repo root)."""
+        repo = self._get_repo()
+        try:
+            repo.index.add(paths)
+        except Exception as e:
+            raise GitClientError(f"stage failed: {e}") from e
+        return list(paths)
+
+    def unstage(self, paths: list[str]) -> list[str]:
+        """Unstage the given paths (keeps working-tree changes)."""
+        repo = self._get_repo()
+        try:
+            repo.git.reset("HEAD", "--", *paths)
+        except Exception as e:
+            raise GitClientError(f"unstage failed: {e}") from e
+        return list(paths)
+
+    def commit(
+        self, message: str, *,
+        author: Optional[str] = None,
+        co_authors: Optional[list[str]] = None,
+        amend: bool = False,
+    ) -> GitCommit:
+        """Commit the staged changes.
+
+        ``co_authors`` is a list of ``Name <email>`` strings appended as
+        ``Co-Authored-By:`` trailers.
+
+        ``amend=True`` rewrites the previous commit — destructive if that
+        commit is already pushed. Logged at INFO.
+        """
+        repo = self._get_repo()
+        if not message or not message.strip():
+            raise GitClientError("commit requires a non-empty message")
+
+        # Pre-check for empty staging — GitPython's index.commit happily
+        # creates empty commits; we want to refuse explicitly so callers
+        # don't silently accumulate no-ops.
+        if not amend:
+            has_staged = False
+            try:
+                head_tree = repo.head.commit.tree
+                if list(repo.index.diff(head_tree)):
+                    has_staged = True
+            except Exception:
+                # No HEAD yet (first commit); treat any indexed file as staged
+                has_staged = len(repo.index.entries) > 0
+            if not has_staged:
+                raise GitClientError("no staged changes to commit")
+
+        full_message = message.rstrip()
+        if co_authors:
+            full_message += "\n"
+            for co in co_authors:
+                full_message += f"\nCo-Authored-By: {co}"
+
+        try:
+            if amend:
+                logger.info("commit(amend=True) in %s", self.cwd)
+                repo.git.commit("--amend", "-m", full_message)
+                # After amend, HEAD is the new commit — fetch it
+                commit = repo.head.commit
+            else:
+                # Use the Python API for non-amend for better structured error handling
+                kwargs: dict[str, Any] = {}
+                if author:
+                    # GitPython accepts this via git.commit() with env vars
+                    os.environ["GIT_AUTHOR_NAME"] = author.split("<")[0].strip()
+                    email = author.split("<")[-1].rstrip(">").strip() if "<" in author else ""
+                    if email:
+                        os.environ["GIT_AUTHOR_EMAIL"] = email
+                commit = repo.index.commit(full_message)
+        except Exception as e:
+            msg = str(e).lower()
+            if "nothing to commit" in msg or "no changes" in msg:
+                raise GitClientError("no staged changes to commit") from e
+            raise GitClientError(f"commit failed: {e}") from e
+        return _to_commit(commit)
+
+    def fetch(self, remote: str = "origin") -> str:
+        """Fetch from the named remote. Returns the remote name."""
+        repo = self._get_repo()
+        try:
+            repo.remotes[remote].fetch()
+        except IndexError as e:
+            raise GitNotFoundError(f"remote {remote!r} not configured") from e
+        except Exception as e:
+            raise GitClientError(f"fetch failed: {e}") from e
+        return remote
+
+    def pull(
+        self, remote: str = "origin", branch: Optional[str] = None, *, ff_only: bool = True,
+    ) -> str:
+        """Pull from ``remote`` into the current branch.
+
+        ``ff_only=True`` (default) refuses to merge or rebase — the safest
+        option; matches `git pull --ff-only`. Set False if a merge/rebase
+        is genuinely wanted.
+        """
+        repo = self._get_repo()
+        try:
+            args = []
+            if ff_only:
+                args.append("--ff-only")
+            if branch:
+                args.extend([remote, branch])
+            else:
+                args.append(remote)
+            repo.git.pull(*args)
+        except Exception as e:
+            msg = str(e).lower()
+            if "not possible to fast-forward" in msg:
+                raise GitUpstreamError(
+                    "pull not fast-forward; branch has diverged from upstream"
+                ) from e
+            if "conflict" in msg:
+                raise GitConflictError(f"pull produced conflicts: {e}") from e
+            raise GitClientError(f"pull failed: {e}") from e
+        return self.current_branch()
+
+    def push(
+        self, remote: str = "origin", branch: Optional[str] = None, *,
+        force: bool = False, set_upstream: bool = False,
+    ) -> dict[str, Any]:
+        """Push to ``remote``.
+
+        ``force=False`` refuses to rewrite upstream history. ``force=True``
+        is logged at INFO with branch + SHA context so the audit trail
+        captures the bypass.
+
+        ``set_upstream=True`` is equivalent to ``git push -u``.
+        """
+        repo = self._get_repo()
+        current = self.current_branch()
+        branch_to_push = branch or current
+
+        try:
+            args = []
+            if force:
+                args.append("--force")
+                logger.info(
+                    "push(force=True): %s/%s in %s", remote, branch_to_push, self.cwd,
+                )
+            if set_upstream:
+                args.append("-u")
+            args.append(remote)
+            args.append(branch_to_push)
+            repo.git.push(*args)
+        except Exception as e:
+            msg = str(e).lower()
+            if "non-fast-forward" in msg or "rejected" in msg:
+                raise GitUpstreamError(
+                    f"push rejected (non-fast-forward); pull or rebase first"
+                ) from e
+            if "does not appear to be a git repository" in msg:
+                raise GitNotFoundError(f"remote {remote!r} unreachable") from e
+            raise GitClientError(f"push failed: {e}") from e
+        return {
+            "remote": remote,
+            "branch": branch_to_push,
+            "force": force,
+            "set_upstream": set_upstream,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _to_commit(commit: Any) -> GitCommit:
+    """Convert a git.Commit into our normalized :class:`GitCommit`."""
+    message = commit.message
+    subject = message.split("\n", 1)[0]
+    return GitCommit(
+        sha=commit.hexsha,
+        short_sha=commit.hexsha[:8],
+        author=f"{commit.author.name} <{commit.author.email}>",
+        committed_at=commit.committed_datetime.isoformat(),
+        message=subject,
+        full_message=message,
+    )
