@@ -413,6 +413,225 @@ class FRStore:
         self._record_capability(fr)
         return fr
 
+    def merge(
+        self,
+        *,
+        source_ids: Iterable[str],
+        title: str,
+        description: str,
+        priority: Optional[str] = None,
+        concept: str = "",
+        classification: str = "app",
+        merge_note: str = "",
+        merge_roles: Optional[dict[str, str]] = None,
+    ) -> FR:
+        """Merge multiple source FRs into a new FR.
+
+        Creates a new FR with the combined content, then marks each source
+        as ``merged`` with ``metadata.merged_into`` pointing at the new FR.
+        Dependency edges from other FRs that pointed at any source are
+        redirected to the new FR.
+
+        Source content is preserved verbatim — the merge never rewrites
+        source titles or descriptions. Each source's ``merge_role`` captures
+        what that source contributed (optional; pass via ``merge_roles``
+        keyed by source id).
+
+        **Why this design:** no existing record's status ever gets inverted
+        (``merged`` is terminal), which avoids the stale-status-overwrite
+        bug class that affects researcher's current merge implementation.
+
+        Args:
+            source_ids: FRs to merge (2 or more; duplicates deduped; each
+                id is resolved through any existing redirect first, so
+                passing already-merged ids merges their terminal targets).
+            title, description: Content for the new FR.
+            priority: New FR's priority. If omitted, takes the highest
+                priority among the (resolved) sources.
+            concept, classification, merge_note: carried as metadata.
+            merge_roles: optional ``{source_id: role_description}`` map.
+                Keys may match either original or resolved ids.
+
+        Raises:
+            FRError: if fewer than 2 distinct resolved sources, if any
+                source is unknown, if any source is already terminal
+                (completed / archived / merged — since that would either
+                waste the operation or invert a terminal state), or if
+                sources target different projects.
+        """
+        source_ids = list(source_ids or [])
+        if len(source_ids) < 2:
+            raise FRError(
+                "merge requires at least 2 source FRs; "
+                f"got {len(source_ids)}"
+            )
+        title = (title or "").strip()
+        description = (description or "").strip()
+        if not title:
+            raise FRError("merge requires a non-empty title")
+        if not description:
+            raise FRError("merge requires a non-empty description")
+        if priority is not None and priority not in ALLOWED_PRIORITIES:
+            raise FRError(
+                f"priority must be one of {sorted(ALLOWED_PRIORITIES)}, got {priority!r}"
+            )
+
+        # Resolve each source through existing redirects; collect in a stable
+        # order (first occurrence wins) for deterministic merged_from order.
+        resolved_sources: list[FR] = []
+        seen_ids: set[str] = set()
+        id_map: dict[str, str] = {}  # caller-id -> resolved-id for role rewriting
+        for raw_id in source_ids:
+            raw_id = (raw_id or "").strip()
+            if not raw_id:
+                continue
+            resolved_id = self.resolve_id(raw_id)
+            id_map[raw_id] = resolved_id
+            if resolved_id in seen_ids:
+                continue
+            fr = self.get(resolved_id, follow_redirect=False)
+            if fr is None:
+                raise FRError(f"unknown source fr id: {raw_id!r}")
+            if fr.status in TERMINAL_STATUSES:
+                # Already terminal (archived/completed/merged). Merging would
+                # either invert a terminal state or waste the operation.
+                raise FRError(
+                    f"source fr {resolved_id!r} is already terminal "
+                    f"(status={fr.status!r}); cannot merge"
+                )
+            resolved_sources.append(fr)
+            seen_ids.add(resolved_id)
+
+        if len(resolved_sources) < 2:
+            raise FRError(
+                "merge needs 2+ distinct (post-redirect) sources; "
+                f"got {len(resolved_sources)}"
+            )
+
+        # All sources must target the same project — merging across targets
+        # is almost always a mistake and has no clean semantic.
+        targets = {fr.target for fr in resolved_sources}
+        if len(targets) > 1:
+            raise FRError(
+                f"cannot merge sources with different targets: {sorted(targets)}"
+            )
+        target = resolved_sources[0].target
+
+        # Derive priority from sources if not explicit — take the highest.
+        effective_priority = priority or _max_priority(
+            [fr.priority for fr in resolved_sources]
+        )
+
+        # Generate new FR id deterministically from source ids so re-merging
+        # the same set yields the same id (the second call then fails the
+        # already-exists check below — the right signal for an accidental
+        # re-merge).
+        merged_from_ids = [fr.id for fr in resolved_sources]
+        new_id = _derive_merge_id(target, merged_from_ids)
+        if self.knowledge.get(new_id) is not None:
+            raise FRError(
+                f"merged fr already exists at {new_id} "
+                f"(same sources as a prior merge)"
+            )
+
+        # Combine backing_papers (stable order, deduped).
+        combined_papers: list[str] = []
+        for fr in resolved_sources:
+            for paper in fr.backing_papers:
+                if paper and paper not in combined_papers:
+                    combined_papers.append(paper)
+
+        # Combine depends_on (resolved through redirects + deduped). Drop any
+        # dep pointing at a source (or at the new id) to avoid self-reference
+        # after the redirect step below.
+        source_id_set = set(merged_from_ids)
+        combined_deps: list[str] = []
+        for fr in resolved_sources:
+            for dep in fr.depends_on:
+                resolved_dep = self.resolve_id(dep)
+                if resolved_dep in source_id_set or resolved_dep == new_id:
+                    continue
+                if resolved_dep not in combined_deps:
+                    combined_deps.append(resolved_dep)
+
+        # Cycle check: a combined_deps entry that (transitively) depends on
+        # any source FR would become a cycle after _redirect_dependents
+        # rewrites those edges to new_id. Example that would cycle:
+        #   A depends on X (so combined_deps includes X)
+        #   X depends on B (a source)
+        # After the merge: new depends on X, and X's dep on B gets
+        # rewritten to new → new ↔ X cycle. Reject up front so we never
+        # commit that state to the store.
+        for dep in combined_deps:
+            offending = self._transitive_dep_hits(dep, source_id_set)
+            if offending is not None:
+                raise FRError(
+                    f"merge would create a dependency cycle: {dep!r} "
+                    f"transitively depends on source {offending!r}. "
+                    "Resolve the dependency before merging."
+                )
+
+        now = time.time()
+        # New FR starts `open`; the merge doesn't imply the combined work is
+        # planned or in-progress yet.
+        new_fr = FR(
+            id=new_id,
+            target=target,
+            title=title,
+            description=description,
+            status=FR_STATUS_OPEN,
+            priority=effective_priority,
+            concept=concept,
+            classification=classification,
+            backing_papers=combined_papers,
+            depends_on=combined_deps,
+            branch="",
+            notes_history=[{
+                "at": now,
+                "status": FR_STATUS_OPEN,
+                "notes": f"merged from {', '.join(merged_from_ids)}",
+            }],
+            merged_into=None,
+            merged_from=list(merged_from_ids),
+            merge_role="",
+            merge_note=merge_note,
+            created_at=now,
+            updated_at=now,
+        )
+        self._store(new_fr)
+
+        # Mark each source as merged. Content preserved; only status +
+        # merged_into + merge_role change.
+        roles = merge_roles or {}
+        for fr in resolved_sources:
+            fr.status = FR_STATUS_MERGED
+            fr.merged_into = new_id
+            # Role lookup: caller-provided original id wins, else resolved id.
+            role = ""
+            for caller_id, resolved_id in id_map.items():
+                if resolved_id == fr.id and caller_id in roles:
+                    role = roles[caller_id]
+                    break
+            if not role and fr.id in roles:
+                role = roles[fr.id]
+            fr.merge_role = role
+            fr.notes_history.append({
+                "at": now,
+                "status": FR_STATUS_MERGED,
+                "notes": f"merged into {new_id}" + (f" ({role})" if role else ""),
+            })
+            fr.updated_at = now
+            self._store(fr)
+            # Capability: mark abandoned. The old entry's fr_id ref remains
+            # for audit; a new capability entry for the merged FR will be
+            # created when that FR transitions to planned/in_progress.
+            self._record_capability(fr)
+
+        # Redirect dependency edges on any other FR that pointed at a source.
+        self._redirect_dependents(merged_from_ids, new_id)
+
+        return new_fr
+
     def set_dependency(
         self,
         fr_id: str,
@@ -592,6 +811,72 @@ class FRStore:
                     stack.append(dep)
         return False
 
+    def _transitive_dep_hits(
+        self, start: str, targets: set[str], *, _visited: Optional[set[str]] = None,
+    ) -> Optional[str]:
+        """Return the first target id reachable from ``start`` via deps, or None.
+
+        Used by :meth:`merge` to pre-validate that combined_deps don't
+        transitively depend on any source FR — such a dep would become
+        a cycle once _redirect_dependents rewrites source-pointing edges
+        to ``new_id``.
+        """
+        if _visited is None:
+            _visited = set()
+        if start in _visited:
+            return None
+        _visited.add(start)
+        entry = self.knowledge.get(start)
+        if entry is None:
+            return None
+        deps = (entry.metadata or {}).get("depends_on") or []
+        for dep in deps:
+            resolved = self.resolve_id(dep)
+            if resolved in targets:
+                return resolved
+            hit = self._transitive_dep_hits(resolved, targets, _visited=_visited)
+            if hit is not None:
+                return hit
+        return None
+
+    def _redirect_dependents(self, source_ids: Iterable[str], new_id: str) -> None:
+        """Rewrite depends_on edges that point at any source to point at new_id.
+
+        Called from :meth:`merge` so other FRs that referenced a merged-away
+        source now resolve their dependency to the new consolidated FR.
+        Dedupes edges (if an FR already depended on both a source and the
+        new id, we don't produce a duplicate).
+        """
+        source_set = set(source_ids)
+        for entry in self.knowledge.get_by_tier(Tier.DERIVED):
+            if "fr" not in (entry.tags or []):
+                continue
+            if entry.id in source_set or entry.id == new_id:
+                continue
+            meta = entry.metadata or {}
+            deps = meta.get("depends_on") or []
+            if not any(d in source_set for d in deps):
+                continue
+
+            rewritten: list[str] = []
+            changed = False
+            for dep in deps:
+                if dep in source_set:
+                    if new_id not in rewritten:
+                        rewritten.append(new_id)
+                    changed = True
+                else:
+                    if dep not in rewritten:
+                        rewritten.append(dep)
+
+            if not changed:
+                continue
+
+            fr = _fr_from_entry(entry)
+            fr.depends_on = rewritten
+            fr.updated_at = time.time()
+            self._store(fr)
+
 
 # ---------------------------------------------------------------------------
 # Module helpers
@@ -635,8 +920,38 @@ def _derive_fr_id(target: str, title: str, concept: str) -> str:
     return f"fr_{target}_{digest}"
 
 
+def _derive_merge_id(target: str, source_ids: Iterable[str]) -> str:
+    """Stable id for a merge of a given set of source FRs.
+
+    Sorts source ids so order-of-arguments doesn't change the id (the same
+    set of sources should always produce the same merged FR id, letting the
+    existing-entry check catch accidental re-merges).
+    """
+    payload = "merge:" + ":".join(sorted(source_ids))
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]
+    return f"fr_{target}_{digest}"
+
+
 def _derive_capability_id(target: str, capability_name: str) -> str:
     """Stable capability id per (target, capability)."""
     payload = f"cap:{target}:{capability_name}".encode("utf-8")
     digest = hashlib.sha256(payload).hexdigest()[:12]
     return f"capability_{target}_{digest}"
+
+
+def _max_priority(priorities: Iterable[str]) -> str:
+    """Return the highest priority (``high`` > ``medium`` > ``low``).
+
+    Used by :meth:`FRStore.merge` when the caller doesn't pin a priority —
+    the merged FR inherits the maximum across its sources so a high-priority
+    source doesn't silently get demoted.
+    """
+    order = {"high": 2, "medium": 1, "low": 0}
+    best = "medium"
+    best_score = 1
+    for p in priorities:
+        score = order.get(p, 1)
+        if score > best_score:
+            best = p
+            best_score = score
+    return best
