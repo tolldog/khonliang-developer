@@ -338,8 +338,10 @@ def test_update_status_idempotent_with_notes_appends_history_and_bumps_ts(store)
     assert len(again.notes_history) == before_len + 1
     # updated_at must bump so consumers watching for changes see the delta
     assert again.updated_at > before_ts
-    # And the history entry's timestamp matches updated_at
-    assert again.notes_history[-1]["at"] == again.updated_at
+    # The history entry's "at" is recorded slightly before _store syncs
+    # updated_at back from KnowledgeStore (which stamps its own clock).
+    # They must both be "recent" — within a small window of each other.
+    assert abs(again.notes_history[-1]["at"] - again.updated_at) < 0.01
 
 
 def test_update_status_rejects_invalid_status_name(store):
@@ -514,6 +516,199 @@ def test_full_lifecycle_roundtrip(store):
 # ---------------------------------------------------------------------------
 # Serialization
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# update — in-place edit
+# ---------------------------------------------------------------------------
+
+
+def test_update_changes_title(store):
+    fr = store.promote(target="developer", title="Old", description="d")
+    updated = store.update(fr.id, title="New")
+    assert updated.title == "New"
+    assert updated.notes_history[-1]["notes"] == "edited in place"
+
+
+def test_update_changes_multiple_fields(store):
+    fr = store.promote(target="developer", title="T", description="d", priority="low")
+    updated = store.update(
+        fr.id, priority="high", description="expanded", concept="new-concept",
+    )
+    assert updated.priority == "high"
+    assert updated.description == "expanded"
+    assert updated.concept == "new-concept"
+
+
+def test_update_backing_papers_replaces(store):
+    fr = store.promote(target="developer", title="P", description="d",
+                       backing_papers=["p1", "p2"])
+    updated = store.update(fr.id, backing_papers=["p3"])
+    assert updated.backing_papers == ["p3"]
+
+
+def test_update_backing_papers_empty_clears(store):
+    fr = store.promote(target="developer", title="P2", description="d",
+                       backing_papers=["p1", "p2"])
+    updated = store.update(fr.id, backing_papers=[])
+    assert updated.backing_papers == []
+
+
+def test_update_backing_papers_none_keeps_existing(store):
+    fr = store.promote(target="developer", title="P3", description="d",
+                       backing_papers=["p1"])
+    updated = store.update(fr.id, title="New title")  # backing_papers=None
+    assert updated.backing_papers == ["p1"]
+
+
+def test_update_rejects_terminal_fr(store):
+    fr = store.promote(target="developer", title="T2", description="d")
+    store.update_status(fr.id, FR_STATUS_ARCHIVED)
+    with pytest.raises(FRError, match="terminal FRs are immutable"):
+        store.update(fr.id, title="Can't change")
+
+
+def test_update_rejects_invalid_priority(store):
+    fr = store.promote(target="developer", title="T3", description="d")
+    with pytest.raises(FRError, match="priority"):
+        store.update(fr.id, priority="urgent")
+
+
+def test_update_rejects_unknown_fr(store):
+    with pytest.raises(FRError, match="unknown fr id"):
+        store.update("fr_developer_missing", title="nope")
+
+
+def test_update_follows_redirect(store):
+    target = store.promote(target="developer", title="Target", description="d")
+    _seed_merged_fr(store, source_id="fr_developer_oldid", target_id=target.id)
+    updated = store.update("fr_developer_oldid", priority="high")
+    assert updated.id == target.id
+    assert updated.priority == "high"
+
+
+def test_update_idempotent_when_no_changes(store):
+    fr = store.promote(target="developer", title="Same", description="d")
+    before_ts = fr.updated_at
+    import time as _t
+    _t.sleep(0.01)
+    updated = store.update(fr.id, title="Same", description="d")
+    assert updated.updated_at == before_ts
+    assert len(updated.notes_history) == len(fr.notes_history)
+
+
+def test_update_with_notes_only_still_records_history(store):
+    fr = store.promote(target="developer", title="N", description="d")
+    before_len = len(fr.notes_history)
+    import time as _t
+    _t.sleep(0.01)
+    updated = store.update(fr.id, notes="just a note, no field change")
+    assert len(updated.notes_history) == before_len + 1
+    assert updated.notes_history[-1]["notes"] == "just a note, no field change"
+    assert updated.updated_at > fr.updated_at
+
+
+def test_update_empty_string_title_is_ignored(store):
+    """Empty string = 'no change' so callers can omit fields cleanly."""
+    fr = store.promote(target="developer", title="Keep", description="d")
+    updated = store.update(fr.id, title="")
+    assert updated.title == "Keep"
+
+
+# ---------------------------------------------------------------------------
+# next_fr — pick highest priority FR with all deps completed
+# ---------------------------------------------------------------------------
+
+
+def test_next_fr_none_when_store_empty(store):
+    assert store.next_fr() is None
+
+
+def test_next_fr_picks_highest_priority(store):
+    low = store.promote(target="developer", title="Low", description="d", priority="low")
+    high = store.promote(target="developer", title="High", description="d",
+                         priority="high", concept="c1")
+    med = store.promote(target="developer", title="Med", description="d",
+                        priority="medium", concept="c2")
+    picked = store.next_fr()
+    assert picked is not None
+    assert picked.id == high.id
+
+
+def test_next_fr_skips_terminal(store):
+    a = store.promote(target="developer", title="A", description="d", priority="high")
+    b = store.promote(target="developer", title="B", description="d",
+                      priority="medium", concept="c")
+    store.update_status(a.id, FR_STATUS_ARCHIVED)
+    picked = store.next_fr()
+    assert picked.id == b.id
+
+
+def test_next_fr_skips_in_progress(store):
+    a = store.promote(target="developer", title="A", description="d", priority="high")
+    b = store.promote(target="developer", title="B", description="d",
+                      priority="medium", concept="c")
+    store.update_status(a.id, FR_STATUS_IN_PROGRESS)
+    picked = store.next_fr()
+    assert picked.id == b.id
+
+
+def test_next_fr_skips_blocked(store):
+    dep = store.promote(target="developer", title="Dep", description="d",
+                        priority="low", concept="c1")
+    blocked = store.promote(target="developer", title="Blocked", description="d",
+                            priority="high", concept="c2")
+    store.set_dependency(blocked.id, [dep.id])
+    picked = store.next_fr()
+    assert picked is not None
+    # dep wins because blocked is blocked on dep
+    assert picked.id == dep.id
+
+
+def test_next_fr_unblocks_when_dep_completes(store):
+    dep = store.promote(target="developer", title="D", description="d",
+                        priority="low", concept="c1")
+    downstream = store.promote(target="developer", title="Later", description="d",
+                               priority="high", concept="c2")
+    store.set_dependency(downstream.id, [dep.id])
+    store.update_status(dep.id, FR_STATUS_IN_PROGRESS)
+    store.update_status(dep.id, FR_STATUS_COMPLETED)
+    picked = store.next_fr()
+    assert picked.id == downstream.id
+
+
+def test_next_fr_resolves_dep_through_merge(store):
+    merged_target = store.promote(target="developer", title="T", description="d",
+                                  priority="low", concept="cT")
+    store.update_status(merged_target.id, FR_STATUS_IN_PROGRESS)
+    store.update_status(merged_target.id, FR_STATUS_COMPLETED)
+    _seed_merged_fr(store, source_id="fr_developer_old", target_id=merged_target.id)
+
+    downstream = store.promote(target="developer", title="Down", description="d",
+                               priority="high", concept="cD")
+    store.set_dependency(downstream.id, ["fr_developer_old"])
+    picked = store.next_fr()
+    assert picked.id == downstream.id
+
+
+def test_next_fr_respects_target_filter(store):
+    dev = store.promote(target="developer", title="Dev", description="d",
+                        priority="high", concept="cD")
+    res = store.promote(target="researcher", title="Res", description="d",
+                        priority="high", concept="cR")
+    picked = store.next_fr(target="researcher")
+    assert picked.id == res.id
+
+
+def test_next_fr_dangling_dep_treated_as_blocked(store):
+    """Dep points at missing id → treat as blocked (conservative)."""
+    fr = store.promote(target="developer", title="F", description="d", priority="high")
+    entry = store.knowledge.get(fr.id)
+    meta = entry.metadata or {}
+    meta["depends_on"] = ["fr_developer_does_not_exist"]
+    entry.metadata = meta
+    store.knowledge.add(entry)
+    assert store.next_fr() is None
 
 
 # ---------------------------------------------------------------------------

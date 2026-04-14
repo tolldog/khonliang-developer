@@ -135,6 +135,22 @@ class DeveloperAgent(BaseAgent):
                    "status": {"type": "string", "default": ""},
                    "include_all": {"type": "boolean", "default": False}},
                   since="0.4.0"),
+            Skill("update_fr", "Edit an existing FR in place. Terminal FRs "
+                  "are immutable.",
+                  {"fr_id": {"type": "string", "required": True},
+                   "title": {"type": "string", "default": ""},
+                   "description": {"type": "string", "default": ""},
+                   "priority": {"type": "string", "default": ""},
+                   "concept": {"type": "string", "default": ""},
+                   "classification": {"type": "string", "default": ""},
+                   "backing_papers": {"type": "string", "default": "__NOCHANGE__",
+                                      "description": "comma-separated; '__NOCHANGE__' keeps existing, empty string clears"},
+                   "notes": {"type": "string", "default": ""}},
+                  since="0.6.0"),
+            Skill("next_fr_local", "Pick the highest-priority open/planned FR "
+                  "whose deps are completed. Returns null when nothing's ready.",
+                  {"target": {"type": "string", "default": ""}},
+                  since="0.6.0"),
             # Native git operations (fr_developer_e778b9bf). Each takes a
             # `cwd` (repo path); destructive ops require explicit flags.
             Skill("git_status", "Working-tree status for a repo",
@@ -649,6 +665,61 @@ class DeveloperAgent(BaseAgent):
             "count": len(frs),
             "frs": [f.to_public_dict() for f in frs],
         }
+
+    @handler("update_fr")
+    async def handle_update_fr(self, args):
+        """Edit an FR in place.
+
+        Empty-string values for title/description/priority/concept/
+        classification are treated as "no change" (so callers can omit
+        fields). backing_papers uses the sentinel '__NOCHANGE__' to mean
+        "don't touch," since an empty string legitimately means "clear."
+        """
+        from developer.fr_store import FRError
+
+        fr_id = args.get("fr_id", "")
+        if not fr_id:
+            return {"error": "fr_id is required"}
+
+        # Translate empty-string "no change" inputs to Python None.
+        def _opt(key: str) -> str | None:
+            v = args.get(key, "")
+            return v if v else None
+
+        backing_raw = args.get("backing_papers", "__NOCHANGE__")
+        if backing_raw == "__NOCHANGE__":
+            backing = None
+        elif isinstance(backing_raw, list):
+            backing = [str(b).strip() for b in backing_raw if str(b).strip()]
+        else:
+            backing = [b.strip() for b in str(backing_raw).split(",") if b.strip()]
+
+        try:
+            fr = self.pipeline.frs.update(
+                fr_id=fr_id,
+                title=_opt("title"),
+                description=_opt("description"),
+                priority=_opt("priority"),
+                concept=_opt("concept"),
+                classification=_opt("classification"),
+                backing_papers=backing,
+                notes=args.get("notes", ""),
+            )
+        except FRError as e:
+            await self.report_gap("update_fr", str(e))
+            return {"error": str(e)}
+        except Exception as e:
+            await self.report_gap("update_fr", f"unexpected failure: {e}")
+            raise
+        return fr.to_public_dict()
+
+    @handler("next_fr_local")
+    async def handle_next_fr_local(self, args):
+        target = args.get("target") or None
+        fr = self.pipeline.frs.next_fr(target=target)
+        if fr is None:
+            return {"fr": None, "reason": "no ready FRs (all in-progress, blocked, or terminal)"}
+        return {"fr": fr.to_public_dict()}
 
     # -- native git operations (fr_developer_e778b9bf) --
     #
