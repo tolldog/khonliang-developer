@@ -33,8 +33,6 @@ For PR 1, the store:
 from __future__ import annotations
 
 import hashlib
-import json
-import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
@@ -45,8 +43,6 @@ from khonliang.knowledge.store import (
     Tier,
     EntryStatus,
 )
-
-logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -72,10 +68,11 @@ ACTIVE_STATUSES = {FR_STATUS_OPEN, FR_STATUS_PLANNED, FR_STATUS_IN_PROGRESS}
 TERMINAL_STATUSES = {FR_STATUS_COMPLETED, FR_STATUS_ARCHIVED, FR_STATUS_MERGED}
 ALL_STATUSES = ACTIVE_STATUSES | TERMINAL_STATUSES
 
-# Allowed transitions — a sparse DAG.
-# No transitions out of terminal states: once merged/archived/completed,
-# an FR stays there. (Any resurrection would be a fresh FR that references
-# the old one, not a status toggle.)
+# Allowed transitions — a sparse, constrained workflow graph.
+# Active states may move between each other when work is reprioritized or
+# re-scoped. No transitions out of terminal states: once
+# merged/archived/completed, an FR stays there. (Any resurrection would be a
+# fresh FR that references the old one, not a status toggle.)
 ALLOWED_TRANSITIONS: dict[str, set[str]] = {
     FR_STATUS_OPEN: {FR_STATUS_PLANNED, FR_STATUS_IN_PROGRESS, FR_STATUS_ARCHIVED, FR_STATUS_MERGED},
     FR_STATUS_PLANNED: {FR_STATUS_IN_PROGRESS, FR_STATUS_OPEN, FR_STATUS_ARCHIVED, FR_STATUS_MERGED},
