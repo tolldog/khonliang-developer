@@ -89,6 +89,39 @@ class DeveloperAgent(BaseAgent):
                    "detail": {"type": "string", "default": "brief"},
                    "timeout_s": {"type": "number", "default": 300}},
                   since="0.3.0"),
+            # Developer-owned FR lifecycle (Bundle A PR 1). These write to
+            # developer.db; legacy get_fr/list_frs still proxy to researcher
+            # for pre-migration records until fr_developer_0ab2aa9b lands.
+            Skill("promote_fr", "Create a new FR in developer's store",
+                  {"target": {"type": "string", "required": True},
+                   "title": {"type": "string", "required": True},
+                   "description": {"type": "string", "required": True},
+                   "priority": {"type": "string", "default": "medium"},
+                   "concept": {"type": "string", "default": ""},
+                   "classification": {"type": "string", "default": "app"},
+                   "backing_papers": {"type": "string", "default": ""}},
+                  since="0.4.0"),
+            Skill("update_fr_status", "Advance an FR's lifecycle status",
+                  {"fr_id": {"type": "string", "required": True},
+                   "status": {"type": "string", "required": True},
+                   "branch": {"type": "string", "default": ""},
+                   "notes": {"type": "string", "default": ""}},
+                  since="0.4.0"),
+            Skill("set_fr_dependency", "Set an FR's depends_on list (replaces prior deps)",
+                  {"fr_id": {"type": "string", "required": True},
+                   "depends_on": {"type": "string", "required": True}},
+                  since="0.4.0"),
+            Skill("get_fr_local", "Look up an FR from developer's own store "
+                  "(follows merge redirects by default)",
+                  {"fr_id": {"type": "string", "required": True},
+                   "follow_redirect": {"type": "boolean", "default": True}},
+                  since="0.4.0"),
+            Skill("list_frs_local", "List FRs from developer's own store. "
+                  "Default filters out terminal states.",
+                  {"target": {"type": "string", "default": ""},
+                   "status": {"type": "string", "default": ""},
+                   "include_all": {"type": "boolean", "default": False}},
+                  since="0.4.0"),
         ]
 
     def register_collaborations(self):
@@ -407,6 +440,112 @@ class DeveloperAgent(BaseAgent):
             c["rank"] = i
 
         return clusters
+
+    # -- developer-owned FR lifecycle (Bundle A PR 1) --
+    #
+    # These write to developer.db. The existing get_fr / list_frs handlers
+    # (which proxy to researcher.knowledge_search / researcher.feature_requests)
+    # stay in place for backward compat with pre-migration records. After
+    # the data migration (fr_developer_0ab2aa9b), those proxies get updated
+    # to read from developer's store first, falling back to researcher.
+
+    @handler("promote_fr")
+    async def handle_promote_fr(self, args):
+        from developer.fr_store import FRError
+
+        try:
+            backing = [p.strip() for p in (args.get("backing_papers") or "").split(",") if p.strip()]
+            fr = self.pipeline.frs.promote(
+                target=args.get("target", ""),
+                title=args.get("title", ""),
+                description=args.get("description", ""),
+                priority=args.get("priority", "medium"),
+                concept=args.get("concept", ""),
+                classification=args.get("classification", "app"),
+                backing_papers=backing,
+            )
+        except FRError as e:
+            await self.report_gap("promote_fr", str(e))
+            return {"error": str(e)}
+        except Exception as e:
+            await self.report_gap("promote_fr", f"unexpected failure: {e}")
+            raise
+        return {
+            "fr_id": fr.id,
+            "target": fr.target,
+            "priority": fr.priority,
+            "status": fr.status,
+        }
+
+    @handler("update_fr_status")
+    async def handle_update_fr_status(self, args):
+        from developer.fr_store import FRError
+
+        try:
+            fr = self.pipeline.frs.update_status(
+                fr_id=args.get("fr_id", ""),
+                status=args.get("status", ""),
+                branch=args.get("branch", ""),
+                notes=args.get("notes", ""),
+            )
+        except FRError as e:
+            await self.report_gap("update_fr_status", str(e))
+            return {"error": str(e)}
+        except Exception as e:
+            await self.report_gap("update_fr_status", f"unexpected failure: {e}")
+            raise
+        return {
+            "fr_id": fr.id,
+            "status": fr.status,
+            "branch": fr.branch,
+            "updated_at": fr.updated_at,
+        }
+
+    @handler("set_fr_dependency")
+    async def handle_set_fr_dependency(self, args):
+        from developer.fr_store import FRError
+
+        deps_raw = args.get("depends_on", "")
+        if isinstance(deps_raw, list):
+            deps = [str(d).strip() for d in deps_raw if str(d).strip()]
+        else:
+            deps = [d.strip() for d in str(deps_raw).split(",") if d.strip()]
+        try:
+            fr = self.pipeline.frs.set_dependency(
+                fr_id=args.get("fr_id", ""),
+                depends_on=deps,
+            )
+        except FRError as e:
+            await self.report_gap("set_fr_dependency", str(e))
+            return {"error": str(e)}
+        except Exception as e:
+            await self.report_gap("set_fr_dependency", f"unexpected failure: {e}")
+            raise
+        return {"fr_id": fr.id, "depends_on": fr.depends_on}
+
+    @handler("get_fr_local")
+    async def handle_get_fr_local(self, args):
+        follow_redirect = bool(args.get("follow_redirect", True))
+        fr = self.pipeline.frs.get(
+            fr_id=args.get("fr_id", ""),
+            follow_redirect=follow_redirect,
+        )
+        if fr is None:
+            return {"error": "not found", "fr_id": args.get("fr_id", "")}
+        return fr.to_public_dict()
+
+    @handler("list_frs_local")
+    async def handle_list_frs_local(self, args):
+        status = args.get("status") or None
+        target = args.get("target") or None
+        include_all = bool(args.get("include_all", False))
+        frs = self.pipeline.frs.list(
+            target=target, status=status, include_all=include_all,
+        )
+        return {
+            "count": len(frs),
+            "frs": [f.to_public_dict() for f in frs],
+        }
 
     # -- test run + distill --
 
