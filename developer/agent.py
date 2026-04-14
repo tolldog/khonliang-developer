@@ -111,6 +111,19 @@ class DeveloperAgent(BaseAgent):
                   {"fr_id": {"type": "string", "required": True},
                    "depends_on": {"type": "string", "required": True}},
                   since="0.4.0"),
+            Skill("merge_frs", "Merge multiple FRs into a new one. Old FRs go "
+                  "to terminal 'merged' state; dep edges redirect to the new FR.",
+                  {"source_ids": {"type": "string", "required": True,
+                                  "description": "comma-separated FR ids"},
+                   "title": {"type": "string", "required": True},
+                   "description": {"type": "string", "required": True},
+                   "priority": {"type": "string", "default": ""},
+                   "concept": {"type": "string", "default": ""},
+                   "classification": {"type": "string", "default": "app"},
+                   "merge_note": {"type": "string", "default": ""},
+                   "merge_roles": {"type": "string", "default": "",
+                                   "description": "optional; 'id1=role1,id2=role2'"}},
+                  since="0.5.0"),
             Skill("get_fr_local", "Look up an FR from developer's own store "
                   "(follows merge redirects by default)",
                   {"fr_id": {"type": "string", "required": True},
@@ -522,6 +535,59 @@ class DeveloperAgent(BaseAgent):
             await self.report_gap("set_fr_dependency", f"unexpected failure: {e}")
             raise
         return {"fr_id": fr.id, "depends_on": fr.depends_on}
+
+    @handler("merge_frs")
+    async def handle_merge_frs(self, args):
+        """Merge multiple FRs into a new consolidated FR.
+
+        ``source_ids`` is a comma-separated id list. ``merge_roles`` is an
+        optional ``id1=role description 1, id2=role description 2`` map.
+        Priority empty → inherit max priority across sources.
+        """
+        from developer.fr_store import FRError
+
+        raw_ids = args.get("source_ids", "")
+        if isinstance(raw_ids, list):
+            source_ids = [str(i).strip() for i in raw_ids if str(i).strip()]
+        else:
+            source_ids = [i.strip() for i in str(raw_ids).split(",") if i.strip()]
+
+        # Parse merge_roles from "id1=role1, id2=role2" format.
+        merge_roles: dict[str, str] = {}
+        raw_roles = args.get("merge_roles", "")
+        if raw_roles:
+            for part in str(raw_roles).split(","):
+                part = part.strip()
+                if "=" not in part:
+                    continue
+                key, _, value = part.partition("=")
+                merge_roles[key.strip()] = value.strip()
+
+        priority = args.get("priority") or None
+
+        try:
+            fr = self.pipeline.frs.merge(
+                source_ids=source_ids,
+                title=args.get("title", ""),
+                description=args.get("description", ""),
+                priority=priority,
+                concept=args.get("concept", ""),
+                classification=args.get("classification", "app"),
+                merge_note=args.get("merge_note", ""),
+                merge_roles=merge_roles or None,
+            )
+        except FRError as e:
+            await self.report_gap("merge_frs", str(e))
+            return {"error": str(e)}
+        except Exception as e:
+            await self.report_gap("merge_frs", f"unexpected failure: {e}")
+            raise
+        return {
+            "fr_id": fr.id,
+            "merged_from": list(fr.merged_from),
+            "priority": fr.priority,
+            "status": fr.status,
+        }
 
     @handler("get_fr_local")
     async def handle_get_fr_local(self, args):
