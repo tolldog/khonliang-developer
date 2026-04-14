@@ -60,8 +60,29 @@ class GithubReviewComment:
 
 
 class GithubClientError(RuntimeError):
-    """Raised on auth/transport failures so callers can distinguish from
+    """Base class for client errors so callers can distinguish from
     domain errors (404 from GitHub is a transport concern, not a bug)."""
+
+
+class GithubMergeBlockedError(GithubClientError):
+    """Merge rejected by branch protection.
+
+    Raised when GitHub's merge endpoint returns 405 Method Not Allowed —
+    typically because branch protection requires reviews, required checks,
+    or similar gates that haven't been satisfied. Callers with bypass
+    permission (the solo-maintainer case this project runs as) should
+    pass ``admin_bypass=True`` to :meth:`GithubClient.merge_pr` so the
+    bypass is explicit in logs and audit trails, instead of a silently
+    successful REST call.
+    """
+
+
+class GithubMergeConflictError(GithubClientError):
+    """Merge rejected because the PR has conflicts or the base has moved.
+
+    Raised when GitHub's merge endpoint returns 409 Conflict. Callers
+    typically need to rebase / update the branch before retrying.
+    """
 
 
 class GithubClient:
@@ -240,13 +261,23 @@ class GithubClient:
 
     async def merge_pr(
         self, repo: str, pr_number: int, *,
-        method: str = "squash", commit_title: str | None = None, commit_message: str | None = None,
+        method: str = "squash",
+        commit_title: str | None = None,
+        commit_message: str | None = None,
+        admin_bypass: bool = False,
     ) -> dict:
         """Merge a PR. ``method`` is ``merge|squash|rebase``.
 
-        Note: does not --admin-bypass branch protection; callers that need
-        that should use the REST ``/merge`` endpoint with a token that has
-        bypass permission. Route-switchable if it becomes load-bearing.
+        **On branch protection:** the REST merge endpoint doesn't have a
+        literal "admin bypass" flag — bypass happens server-side if the
+        authenticated token has ``bypass_pull_request_allowances`` on the
+        protection rule. ``admin_bypass=True`` is a **semantic marker**
+        on the caller side: it declares "I know this merge bypasses
+        protection, and that's intentional." When True, the merge is
+        logged at INFO so the bypass is visible in audit trails. When
+        False and protection blocks the merge, we raise
+        :class:`GithubMergeBlockedError` with a clear cause rather than
+        surfacing GitHub's 405 as a generic error.
         """
         owner, name = self._split_repo(repo)
         kwargs: dict = {"owner": owner, "repo": name, "pull_number": pr_number,
@@ -255,14 +286,33 @@ class GithubClient:
             kwargs["commit_title"] = commit_title
         if commit_message:
             kwargs["commit_message"] = commit_message
+
         try:
             resp = await self._client().rest.pulls.async_merge(**kwargs)
         except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 405:
+                raise GithubMergeBlockedError(
+                    f"merge_pr({repo}#{pr_number}): branch protection rejected the merge. "
+                    f"Pass admin_bypass=True if this is intentional and the token has bypass permission."
+                ) from e
+            if status == 409:
+                raise GithubMergeConflictError(
+                    f"merge_pr({repo}#{pr_number}): PR has conflicts or base has moved. Rebase and retry."
+                ) from e
             raise GithubClientError(f"merge_pr({repo}#{pr_number}): {e}") from e
+
+        if admin_bypass:
+            logger.info(
+                "merge_pr(%s#%d): admin-bypass merge via %s, sha=%s",
+                repo, pr_number, method, resp.parsed_data.sha,
+            )
+
         return {
             "merged": resp.parsed_data.merged,
             "sha": resp.parsed_data.sha,
             "message": resp.parsed_data.message,
+            "admin_bypass": admin_bypass,
         }
 
     # -- helpers --

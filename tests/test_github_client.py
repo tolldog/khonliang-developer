@@ -81,3 +81,59 @@ def test_review_comment_dataclass_roundtrip():
     )
     assert c.path == "developer/foo.py"
     assert c.line == 10
+
+
+# -- typed merge errors --
+
+class _FakeResponse:
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+
+
+class _FakeHttpError(Exception):
+    def __init__(self, status_code: int):
+        super().__init__(f"HTTP {status_code}")
+        self.response = _FakeResponse(status_code)
+
+
+def _install_merge_stub(client, error_to_raise):
+    """Replace the underlying githubkit merge call with one that raises."""
+    class _FakePulls:
+        async def async_merge(self, **kwargs):
+            raise error_to_raise
+
+    class _FakeRest:
+        pulls = _FakePulls()
+
+    class _FakeGh:
+        rest = _FakeRest()
+
+    client._gh = _FakeGh()
+
+
+@pytest.mark.asyncio
+async def test_merge_pr_raises_merge_blocked_on_405():
+    from developer.github_client import GithubMergeBlockedError
+
+    c = GithubClient(token="t")
+    _install_merge_stub(c, _FakeHttpError(405))
+    with pytest.raises(GithubMergeBlockedError, match="branch protection"):
+        await c.merge_pr("o/n", 1)
+
+
+@pytest.mark.asyncio
+async def test_merge_pr_raises_merge_conflict_on_409():
+    from developer.github_client import GithubMergeConflictError
+
+    c = GithubClient(token="t")
+    _install_merge_stub(c, _FakeHttpError(409))
+    with pytest.raises(GithubMergeConflictError, match="conflicts or base has moved"):
+        await c.merge_pr("o/n", 1)
+
+
+@pytest.mark.asyncio
+async def test_merge_pr_wraps_other_errors_as_client_error():
+    c = GithubClient(token="t")
+    _install_merge_stub(c, _FakeHttpError(500))
+    with pytest.raises(GithubClientError):
+        await c.merge_pr("o/n", 1)
