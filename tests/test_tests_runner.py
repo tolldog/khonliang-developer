@@ -76,6 +76,25 @@ ModuleNotFoundError: No module named 'pytest'
 """
 
 
+# pytest -q --no-header output — no decorative bars around the summary line.
+# This is what `run_pytest()` actually produces in production; regression
+# coverage for the bar-optional summary regex.
+Q_MODE_ALL_PASSED = """\
+........................................................................ [ 59%]
+.................................................                        [100%]
+121 passed in 10.50s
+"""
+
+
+Q_MODE_MIXED = """\
+..F..E.s.                                                              [100%]
+=========================== short test summary info ============================
+FAILED tests/test_x.py::test_bar - assert 1 == 2
+ERROR tests/test_x.py::test_setup_fails - fixture 'y' missing
+1 failed, 1 error, 6 passed, 1 skipped in 2.05s
+"""
+
+
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
@@ -128,6 +147,25 @@ def test_parse_unparseable_returns_parsed_false():
 def test_parse_empty_returns_empty_result():
     r = _parse_pytest_output("")
     assert r.parsed is False
+
+
+def test_parse_q_mode_all_passed_without_bars():
+    """Regression: -q --no-header emits the summary line without `=+ =+` bars."""
+    r = _parse_pytest_output(Q_MODE_ALL_PASSED)
+    assert r.parsed is True
+    assert r.passed == 121
+    assert r.failed == 0
+
+
+def test_parse_q_mode_mixed_without_bars():
+    r = _parse_pytest_output(Q_MODE_MIXED)
+    assert r.parsed is True
+    assert r.passed == 6
+    assert r.failed == 1
+    assert r.errors == 1
+    assert r.skipped == 1
+    # short test summary block gives us one failure nodeid
+    assert any(f.nodeid == "tests/test_x.py::test_bar" for f in r.failures)
 
 
 # ---------------------------------------------------------------------------

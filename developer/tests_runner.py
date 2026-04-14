@@ -195,13 +195,16 @@ async def run_pytest(
 # ---------------------------------------------------------------------------
 
 
-# pytest -q summary line examples:
-#   "== 12 passed in 0.42s =="
-#   "== 2 failed, 10 passed in 1.02s =="
-#   "== 1 failed, 1 error, 3 passed, 2 skipped in 0.80s =="
-# We match a line of the form `=+ ... in N.NNs =+` or `=+ ... in N.NNs =+`.
+# pytest summary line examples seen in the wild:
+#   "== 12 passed in 0.42s =="                          — default / -v
+#   "== 2 failed, 10 passed in 1.02s =="                — default w/ failures
+#   "== 1 failed, 1 error, 3 passed, 2 skipped in 0.80s ==" — with errors+skipped
+#   "121 passed in 10.50s"                              — -q (bars omitted)
+#   "2 failed, 119 passed in 10.50s"                    — -q w/ failures
+# The decorative `=+` bars are optional in -q mode. Make them optional on
+# both sides so the same regex handles quiet and verbose output.
 _SUMMARY_RE = re.compile(
-    r"^=+\s+(?P<body>.+?)\s+in\s+(?P<elapsed>\d+(?:\.\d+)?)s\s+=+\s*$",
+    r"^(?:=+\s+)?(?P<body>.+?)\s+in\s+(?P<elapsed>\d+(?:\.\d+)?)s(?:\s+=+)?\s*$",
     re.MULTILINE,
 )
 _COUNT_RE = re.compile(r"(\d+)\s+([a-z]+)")
