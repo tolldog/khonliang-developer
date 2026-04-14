@@ -16,7 +16,7 @@ def harness(temp_config_file):
 
 def test_skill_count(harness):
     # 11 (MS-01 skills + bus proxies) + 5 FR-lifecycle (PR #10) + 1 merge_frs
-    # (PR #11) + 5 git_* (this PR) = 22
+    # (PR #11) + 5 git_* (PR #12) + 2 PM edit/picker (this PR) = 24
     assert len(harness.skills) == 24
 
 

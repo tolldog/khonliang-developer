@@ -338,10 +338,11 @@ def test_update_status_idempotent_with_notes_appends_history_and_bumps_ts(store)
     assert len(again.notes_history) == before_len + 1
     # updated_at must bump so consumers watching for changes see the delta
     assert again.updated_at > before_ts
-    # The history entry's "at" is recorded slightly before _store syncs
-    # updated_at back from KnowledgeStore (which stamps its own clock).
-    # They must both be "recent" — within a small window of each other.
-    assert abs(again.notes_history[-1]["at"] - again.updated_at) < 0.01
+    # The history entry's "at" is recorded before _store syncs updated_at
+    # back from KnowledgeStore (which stamps its own clock), so the
+    # ordering holds strictly; we verify that rather than a tight
+    # timing bound (10ms would be flaky on slow/loaded CI).
+    assert again.notes_history[-1]["at"] <= again.updated_at
 
 
 def test_update_status_rejects_invalid_status_name(store):
@@ -608,11 +609,39 @@ def test_update_with_notes_only_still_records_history(store):
     assert updated.updated_at > fr.updated_at
 
 
-def test_update_empty_string_title_is_ignored(store):
-    """Empty string = 'no change' so callers can omit fields cleanly."""
+def test_update_empty_title_raises(store):
+    """Empty/whitespace-only title is invalid at the FRStore level.
+
+    Bus handlers translate empty strings to None before calling into the
+    store, so callers over the bus keep their 'omit for no change'
+    ergonomics. Direct callers to FRStore get a clear error instead of
+    silent no-ops (the previous ambiguous behavior).
+    """
     fr = store.promote(target="developer", title="Keep", description="d")
-    updated = store.update(fr.id, title="")
-    assert updated.title == "Keep"
+    with pytest.raises(FRError, match="title"):
+        store.update(fr.id, title="")
+    with pytest.raises(FRError, match="title"):
+        store.update(fr.id, title="   ")
+
+
+def test_update_empty_description_raises(store):
+    fr = store.promote(target="developer", title="K", description="d")
+    with pytest.raises(FRError, match="description"):
+        store.update(fr.id, description="")
+
+
+def test_update_empty_concept_is_allowed(store):
+    """Unlike title/description, empty concept is a valid clear."""
+    fr = store.promote(target="developer", title="K2", description="d", concept="c1")
+    updated = store.update(fr.id, concept="")
+    assert updated.concept == ""
+
+
+def test_update_backing_papers_strips_entries(store):
+    """Backing papers are stripped, not just used for filtering."""
+    fr = store.promote(target="developer", title="K3", description="d")
+    updated = store.update(fr.id, backing_papers=["  p1  ", " p2 "])
+    assert updated.backing_papers == ["p1", "p2"]
 
 
 # ---------------------------------------------------------------------------

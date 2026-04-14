@@ -646,10 +646,20 @@ class FRStore:
     ) -> FR:
         """Modify an existing FR in place.
 
-        All fields are optional; only non-None values are updated.
-        ``backing_papers`` fully replaces the existing list (pass an empty
-        list to clear). Callers that want to append should read + extend +
-        update.
+        **Field semantics — all uniform on None-means-no-change:**
+
+        - Any field passed as ``None`` (the default) is left untouched.
+        - Any non-None value is applied, after normalization:
+          - ``title`` / ``description`` — stripped; must be non-empty.
+            An empty or whitespace-only value raises :class:`FRError`
+            (these fields are required on an FR by the same invariant
+            that :meth:`promote` enforces). Bus handlers translate
+            caller-provided empty strings to ``None`` before calling
+            this API to keep their "omit for no change" ergonomic.
+          - ``concept`` / ``classification`` — stored as-is, including
+            empty-string (which clears the field).
+          - ``backing_papers`` — each entry is stripped and empty values
+            filtered out. Pass an empty list to clear entirely.
 
         Resolves ``fr_id`` through merge redirects, so updating an old id
         lands on the terminal FR. Terminal FRs (merged / archived /
@@ -675,12 +685,23 @@ class FRStore:
             )
 
         changed = False
-        if title is not None and title.strip() and title.strip() != fr.title:
-            fr.title = title.strip()
-            changed = True
-        if description is not None and description.strip() and description.strip() != fr.description:
-            fr.description = description.strip()
-            changed = True
+
+        if title is not None:
+            stripped = title.strip()
+            if not stripped:
+                raise FRError("title must be non-empty when provided")
+            if stripped != fr.title:
+                fr.title = stripped
+                changed = True
+
+        if description is not None:
+            stripped = description.strip()
+            if not stripped:
+                raise FRError("description must be non-empty when provided")
+            if stripped != fr.description:
+                fr.description = stripped
+                changed = True
+
         if priority is not None and priority != fr.priority:
             fr.priority = priority
             changed = True
@@ -691,7 +712,9 @@ class FRStore:
             fr.classification = classification
             changed = True
         if backing_papers is not None:
-            new_papers = [p for p in backing_papers if p and p.strip()]
+            # Strip entries so stored values are clean (filter was only
+            # controlling which were kept; we also normalize what we keep).
+            new_papers = [p.strip() for p in backing_papers if p and p.strip()]
             if new_papers != fr.backing_papers:
                 fr.backing_papers = new_papers
                 changed = True
