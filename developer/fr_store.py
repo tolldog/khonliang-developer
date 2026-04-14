@@ -200,7 +200,14 @@ class FRStore:
         if not follow_redirect:
             return fr
 
-        if fr.status != FR_STATUS_MERGED or not fr.merged_into:
+        # Non-merged FRs resolve to themselves with no hint.
+        if fr.status != FR_STATUS_MERGED:
+            return fr
+
+        # Merged state but no pointer — partially-formed record. Signal that
+        # the caller's id "redirects to itself" by setting redirected_from.
+        if not fr.merged_into:
+            fr.redirected_from = fr_id
             return fr
 
         # Walk the chain
@@ -210,7 +217,12 @@ class FRStore:
         for _ in range(_MAX_REDIRECT_DEPTH):
             next_id = current.merged_into
             if not next_id:
-                break
+                # Partially-formed merged record (status=merged but no
+                # merged_into pointer). Treat it as a terminal redirect and
+                # return the last well-formed FR in the chain with a hint,
+                # rather than raising "exceeded depth".
+                current.redirected_from = requested_id
+                return current
             if next_id in seen:
                 raise FRError(
                     f"redirect cycle detected while resolving {fr_id!r}: "
@@ -219,9 +231,11 @@ class FRStore:
             seen.add(next_id)
             next_entry = self.knowledge.get(next_id)
             if next_entry is None:
-                # Dangling pointer; return the last well-formed FR with a hint
-                fr.redirected_from = requested_id
-                return fr
+                # Dangling pointer; return the last well-formed FR in the
+                # chain (``current``), not the originally requested record.
+                # For A -> B -> missing, this returns B with the hint.
+                current.redirected_from = requested_id
+                return current
             current = _fr_from_entry(next_entry)
             if current.status != FR_STATUS_MERGED:
                 current.redirected_from = requested_id
@@ -364,11 +378,14 @@ class FRStore:
         if fr.status == status:
             # Idempotent — but still append a notes entry if one was provided,
             # so the audit trail captures intent (e.g. "confirmed in_progress
-            # after a crash recovery").
+            # after a crash recovery"). Bump updated_at so consumers watching
+            # for "did this FR change" see the history delta.
             if notes:
+                now = time.time()
                 fr.notes_history.append({
-                    "at": time.time(), "status": status, "notes": notes,
+                    "at": now, "status": status, "notes": notes,
                 })
+                fr.updated_at = now
                 self._store(fr)
             return fr
 

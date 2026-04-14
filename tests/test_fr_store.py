@@ -181,14 +181,57 @@ def test_get_detects_redirect_cycle(store):
         store.get("fr_developer_a")
 
 
-def test_get_tolerates_dangling_pointer(store):
-    """A → missing_id returns A with redirected_from hint."""
+def test_get_tolerates_dangling_pointer_single_hop(store):
+    """A → missing_id: A is the last well-formed FR; return it with hint."""
     _seed_merged_fr(store, source_id="fr_developer_a", target_id="fr_developer_gone")
     out = store.get("fr_developer_a")
     assert out is not None
-    # Returns the last well-formed FR in the chain with the original id as hint
+    # A itself is the last well-formed FR in the chain — its pointer is dangling
     assert out.id == "fr_developer_a"
     assert out.redirected_from == "fr_developer_a"
+
+
+def test_get_tolerates_dangling_pointer_multi_hop(store):
+    """A → B → missing: B is the last well-formed FR; return it, not A."""
+    _seed_merged_fr(store, source_id="fr_developer_b", target_id="fr_developer_gone")
+    _seed_merged_fr(store, source_id="fr_developer_a", target_id="fr_developer_b")
+    out = store.get("fr_developer_a")
+    assert out is not None
+    # B is the last well-formed FR we reached, not A
+    assert out.id == "fr_developer_b"
+    assert out.redirected_from == "fr_developer_a"
+
+
+def test_get_tolerates_merged_record_with_empty_merged_into(store):
+    """status=merged with no merged_into pointer is partially-formed; return it as terminal."""
+    # Manually write a merged record with empty merged_into
+    import time as _t
+    from khonliang.knowledge.store import KnowledgeEntry, Tier, EntryStatus
+    now = _t.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="fr_developer_broken",
+        tier=Tier.DERIVED,
+        title="broken",
+        content="d",
+        source="test",
+        scope="development",
+        tags=["fr", "target:developer", "app"],
+        status=EntryStatus.DISTILLED,
+        metadata={
+            "fr_status": FR_STATUS_MERGED,
+            "priority": "medium",
+            "target": "developer",
+            "classification": "app",
+            "merged_into": "",   # missing/empty
+        },
+        created_at=now, updated_at=now,
+    ))
+    # Should NOT raise exceeded-depth; should return the broken record itself
+    # as the terminal-with-hint.
+    out = store.get("fr_developer_broken")
+    assert out is not None
+    assert out.id == "fr_developer_broken"
+    assert out.redirected_from == "fr_developer_broken"
 
 
 # ---------------------------------------------------------------------------
@@ -282,12 +325,21 @@ def test_update_status_idempotent_same_status(store):
     assert len(again.notes_history) == len(before.notes_history)
 
 
-def test_update_status_idempotent_with_notes_appends_history(store):
+def test_update_status_idempotent_with_notes_appends_history_and_bumps_ts(store):
     fr = store.promote(target="developer", title="I2", description="d")
     store.update_status(fr.id, FR_STATUS_IN_PROGRESS)
-    before_len = len(store.get(fr.id).notes_history)
+    before = store.get(fr.id)
+    before_len = len(before.notes_history)
+    before_ts = before.updated_at
+    # Ensure clock advances (sub-second resolution is fine, but sleep a hair)
+    import time as _t
+    _t.sleep(0.01)
     again = store.update_status(fr.id, FR_STATUS_IN_PROGRESS, notes="still working")
     assert len(again.notes_history) == before_len + 1
+    # updated_at must bump so consumers watching for changes see the delta
+    assert again.updated_at > before_ts
+    # And the history entry's timestamp matches updated_at
+    assert again.notes_history[-1]["at"] == again.updated_at
 
 
 def test_update_status_rejects_invalid_status_name(store):

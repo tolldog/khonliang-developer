@@ -525,11 +525,22 @@ class DeveloperAgent(BaseAgent):
 
     @handler("get_fr_local")
     async def handle_get_fr_local(self, args):
+        from developer.fr_store import FRError
+
         follow_redirect = bool(args.get("follow_redirect", True))
-        fr = self.pipeline.frs.get(
-            fr_id=args.get("fr_id", ""),
-            follow_redirect=follow_redirect,
-        )
+        try:
+            fr = self.pipeline.frs.get(
+                fr_id=args.get("fr_id", ""),
+                follow_redirect=follow_redirect,
+            )
+        except FRError as e:
+            # FRStore.get raises on redirect cycle / exceeded depth. Surface
+            # as a structured error rather than crashing the skill.
+            await self.report_gap("get_fr_local", str(e))
+            return {"error": str(e), "fr_id": args.get("fr_id", "")}
+        except Exception as e:
+            await self.report_gap("get_fr_local", f"unexpected failure: {e}")
+            raise
         if fr is None:
             return {"error": "not found", "fr_id": args.get("fr_id", "")}
         return fr.to_public_dict()
