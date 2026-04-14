@@ -16,8 +16,8 @@ def harness(temp_config_file):
 
 def test_skill_count(harness):
     # 11 (MS-01 skills + bus proxies) + 5 FR-lifecycle (PR #10) + 1 merge_frs
-    # (PR #11) + 5 git_* (this PR) = 22
-    assert len(harness.skills) == 22
+    # (PR #11) + 5 git_* (PR #12) + 2 PM edit/picker (this PR) = 24
+    assert len(harness.skills) == 24
 
 
 def test_skills_registered(harness):
@@ -32,7 +32,9 @@ def test_skills_registered(harness):
         "get_fr_local", "list_frs_local",
         # merge write op (PR #11)
         "merge_frs",
-        # native git operations (this PR — fr_developer_e778b9bf)
+        # in-place edit + next-to-work picker (this PR)
+        "update_fr", "next_fr_local",
+        # native git operations (fr_developer_e778b9bf)
         "git_status", "git_log", "git_diff", "git_branches", "git_commit",
     }
     assert harness.skill_names == expected
@@ -265,7 +267,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 22
+    assert len(reg.skills) == 24
     assert len(reg.collaborations) == 2
 
 

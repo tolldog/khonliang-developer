@@ -632,6 +632,159 @@ class FRStore:
 
         return new_fr
 
+    def update(
+        self,
+        fr_id: str,
+        *,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        priority: Optional[str] = None,
+        concept: Optional[str] = None,
+        classification: Optional[str] = None,
+        backing_papers: Optional[Iterable[str]] = None,
+        notes: str = "",
+    ) -> FR:
+        """Modify an existing FR in place.
+
+        **Field semantics — all uniform on None-means-no-change:**
+
+        - Any field passed as ``None`` (the default) is left untouched.
+        - Any non-None value is applied, after normalization:
+          - ``title`` / ``description`` — stripped; must be non-empty.
+            An empty or whitespace-only value raises :class:`FRError`
+            (these fields are required on an FR by the same invariant
+            that :meth:`promote` enforces). Bus handlers translate
+            caller-provided empty strings to ``None`` before calling
+            this API to keep their "omit for no change" ergonomic.
+          - ``concept`` / ``classification`` — stored as-is, including
+            empty-string (which clears the field).
+          - ``backing_papers`` — each entry is stripped and empty values
+            filtered out. Pass an empty list to clear entirely.
+
+        Resolves ``fr_id`` through merge redirects, so updating an old id
+        lands on the terminal FR. Terminal FRs (merged / archived /
+        completed) cannot be edited — the audit trail must stay immutable.
+
+        ``notes`` is appended to ``notes_history`` with the current status
+        (no status change). Useful for recording "re-scoped description"
+        or "priority bumped after X incident."
+        """
+        resolved_id = self.resolve_id(fr_id)
+        fr = self.get(resolved_id, follow_redirect=False)
+        if fr is None:
+            raise FRError(f"unknown fr id: {fr_id}")
+        if fr.status in TERMINAL_STATUSES:
+            raise FRError(
+                f"cannot update {resolved_id}: status is {fr.status!r} "
+                "(terminal FRs are immutable)"
+            )
+
+        if priority is not None and priority not in ALLOWED_PRIORITIES:
+            raise FRError(
+                f"priority must be one of {sorted(ALLOWED_PRIORITIES)}, got {priority!r}"
+            )
+
+        changed = False
+
+        if title is not None:
+            stripped = title.strip()
+            if not stripped:
+                raise FRError("title must be non-empty when provided")
+            if stripped != fr.title:
+                fr.title = stripped
+                changed = True
+
+        if description is not None:
+            stripped = description.strip()
+            if not stripped:
+                raise FRError("description must be non-empty when provided")
+            if stripped != fr.description:
+                fr.description = stripped
+                changed = True
+
+        if priority is not None and priority != fr.priority:
+            fr.priority = priority
+            changed = True
+        if concept is not None and concept != fr.concept:
+            fr.concept = concept
+            changed = True
+        if classification is not None and classification != fr.classification:
+            fr.classification = classification
+            changed = True
+        if backing_papers is not None:
+            # Strip entries so stored values are clean (filter was only
+            # controlling which were kept; we also normalize what we keep).
+            new_papers = [p.strip() for p in backing_papers if p and p.strip()]
+            if new_papers != fr.backing_papers:
+                fr.backing_papers = new_papers
+                changed = True
+
+        if not changed and not notes:
+            # Nothing to do — idempotent no-op. Don't bump updated_at.
+            return fr
+
+        now = time.time()
+        history_note = notes or "edited in place"
+        fr.notes_history.append({
+            "at": now,
+            "status": fr.status,
+            "notes": history_note,
+        })
+        fr.updated_at = now
+        self._store(fr)
+        return fr
+
+    def next_fr(self, *, target: Optional[str] = None) -> Optional[FR]:
+        """Pick the highest-priority FR that's ready to work on.
+
+        "Ready" means:
+        - Status is `open` or `planned` (not in_progress — someone's already
+          on it; not terminal — already done/abandoned/merged)
+        - Every FR in `depends_on` is either `completed` or `merged` into a
+          completed FR (dependency graph unblocked)
+
+        Among ready FRs, pick by: highest priority first, then oldest
+        `created_at` (first-in, first-out). Returns None when nothing
+        qualifies.
+
+        ``target`` optionally restricts to a single project.
+        """
+        candidates = []
+        for fr in self.list(include_all=True):
+            if fr.status not in (FR_STATUS_OPEN, FR_STATUS_PLANNED):
+                continue
+            if target and fr.target != target:
+                continue
+            if not self._deps_unblocked(fr):
+                continue
+            candidates.append(fr)
+
+        if not candidates:
+            return None
+
+        priority_order = {"high": 0, "medium": 1, "low": 2}
+        candidates.sort(key=lambda f: (
+            priority_order.get(f.priority, 99),
+            f.created_at,
+        ))
+        return candidates[0]
+
+    def _deps_unblocked(self, fr: FR) -> bool:
+        """True if every FR in fr.depends_on is completed (or points, via
+        merge, at a completed FR).
+
+        Merged dependencies are resolved through the chain — if A depended
+        on B, and B merged into C, then A's dep is effectively on C.
+        """
+        for dep_id in fr.depends_on:
+            resolved_dep = self.get(dep_id, follow_redirect=True)
+            if resolved_dep is None:
+                # Dangling dep — treat as unmet. Caller should clean up.
+                return False
+            if resolved_dep.status != FR_STATUS_COMPLETED:
+                return False
+        return True
+
     def set_dependency(
         self,
         fr_id: str,
@@ -716,7 +869,14 @@ class FRStore:
     # ------------------------------------------------------------------
 
     def _store(self, fr: FR) -> None:
-        """Serialize an :class:`FR` back into the KnowledgeStore."""
+        """Serialize an :class:`FR` back into the KnowledgeStore.
+
+        ``KnowledgeStore.add`` overwrites ``updated_at`` with its own clock
+        to guarantee monotonic timestamps. We read the stored value back
+        and sync it onto the caller's ``fr`` so the returned object
+        matches what's persisted — otherwise an in-memory idempotent
+        compare (e.g. ``update(no-change)``) would see stale times.
+        """
         entry = KnowledgeEntry(
             id=fr.id,
             tier=Tier.DERIVED,
@@ -746,6 +906,11 @@ class FRStore:
             updated_at=fr.updated_at,
         )
         self.knowledge.add(entry)
+        # Sync timestamps from the stored entry so fr reflects reality
+        stored = self.knowledge.get(fr.id)
+        if stored is not None:
+            fr.created_at = stored.created_at
+            fr.updated_at = stored.updated_at
 
     def _record_capability(self, fr: FR) -> None:
         """Write/update the capability entry for an FR's current status.
