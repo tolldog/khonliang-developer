@@ -107,3 +107,46 @@ def test_draft_spec_appends_priority_when_description_omits_it(pipeline):
     milestone = pipeline.milestones.propose_from_work_unit(work_unit)
 
     assert "Create milestone records [high]" in milestone.draft_spec
+
+
+def test_review_scope_flags_duplicates_and_review_terms(pipeline):
+    work_unit = {
+        "name": "Cluster 1",
+        "targets": ["developer"],
+        "frs": [
+            {
+                "fr_id": "fr_developer_11111111",
+                "description": "Utilize GRA for Developer-Specific Tasks -> developer [high]",
+                "priority": "high",
+            },
+            {
+                "fr_id": "fr_developer_22222222",
+                "description": "Utilize GRA for Developer-Specific Tasks -> developer [medium]",
+                "priority": "medium",
+            },
+            {
+                "fr_id": "fr_developer_33333333",
+                "description": "Create AutoGen template -> developer [medium]",
+                "priority": "medium",
+            },
+        ],
+    }
+    milestone = pipeline.milestones.propose_from_work_unit(work_unit)
+
+    review = pipeline.milestones.review_scope(milestone.id)
+
+    assert review["recommendation"] == "refine_before_implementation"
+    assert review["duplicate_groups"][0]["normalized_description"] == (
+        "utilize gra for developer-specific tasks"
+    )
+    assert {hit["term"] for hit in review["review_term_hits"]} == {"AutoGen", "GRA"}
+
+
+def test_review_scope_ready_when_no_duplicates_or_review_terms(pipeline):
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+
+    review = pipeline.milestones.review_scope(milestone.id, review_terms=["AutoGen"])
+
+    assert review["recommendation"] == "ready_for_spec"
+    assert review["duplicate_groups"] == []
+    assert review["review_term_hits"] == []

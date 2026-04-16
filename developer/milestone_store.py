@@ -9,6 +9,7 @@ serialized through a small domain object.
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -172,6 +173,31 @@ class MilestoneStore:
         self._store(milestone)
         return milestone
 
+    def review_scope(
+        self,
+        milestone_id: str,
+        *,
+        review_terms: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Return deterministic scope warnings before implementation starts."""
+        milestone = self.get(milestone_id)
+        if milestone is None:
+            raise MilestoneError(f"unknown milestone id: {milestone_id}")
+
+        frs = [fr for fr in (milestone.work_unit.get("frs") or []) if isinstance(fr, dict)]
+        duplicate_groups = _duplicate_fr_groups(frs)
+        term_hits = _term_hits(frs, review_terms or ["AutoGen", "GRA"])
+        issue_count = len(duplicate_groups) + len(term_hits)
+        return {
+            "milestone_id": milestone.id,
+            "title": milestone.title,
+            "status": milestone.status,
+            "fr_count": len(milestone.fr_ids),
+            "duplicate_groups": duplicate_groups,
+            "review_term_hits": term_hits,
+            "recommendation": "refine_before_implementation" if issue_count else "ready_for_spec",
+        }
+
     def _store(self, milestone: Milestone) -> None:
         entry = KnowledgeEntry(
             id=milestone.id,
@@ -290,3 +316,48 @@ def _fr_description_with_priority(fr: dict[str, Any]) -> str:
     if priority and not description.endswith(f"[{priority}]"):
         description = f"{description} [{priority}]".strip()
     return description
+
+
+def _duplicate_fr_groups(frs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[str, list[dict[str, str]]] = {}
+    for fr in frs:
+        key = _normalized_fr_description(fr)
+        if not key:
+            continue
+        groups.setdefault(key, []).append({
+            "fr_id": _fr_id_from_item(fr),
+            "description": str(fr.get("description") or fr.get("title") or "").strip(),
+        })
+    return [
+        {"normalized_description": key, "frs": values}
+        for key, values in sorted(groups.items())
+        if len(values) > 1
+    ]
+
+
+def _term_hits(frs: list[dict[str, Any]], terms: list[str]) -> list[dict[str, Any]]:
+    hits = []
+    for term in terms:
+        clean = str(term).strip()
+        if not clean:
+            continue
+        matched = []
+        needle = clean.lower()
+        for fr in frs:
+            description = str(fr.get("description") or fr.get("title") or "")
+            if needle in description.lower():
+                matched.append({
+                    "fr_id": _fr_id_from_item(fr),
+                    "description": description.strip(),
+                })
+        if matched:
+            hits.append({"term": clean, "frs": matched})
+    return hits
+
+
+def _normalized_fr_description(fr: dict[str, Any]) -> str:
+    text = str(fr.get("description") or fr.get("title") or "").lower()
+    text = re.sub(r"\s*(?:->|→)\s*[\w-]+\s*", " ", text)
+    text = re.sub(r"\[(?:high|medium|low)\]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
