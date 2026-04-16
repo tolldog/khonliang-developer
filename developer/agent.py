@@ -78,7 +78,8 @@ class DeveloperAgent(BaseAgent):
                   {"target": {"type": "string", "default": "developer"},
                    "max_concepts": {"type": "integer", "default": 8},
                    "min_score": {"type": "number", "default": 0.0},
-                   "detail": {"type": "string", "default": "brief"}},
+                   "detail": {"type": "string", "default": "brief"},
+                   "timeout_s": {"type": "number", "default": 90}},
                   since="0.9.0"),
             # Clustered FR work planning
             Skill("next_work_unit", "Get the highest-ranked FR cluster as a work unit",
@@ -438,6 +439,7 @@ class DeveloperAgent(BaseAgent):
         max_concepts = int(args.get("max_concepts") or 8)
         min_score = float(args.get("min_score") or 0.0)
         detail = args.get("detail", "brief")
+        timeout_s = float(args.get("timeout_s") or 90)
         try:
             result = await self.request(
                 agent_type="researcher",
@@ -447,6 +449,7 @@ class DeveloperAgent(BaseAgent):
                     "max_concepts": max_concepts,
                     "min_score": min_score,
                 },
+                timeout=timeout_s,
             )
         except Exception as e:
             await self.report_gap(

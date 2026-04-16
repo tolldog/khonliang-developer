@@ -637,6 +637,7 @@ Thought Communication (strength: 60%)
 
     async def mock_request(**kwargs):
         assert kwargs["operation"] == "synergize_concepts"
+        assert kwargs["timeout"] == 90
         return concept_response
 
     harness.agent.request = mock_request
@@ -654,6 +655,21 @@ Thought Communication (strength: 60%)
     ]
     assert result["candidates"][1]["status"] == "new_candidate"
     assert result["candidates"][1]["priority"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_fr_candidates_from_concepts_allows_timeout_override(harness):
+    concept_response = {"result": {"result": ""}}
+    seen = {}
+
+    async def mock_request(**kwargs):
+        seen.update(kwargs)
+        return concept_response
+
+    harness.agent.request = mock_request
+    await harness.call("fr_candidates_from_concepts", {"timeout_s": 12})
+
+    assert seen["timeout"] == 12
 
 
 @pytest.mark.asyncio
