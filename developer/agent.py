@@ -439,7 +439,17 @@ class DeveloperAgent(BaseAgent):
         max_concepts = int(args.get("max_concepts") or 8)
         min_score = float(args.get("min_score") or 0.0)
         detail = args.get("detail", "brief")
-        timeout_s = float(args.get("timeout_s") or 90)
+        raw_timeout_s = args.get("timeout_s", 90)
+        try:
+            timeout_s = float(raw_timeout_s)
+        except (TypeError, ValueError):
+            message = f"timeout_s must be a number, got {raw_timeout_s!r}"
+            await self._safe_report_gap("fr_candidates_from_concepts", message)
+            return {"error": message}
+        if timeout_s <= 0:
+            message = f"timeout_s must be greater than 0, got {raw_timeout_s!r}"
+            await self._safe_report_gap("fr_candidates_from_concepts", message)
+            return {"error": message}
         try:
             result = await self.request(
                 agent_type="researcher",

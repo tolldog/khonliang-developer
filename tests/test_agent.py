@@ -673,6 +673,20 @@ async def test_fr_candidates_from_concepts_allows_timeout_override(harness):
 
 
 @pytest.mark.asyncio
+async def test_fr_candidates_from_concepts_rejects_bad_timeout(harness):
+    result = await harness.call("fr_candidates_from_concepts", {"timeout_s": "slow"})
+
+    assert result == {"error": "timeout_s must be a number, got 'slow'"}
+
+
+@pytest.mark.asyncio
+async def test_fr_candidates_from_concepts_rejects_non_positive_timeout(harness):
+    result = await harness.call("fr_candidates_from_concepts", {"timeout_s": 0})
+
+    assert result == {"error": "timeout_s must be greater than 0, got 0"}
+
+
+@pytest.mark.asyncio
 async def test_propose_milestone_from_top_work_unit(harness):
     cluster_response = {"result": {"result": """## Cluster 1 (2 FRs, targets: developer)
   [fr_developer_11111111] Milestone entity → developer [high]
