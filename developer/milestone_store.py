@@ -131,13 +131,14 @@ class MilestoneStore:
             raise MilestoneError("work_unit must include a non-empty frs list")
 
         fr_ids = [_fr_id_from_item(fr) for fr in frs]
-        fr_ids = [fr_id for fr_id in fr_ids if fr_id]
-        if not fr_ids:
-            raise MilestoneError("work_unit frs must include fr_id values")
+        if any(not fr_id for fr_id in fr_ids):
+            raise MilestoneError("every work_unit fr must include a non-empty fr_id")
 
         inferred_target = target or _infer_target(work_unit)
         if not inferred_target:
-            raise MilestoneError("target is required when work_unit has no target")
+            raise MilestoneError(
+                "target is required when work_unit has missing or ambiguous targets"
+            )
 
         milestone_title = title.strip() or str(work_unit.get("name") or "FR work unit").strip()
         milestone_summary = summary.strip() or _summarize_work_unit(work_unit)
@@ -147,17 +148,24 @@ class MilestoneStore:
 
         existing = self.get(milestone_id)
         created_at = existing.created_at if existing else now
+        status = existing.status if existing else MILESTONE_STATUS_PROPOSED
         milestone = Milestone(
             id=milestone_id,
             title=milestone_title,
             target=inferred_target,
-            status=existing.status if existing else MILESTONE_STATUS_PROPOSED,
+            status=status,
             summary=milestone_summary,
             fr_ids=fr_ids,
             work_unit=work_unit,
             source=source,
             rank=rank,
-            draft_spec=_draft_spec(milestone_title, inferred_target, milestone_summary, work_unit),
+            draft_spec=_draft_spec(
+                milestone_title,
+                inferred_target,
+                milestone_summary,
+                work_unit,
+                status=status,
+            ),
             created_at=created_at,
             updated_at=now,
         )
@@ -238,12 +246,19 @@ def _summarize_work_unit(work_unit: dict[str, Any]) -> str:
     return f"{name}: {size} FRs, max priority {max_priority}."
 
 
-def _draft_spec(title: str, target: str, summary: str, work_unit: dict[str, Any]) -> str:
+def _draft_spec(
+    title: str,
+    target: str,
+    summary: str,
+    work_unit: dict[str, Any],
+    *,
+    status: str = MILESTONE_STATUS_PROPOSED,
+) -> str:
     lines = [
         f"# {title}",
         "",
         f"**Target:** `{target}`",
-        "**Status:** proposed",
+        f"**Status:** {status}",
         "",
         "## Summary",
         "",

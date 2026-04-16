@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from developer.milestone_store import (
+    MILESTONE_STATUS_IN_PROGRESS,
     MILESTONE_STATUS_PROPOSED,
     MilestoneError,
 )
@@ -68,11 +69,30 @@ def test_propose_requires_frs(pipeline):
         pipeline.milestones.propose_from_work_unit({"targets": ["developer"], "frs": []})
 
 
+def test_propose_requires_every_fr_to_have_id(pipeline):
+    work_unit = _work_unit()
+    work_unit["frs"].append({"description": "missing id", "priority": "low"})
+
+    with pytest.raises(MilestoneError, match="every work_unit fr"):
+        pipeline.milestones.propose_from_work_unit(work_unit)
+
+
 def test_propose_requires_target_when_not_inferred(pipeline):
     work_unit = _work_unit()
     work_unit["targets"] = ["developer", "bus"]
-    with pytest.raises(MilestoneError, match="target"):
+    with pytest.raises(MilestoneError, match="missing or ambiguous targets"):
         pipeline.milestones.propose_from_work_unit(work_unit)
 
     milestone = pipeline.milestones.propose_from_work_unit(work_unit, target="developer")
     assert milestone.target == "developer"
+
+
+def test_reproposal_draft_spec_uses_existing_status(pipeline):
+    first = pipeline.milestones.propose_from_work_unit(_work_unit())
+    first.status = MILESTONE_STATUS_IN_PROGRESS
+    pipeline.milestones._store(first)
+
+    second = pipeline.milestones.propose_from_work_unit(_work_unit())
+
+    assert second.status == MILESTONE_STATUS_IN_PROGRESS
+    assert "**Status:** in_progress" in second.draft_spec
