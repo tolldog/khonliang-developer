@@ -150,3 +150,45 @@ def test_review_scope_ready_when_no_duplicates_or_review_terms(pipeline):
     assert review["recommendation"] == "ready_for_spec"
     assert review["duplicate_groups"] == []
     assert review["review_term_hits"] == []
+
+
+def test_review_scope_empty_review_terms_disables_term_hits(pipeline):
+    work_unit = _work_unit()
+    work_unit["frs"][0]["description"] = "Create AutoGen template"
+    milestone = pipeline.milestones.propose_from_work_unit(work_unit)
+
+    review = pipeline.milestones.review_scope(milestone.id, review_terms=[])
+
+    assert review["recommendation"] == "ready_for_spec"
+    assert review["review_term_hits"] == []
+
+
+def test_review_scope_handles_string_fr_items(pipeline):
+    work_unit = {
+        "name": "String FR cluster",
+        "targets": ["developer"],
+        "frs": [
+            "fr_developer_autogen1",
+            "fr_developer_autogen2",
+        ],
+    }
+    milestone = pipeline.milestones.propose_from_work_unit(work_unit)
+
+    review = pipeline.milestones.review_scope(milestone.id, review_terms=["autogen"])
+
+    assert review["fr_count"] == 2
+    assert review["review_term_hits"] == [
+        {
+            "term": "autogen",
+            "frs": [
+                {
+                    "fr_id": "fr_developer_autogen1",
+                    "description": "fr_developer_autogen1",
+                },
+                {
+                    "fr_id": "fr_developer_autogen2",
+                    "description": "fr_developer_autogen2",
+                },
+            ],
+        }
+    ]

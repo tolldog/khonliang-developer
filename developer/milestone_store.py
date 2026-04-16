@@ -184,9 +184,14 @@ class MilestoneStore:
         if milestone is None:
             raise MilestoneError(f"unknown milestone id: {milestone_id}")
 
-        frs = [fr for fr in (milestone.work_unit.get("frs") or []) if isinstance(fr, dict)]
+        frs = [
+            fr
+            for fr in (_review_fr_item(fr) for fr in (milestone.work_unit.get("frs") or []))
+            if fr["fr_id"] or fr["description"]
+        ]
         duplicate_groups = _duplicate_fr_groups(frs)
-        term_hits = _term_hits(frs, review_terms or ["AutoGen", "GRA"])
+        terms = ["AutoGen", "GRA"] if review_terms is None else review_terms
+        term_hits = _term_hits(frs, terms)
         issue_count = len(duplicate_groups) + len(term_hits)
         return {
             "milestone_id": milestone.id,
@@ -256,6 +261,17 @@ def _fr_id_from_item(item: Any) -> str:
     if isinstance(item, dict):
         return str(item.get("fr_id") or item.get("id") or "").strip()
     return str(item).strip()
+
+
+def _review_fr_item(item: Any) -> dict[str, str]:
+    if isinstance(item, dict):
+        fr_id = _fr_id_from_item(item)
+        description = str(item.get("description") or item.get("title") or fr_id).strip()
+        priority = str(item.get("priority") or "").strip()
+        return {"fr_id": fr_id, "description": description, "priority": priority}
+
+    fr_id = _fr_id_from_item(item)
+    return {"fr_id": fr_id, "description": fr_id, "priority": ""}
 
 
 def _infer_target(work_unit: dict[str, Any]) -> str:
