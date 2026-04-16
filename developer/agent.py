@@ -73,6 +73,13 @@ class DeveloperAgent(BaseAgent):
             Skill("get_paper_context", "Get research evidence for a query via researcher",
                   {"query": {"type": "string", "required": True}},
                   since="0.2.0"),
+            Skill("fr_candidates_from_concepts",
+                  "Generate promote-ready FR candidates from researcher concept bundles",
+                  {"target": {"type": "string", "default": "developer"},
+                   "max_concepts": {"type": "integer", "default": 8},
+                   "min_score": {"type": "number", "default": 0.0},
+                   "detail": {"type": "string", "default": "brief"}},
+                  since="0.9.0"),
             # Clustered FR work planning
             Skill("next_work_unit", "Get the highest-ranked FR cluster as a work unit",
                   {"target": {"type": "string", "default": ""},
@@ -423,6 +430,48 @@ class DeveloperAgent(BaseAgent):
             await self.report_gap("get_paper_context", f"Bus request failed for {query!r}: {e}")
             raise
         return (result and result.get("result")) or {"error": "no result from researcher"}
+
+    @handler("fr_candidates_from_concepts")
+    async def handle_fr_candidates_from_concepts(self, args):
+        """Turn researcher concept bundles into developer-owned FR candidates."""
+        target = str(args.get("target") or "developer").strip() or "developer"
+        max_concepts = int(args.get("max_concepts") or 8)
+        min_score = float(args.get("min_score") or 0.0)
+        detail = args.get("detail", "brief")
+        try:
+            result = await self.request(
+                agent_type="researcher",
+                operation="synergize_concepts",
+                args={
+                    "detail": detail,
+                    "max_concepts": max_concepts,
+                    "min_score": min_score,
+                },
+            )
+        except Exception as e:
+            await self.report_gap(
+                "fr_candidates_from_concepts",
+                f"Failed to get concept bundles: {e}",
+            )
+            raise
+
+        raw = (result and result.get("result")) or {}
+        text = raw.get("result", "") if isinstance(raw, dict) else str(raw)
+        bundles = _parse_concept_bundles(text)
+        existing = self.pipeline.frs.list(target=target or None, include_all=True)
+        candidates = [
+            _candidate_from_concept_bundle(bundle, target=target, existing=existing)
+            for bundle in bundles
+        ]
+        return {
+            "source": "researcher.synergize_concepts",
+            "target": target,
+            "bundle_count": len(bundles),
+            "candidate_count": len(candidates),
+            "new_count": sum(1 for c in candidates if c["status"] == "new_candidate"),
+            "existing_match_count": sum(1 for c in candidates if c["existing_matches"]),
+            "candidates": candidates,
+        }
 
     # -- clustered FR work planning --
 
@@ -1266,6 +1315,106 @@ def _parse_work_unit_arg(value) -> dict:
             raise ValueError("work_unit JSON must decode to an object")
         return parsed
     raise ValueError("work_unit must be a JSON object or JSON string")
+
+
+def _parse_concept_bundles(text: str) -> list[dict]:
+    """Parse researcher.synergize_concepts brief text into bundle dicts."""
+    bundles = []
+    current = None
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        strength_match = re.match(r"^(?P<title>.+?)\s+\(strength:\s*(?P<strength>\d+)%\)$", line)
+        if strength_match:
+            if current:
+                bundles.append(current)
+            current = {
+                "title": strength_match.group("title").strip(),
+                "strength": int(strength_match.group("strength")),
+                "concepts": [],
+                "summary": "",
+            }
+            continue
+        if current is None:
+            continue
+        if line.lower().startswith("concepts:"):
+            concepts = line.split(":", 1)[1]
+            current["concepts"] = [c.strip() for c in concepts.split(",") if c.strip()]
+        elif not current["summary"]:
+            current["summary"] = line
+        else:
+            current["summary"] = f"{current['summary']} {line}".strip()
+    if current:
+        bundles.append(current)
+    return bundles
+
+
+def _candidate_from_concept_bundle(bundle: dict, *, target: str, existing: list) -> dict:
+    concepts = list(bundle.get("concepts") or [])
+    title = f"Apply {bundle.get('title', 'concept bundle')} to {target} workflow"
+    summary = bundle.get("summary") or "Use this concept bundle to improve developer workflow."
+    strength = int(bundle.get("strength") or 0)
+    priority = "high" if strength >= 80 else "medium" if strength >= 50 else "low"
+    concept = ", ".join(concepts) or str(bundle.get("title", "")).strip()
+    description = (
+        f"{summary}\n\n"
+        f"Concepts: {concept or 'unspecified'}.\n"
+        "Acceptance criteria: developer can review this as a concrete FR, "
+        "compare it against existing local FRs, and promote it without relying "
+        "on researcher to own FR creation."
+    )
+    matches = _existing_fr_matches(title=title, concepts=concepts, existing=existing)
+    return {
+        "title": title,
+        "description": description,
+        "priority": priority,
+        "target": target,
+        "concept": concept,
+        "classification": "app",
+        "source_bundle": bundle,
+        "status": "existing_match" if matches else "new_candidate",
+        "existing_matches": matches,
+    }
+
+
+def _existing_fr_matches(*, title: str, concepts: list[str], existing: list) -> list[dict]:
+    title_tokens = _match_tokens(title)
+    concept_tokens = set()
+    for concept in concepts:
+        concept_tokens.update(_match_tokens(concept))
+
+    matches = []
+    for fr in existing:
+        haystack = " ".join([
+            getattr(fr, "title", ""),
+            getattr(fr, "description", ""),
+            getattr(fr, "concept", ""),
+        ])
+        tokens = _match_tokens(haystack)
+        shared_title = title_tokens & tokens
+        shared_concepts = concept_tokens & tokens
+        if len(shared_title) >= 3 or shared_concepts:
+            matches.append({
+                "fr_id": fr.id,
+                "title": fr.title,
+                "status": fr.status,
+                "priority": fr.priority,
+                "shared_terms": sorted(shared_title | shared_concepts),
+            })
+    return matches
+
+
+def _match_tokens(text: str) -> set[str]:
+    stop = {
+        "the", "and", "for", "from", "into", "with", "this", "that",
+        "apply", "developer", "workflow",
+    }
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if len(token) > 2 and token not in stop
+    }
 
 
 # ---------------------------------------------------------------------------

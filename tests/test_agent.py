@@ -15,8 +15,8 @@ def harness(temp_config_file):
 # -- skills --
 
 def test_skill_count(harness):
-    # 34 existing skills + 5 milestone work-unit skills.
-    assert len(harness.skills) == 39
+    # 34 existing skills + 5 milestone work-unit skills + concept FR candidates.
+    assert len(harness.skills) == 40
 
 
 def test_skills_registered(harness):
@@ -24,6 +24,7 @@ def test_skills_registered(harness):
         "read_spec", "list_specs", "traverse_milestone",
         "health_check", "developer_guide",
         "get_fr", "list_frs", "get_paper_context",
+        "fr_candidates_from_concepts",
         "next_work_unit", "work_units",
         "propose_milestone_from_work_unit", "get_milestone",
         "list_milestones", "draft_spec_from_milestone", "review_milestone_scope",
@@ -66,6 +67,10 @@ def test_list_frs_skill(harness):
 
 def test_get_paper_context_skill(harness):
     harness.assert_skill_exists("get_paper_context", description="researcher")
+
+
+def test_fr_candidates_from_concepts_skill(harness):
+    harness.assert_skill_exists("fr_candidates_from_concepts", description="concept bundles")
 
 
 def test_milestone_skills(harness):
@@ -427,7 +432,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 39
+    assert len(reg.skills) == 40
     assert len(reg.collaborations) == 2
 
 
@@ -483,6 +488,36 @@ def test_parse_empty_clusters():
     agent = DeveloperAgent(agent_id="test", bus_url="http://x", config_path="")
     units = agent._parse_and_rank_clusters("No clusters found", "")
     assert units == []
+
+
+def test_parse_concept_bundles():
+    from developer.agent import _parse_concept_bundles
+    text = """2 concept bundles from 10 papers
+
+Multi-Agent Systems for LLMs (strength: 100%)
+  concepts: multi-agent, AutoGen
+  Leveraging multi-agent systems to improve LLM performance.
+
+Thought Communication (strength: 60%)
+  concepts: thought communication
+  Improving multi-agent conversations.
+"""
+    bundles = _parse_concept_bundles(text)
+
+    assert bundles == [
+        {
+            "title": "Multi-Agent Systems for LLMs",
+            "strength": 100,
+            "concepts": ["multi-agent", "AutoGen"],
+            "summary": "Leveraging multi-agent systems to improve LLM performance.",
+        },
+        {
+            "title": "Thought Communication",
+            "strength": 60,
+            "concepts": ["thought communication"],
+            "summary": "Improving multi-agent conversations.",
+        },
+    ]
 
 
 def test_work_units_skill_exists(harness):
@@ -578,6 +613,47 @@ async def test_next_work_unit_no_units_returns_error(harness):
     harness.agent.request = mock_request
     result = await harness.call("next_work_unit", {})
     assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_fr_candidates_from_concepts_returns_fr_aware_diff(harness):
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Existing Multi-Agent Workflow",
+        description="Apply multi-agent systems to developer workflow",
+        priority="high",
+        concept="multi-agent",
+    )
+    concept_response = {"result": {"result": """2 concept bundles from 10 papers
+
+Multi-Agent Systems for LLMs (strength: 100%)
+  concepts: multi-agent, AutoGen
+  Leveraging multi-agent systems to improve LLM performance.
+
+Thought Communication (strength: 60%)
+  concepts: thought communication
+  Improving multi-agent conversations.
+"""}}
+
+    async def mock_request(**kwargs):
+        assert kwargs["operation"] == "synergize_concepts"
+        return concept_response
+
+    harness.agent.request = mock_request
+    result = await harness.call("fr_candidates_from_concepts", {"target": "developer"})
+
+    assert result["source"] == "researcher.synergize_concepts"
+    assert result["bundle_count"] == 2
+    assert result["new_count"] == 1
+    assert result["existing_match_count"] == 1
+    assert result["candidates"][0]["status"] == "existing_match"
+    assert result["candidates"][0]["existing_matches"][0]["shared_terms"] == [
+        "agent",
+        "multi",
+        "systems",
+    ]
+    assert result["candidates"][1]["status"] == "new_candidate"
+    assert result["candidates"][1]["priority"] == "medium"
 
 
 @pytest.mark.asyncio
