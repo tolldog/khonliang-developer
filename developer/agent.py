@@ -774,10 +774,8 @@ class DeveloperAgent(BaseAgent):
     # -- native git operations (fr_developer_e778b9bf) --
     #
     # Each handler takes an explicit `cwd` since developer can operate
-    # on multiple project workspaces. Destructive flags (force, amend)
-    # are deliberately NOT surfaced via these initial skills — if a
-    # caller needs them they call the Python API directly; the bus skill
-    # surface stays safe by default.
+    # on multiple project workspaces. Destructive flags default to safe
+    # values and must be explicitly opted into by callers.
 
     async def _safe_report_gap(self, operation: str, reason: str) -> None:
         """Report a gap, swallowing 'not connected' errors.
@@ -1033,9 +1031,13 @@ class DeveloperAgent(BaseAgent):
         if not cwd:
             return {"error": "cwd is required"}
         try:
-            result = GitClient(cwd).push(
+            client = GitClient(cwd)
+            branch = args.get("branch") or None
+            if branch is None and client.current_branch() == "HEAD":
+                return {"error": "cannot push detached HEAD without an explicit branch"}
+            result = client.push(
                 remote=args.get("remote") or "origin",
-                branch=args.get("branch") or None,
+                branch=branch,
                 force=bool(args.get("force", False)),
                 set_upstream=bool(args.get("set_upstream", False)),
             )
@@ -1136,6 +1138,8 @@ class DeveloperAgent(BaseAgent):
 
 def _parse_paths(value) -> list[str]:
     """Parse list or comma-separated path input from bus args."""
+    if value is None:
+        return []
     if isinstance(value, list):
         return [str(p).strip() for p in value if str(p).strip()]
     return [p.strip() for p in str(value).split(",") if p.strip()]

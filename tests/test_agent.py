@@ -304,6 +304,37 @@ async def test_git_stage_handler_requires_paths(harness, git_repo):
     assert "paths are required" in result["error"]
 
 
+@pytest.mark.asyncio
+async def test_git_stage_handler_treats_none_paths_as_missing(harness, git_repo):
+    result = await harness.call("git_stage", {"cwd": str(git_repo), "paths": None})
+    assert "error" in result
+    assert "paths are required" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_git_push_rejects_implicit_detached_head(harness, git_repo, monkeypatch):
+    import subprocess as _sub
+    from git.cmd import Git as _GitCmd
+
+    push_calls: list[tuple] = []
+
+    def fake_push(self_git, *args, **kwargs):
+        push_calls.append(args)
+        return ""
+
+    monkeypatch.setattr(_GitCmd, "push", fake_push, raising=False)
+    _sub.run(["git", "checkout", "--detach", "HEAD"], cwd=str(git_repo), check=True,
+             stdout=_sub.DEVNULL, stderr=_sub.DEVNULL)
+
+    result = await harness.call("git_push", {
+        "cwd": str(git_repo),
+        "remote": "origin",
+    })
+    assert "error" in result
+    assert "detached HEAD" in result["error"]
+    assert push_calls == []
+
+
 # -- handlers --
 
 @pytest.mark.asyncio
