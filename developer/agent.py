@@ -177,6 +177,56 @@ class DeveloperAgent(BaseAgent):
                    "co_authors": {"type": "string", "default": "",
                                   "description": "comma-separated Name <email> list"}},
                   since="0.5.0"),
+            Skill("git_stage", "Stage paths for commit",
+                  {"cwd": {"type": "string", "required": True},
+                   "paths": {"type": "string", "required": True,
+                             "description": "comma-separated paths"}},
+                  since="0.7.0"),
+            Skill("git_unstage", "Unstage paths while keeping working-tree changes",
+                  {"cwd": {"type": "string", "required": True},
+                   "paths": {"type": "string", "required": True,
+                             "description": "comma-separated paths"}},
+                  since="0.7.0"),
+            Skill("git_checkout", "Checkout a ref or create and switch to a new branch",
+                  {"cwd": {"type": "string", "required": True},
+                   "ref": {"type": "string", "required": True},
+                   "new_branch": {"type": "boolean", "default": False}},
+                  since="0.7.0"),
+            Skill("git_create_branch", "Create a local branch without switching",
+                  {"cwd": {"type": "string", "required": True},
+                   "name": {"type": "string", "required": True},
+                   "base": {"type": "string", "default": ""}},
+                  since="0.7.0"),
+            Skill("git_delete_branch", "Delete a local branch; force requires explicit flag",
+                  {"cwd": {"type": "string", "required": True},
+                   "name": {"type": "string", "required": True},
+                   "force": {"type": "boolean", "default": False}},
+                  since="0.7.0"),
+            Skill("git_fetch", "Fetch from a remote",
+                  {"cwd": {"type": "string", "required": True},
+                   "remote": {"type": "string", "default": "origin"}},
+                  since="0.7.0"),
+            Skill("git_pull", "Pull into the current branch, ff-only by default",
+                  {"cwd": {"type": "string", "required": True},
+                   "remote": {"type": "string", "default": ""},
+                   "branch": {"type": "string", "default": ""},
+                   "ff_only": {"type": "boolean", "default": True}},
+                  since="0.7.0"),
+            Skill("git_push", "Push a branch to a remote",
+                  {"cwd": {"type": "string", "required": True},
+                   "remote": {"type": "string", "default": "origin"},
+                   "branch": {"type": "string", "default": ""},
+                   "force": {"type": "boolean", "default": False},
+                   "set_upstream": {"type": "boolean", "default": False}},
+                  since="0.7.0"),
+            Skill("git_show", "Resolve and summarize a commit",
+                  {"cwd": {"type": "string", "required": True},
+                   "ref": {"type": "string", "required": True}},
+                  since="0.7.0"),
+            Skill("git_rev_parse", "Resolve a ref to its full SHA",
+                  {"cwd": {"type": "string", "required": True},
+                   "ref": {"type": "string", "required": True}},
+                  since="0.7.0"),
         ]
 
     def register_collaborations(self):
@@ -724,10 +774,8 @@ class DeveloperAgent(BaseAgent):
     # -- native git operations (fr_developer_e778b9bf) --
     #
     # Each handler takes an explicit `cwd` since developer can operate
-    # on multiple project workspaces. Destructive flags (force, amend)
-    # are deliberately NOT surfaced via these initial skills — if a
-    # caller needs them they call the Python API directly; the bus skill
-    # surface stays safe by default.
+    # on multiple project workspaces. Destructive flags default to safe
+    # values and must be explicitly opted into by callers.
 
     async def _safe_report_gap(self, operation: str, reason: str) -> None:
         """Report a gap, swallowing 'not connected' errors.
@@ -867,6 +915,172 @@ class DeveloperAgent(BaseAgent):
             "message": commit.message,
         }
 
+    @handler("git_stage")
+    async def handle_git_stage(self, args):
+        from developer.git_client import GitClient, GitClientError
+        cwd = args.get("cwd", "")
+        paths = _parse_paths(args.get("paths", []))
+        if not cwd or not paths:
+            return {"error": "cwd and paths are required"}
+        try:
+            staged = GitClient(cwd).stage(paths)
+        except GitClientError as e:
+            await self._safe_report_gap("git_stage", str(e))
+            return {"error": str(e)}
+        return {"staged": staged}
+
+    @handler("git_unstage")
+    async def handle_git_unstage(self, args):
+        from developer.git_client import GitClient, GitClientError
+        cwd = args.get("cwd", "")
+        paths = _parse_paths(args.get("paths", []))
+        if not cwd or not paths:
+            return {"error": "cwd and paths are required"}
+        try:
+            unstaged = GitClient(cwd).unstage(paths)
+        except GitClientError as e:
+            await self._safe_report_gap("git_unstage", str(e))
+            return {"error": str(e)}
+        return {"unstaged": unstaged}
+
+    @handler("git_checkout")
+    async def handle_git_checkout(self, args):
+        from developer.git_client import GitClient, GitClientError
+        cwd = args.get("cwd", "")
+        ref = args.get("ref", "")
+        if not cwd or not ref:
+            return {"error": "cwd and ref are required"}
+        try:
+            branch = GitClient(cwd).checkout(
+                ref,
+                new_branch=bool(args.get("new_branch", False)),
+            )
+        except GitClientError as e:
+            await self._safe_report_gap("git_checkout", str(e))
+            return {"error": str(e)}
+        return {"branch": branch}
+
+    @handler("git_create_branch")
+    async def handle_git_create_branch(self, args):
+        from developer.git_client import GitClient, GitClientError
+        cwd = args.get("cwd", "")
+        name = args.get("name", "")
+        if not cwd or not name:
+            return {"error": "cwd and name are required"}
+        try:
+            branch = GitClient(cwd).create_branch(
+                name,
+                base=args.get("base") or None,
+            )
+        except GitClientError as e:
+            await self._safe_report_gap("git_create_branch", str(e))
+            return {"error": str(e)}
+        return {"branch": branch}
+
+    @handler("git_delete_branch")
+    async def handle_git_delete_branch(self, args):
+        from developer.git_client import GitClient, GitClientError
+        cwd = args.get("cwd", "")
+        name = args.get("name", "")
+        if not cwd or not name:
+            return {"error": "cwd and name are required"}
+        try:
+            branch = GitClient(cwd).delete_branch(
+                name,
+                force=bool(args.get("force", False)),
+            )
+        except GitClientError as e:
+            await self._safe_report_gap("git_delete_branch", str(e))
+            return {"error": str(e)}
+        return {"deleted": branch, "force": bool(args.get("force", False))}
+
+    @handler("git_fetch")
+    async def handle_git_fetch(self, args):
+        from developer.git_client import GitClient, GitClientError
+        cwd = args.get("cwd", "")
+        if not cwd:
+            return {"error": "cwd is required"}
+        try:
+            remote = GitClient(cwd).fetch(remote=args.get("remote") or "origin")
+        except GitClientError as e:
+            await self._safe_report_gap("git_fetch", str(e))
+            return {"error": str(e)}
+        return {"remote": remote}
+
+    @handler("git_pull")
+    async def handle_git_pull(self, args):
+        from developer.git_client import GitClient, GitClientError
+        cwd = args.get("cwd", "")
+        if not cwd:
+            return {"error": "cwd is required"}
+        try:
+            branch = GitClient(cwd).pull(
+                remote=args.get("remote") or None,
+                branch=args.get("branch") or None,
+                ff_only=bool(args.get("ff_only", True)),
+            )
+        except GitClientError as e:
+            await self._safe_report_gap("git_pull", str(e))
+            return {"error": str(e)}
+        return {"branch": branch}
+
+    @handler("git_push")
+    async def handle_git_push(self, args):
+        from developer.git_client import GitClient, GitClientError
+        cwd = args.get("cwd", "")
+        if not cwd:
+            return {"error": "cwd is required"}
+        try:
+            client = GitClient(cwd)
+            branch = args.get("branch") or None
+            if branch is None and client.current_branch() == "HEAD":
+                return {"error": "cannot push detached HEAD without an explicit branch"}
+            result = client.push(
+                remote=args.get("remote") or "origin",
+                branch=branch,
+                force=bool(args.get("force", False)),
+                set_upstream=bool(args.get("set_upstream", False)),
+            )
+        except GitClientError as e:
+            await self._safe_report_gap("git_push", str(e))
+            return {"error": str(e)}
+        return result
+
+    @handler("git_show")
+    async def handle_git_show(self, args):
+        from developer.git_client import GitClient, GitClientError
+        cwd = args.get("cwd", "")
+        ref = args.get("ref", "")
+        if not cwd or not ref:
+            return {"error": "cwd and ref are required"}
+        try:
+            commit = GitClient(cwd).show(ref)
+        except GitClientError as e:
+            await self._safe_report_gap("git_show", str(e))
+            return {"error": str(e)}
+        return {
+            "sha": commit.sha,
+            "short_sha": commit.short_sha,
+            "author": commit.author,
+            "committed_at": commit.committed_at,
+            "message": commit.message,
+            "full_message": commit.full_message,
+        }
+
+    @handler("git_rev_parse")
+    async def handle_git_rev_parse(self, args):
+        from developer.git_client import GitClient, GitClientError
+        cwd = args.get("cwd", "")
+        ref = args.get("ref", "")
+        if not cwd or not ref:
+            return {"error": "cwd and ref are required"}
+        try:
+            sha = GitClient(cwd).rev_parse(ref)
+        except GitClientError as e:
+            await self._safe_report_gap("git_rev_parse", str(e))
+            return {"error": str(e)}
+        return {"ref": ref, "sha": sha}
+
     # -- test run + distill --
 
     @handler("run_tests")
@@ -920,6 +1134,15 @@ class DeveloperAgent(BaseAgent):
             "parsed": result.parsed,
             "digest": tests_runner.format_response(result, detail=detail),
         }
+
+
+def _parse_paths(value) -> list[str]:
+    """Parse list or comma-separated path input from bus args."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(p).strip() for p in value if str(p).strip()]
+    return [p.strip() for p in str(value).split(",") if p.strip()]
 
 
 # ---------------------------------------------------------------------------
