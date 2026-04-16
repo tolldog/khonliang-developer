@@ -15,9 +15,8 @@ def harness(temp_config_file):
 # -- skills --
 
 def test_skill_count(harness):
-    # 11 (MS-01 skills + bus proxies) + 5 FR-lifecycle (PR #10) + 1 merge_frs
-    # (PR #11) + 5 git_* (PR #12) + 2 PM edit/picker (this PR) = 24
-    assert len(harness.skills) == 24
+    # 24 existing skills + 10 expanded git workflow skills.
+    assert len(harness.skills) == 34
 
 
 def test_skills_registered(harness):
@@ -36,6 +35,9 @@ def test_skills_registered(harness):
         "update_fr", "next_fr_local",
         # native git operations (fr_developer_e778b9bf)
         "git_status", "git_log", "git_diff", "git_branches", "git_commit",
+        "git_stage", "git_unstage", "git_checkout", "git_create_branch",
+        "git_delete_branch", "git_fetch", "git_pull", "git_push",
+        "git_show", "git_rev_parse",
     }
     assert harness.skill_names == expected
 
@@ -185,6 +187,123 @@ async def test_git_commit_handler_empty_staging_returns_error(harness, git_repo)
     assert "no staged" in result["error"].lower()
 
 
+@pytest.mark.asyncio
+async def test_git_stage_and_unstage_handlers(harness, git_repo):
+    (git_repo / "stage-me.txt").write_text("x\n")
+    staged = await harness.call("git_stage", {
+        "cwd": str(git_repo),
+        "paths": "stage-me.txt",
+    })
+    assert staged["staged"] == ["stage-me.txt"]
+
+    status = await harness.call("git_status", {"cwd": str(git_repo)})
+    assert "stage-me.txt" in status["staged"]
+
+    unstaged = await harness.call("git_unstage", {
+        "cwd": str(git_repo),
+        "paths": ["stage-me.txt"],
+    })
+    assert unstaged["unstaged"] == ["stage-me.txt"]
+
+    status = await harness.call("git_status", {"cwd": str(git_repo)})
+    assert "stage-me.txt" in status["untracked"]
+
+
+@pytest.mark.asyncio
+async def test_git_checkout_create_and_delete_branch_handlers(harness, git_repo):
+    created = await harness.call("git_create_branch", {
+        "cwd": str(git_repo),
+        "name": "feat/created",
+    })
+    assert created["branch"] == "feat/created"
+
+    checked = await harness.call("git_checkout", {
+        "cwd": str(git_repo),
+        "ref": "feat/switched",
+        "new_branch": True,
+    })
+    assert checked["branch"] == "feat/switched"
+
+    await harness.call("git_checkout", {"cwd": str(git_repo), "ref": "main"})
+    deleted = await harness.call("git_delete_branch", {
+        "cwd": str(git_repo),
+        "name": "feat/switched",
+    })
+    assert deleted == {"deleted": "feat/switched", "force": False}
+
+
+@pytest.mark.asyncio
+async def test_git_show_and_rev_parse_handlers(harness, git_repo):
+    shown = await harness.call("git_show", {"cwd": str(git_repo), "ref": "HEAD"})
+    assert shown["message"] == "initial"
+    assert shown["sha"]
+
+    parsed = await harness.call("git_rev_parse", {"cwd": str(git_repo), "ref": "HEAD"})
+    assert parsed["ref"] == "HEAD"
+    assert parsed["sha"] == shown["sha"]
+
+
+@pytest.mark.asyncio
+async def test_git_fetch_handler_with_local_remote(harness, git_repo, tmp_path):
+    import subprocess as _sub
+
+    remote = tmp_path / "remote.git"
+    _sub.run(["git", "init", "--bare", str(remote)], check=True,
+             stdout=_sub.DEVNULL, stderr=_sub.DEVNULL)
+    _sub.run(["git", "remote", "add", "origin", str(remote)], cwd=str(git_repo), check=True)
+
+    result = await harness.call("git_fetch", {"cwd": str(git_repo)})
+    assert result == {"remote": "origin"}
+
+
+@pytest.mark.asyncio
+async def test_git_pull_and_push_handlers(harness, git_repo, monkeypatch):
+    from git.cmd import Git as _GitCmd
+
+    pull_calls: list[tuple] = []
+    push_calls: list[tuple] = []
+
+    def fake_pull(self_git, *args, **kwargs):
+        pull_calls.append(args)
+        return ""
+
+    def fake_push(self_git, *args, **kwargs):
+        push_calls.append(args)
+        return ""
+
+    monkeypatch.setattr(_GitCmd, "pull", fake_pull, raising=False)
+    monkeypatch.setattr(_GitCmd, "push", fake_push, raising=False)
+
+    pulled = await harness.call("git_pull", {
+        "cwd": str(git_repo),
+        "remote": "origin",
+        "branch": "main",
+    })
+    assert pulled["branch"] == "main"
+    assert pull_calls == [("--ff-only", "origin", "main")]
+
+    pushed = await harness.call("git_push", {
+        "cwd": str(git_repo),
+        "remote": "origin",
+        "branch": "main",
+        "set_upstream": True,
+    })
+    assert pushed == {
+        "remote": "origin",
+        "branch": "main",
+        "force": False,
+        "set_upstream": True,
+    }
+    assert push_calls == [("-u", "origin", "main")]
+
+
+@pytest.mark.asyncio
+async def test_git_stage_handler_requires_paths(harness, git_repo):
+    result = await harness.call("git_stage", {"cwd": str(git_repo), "paths": ""})
+    assert "error" in result
+    assert "paths are required" in result["error"]
+
+
 # -- handlers --
 
 @pytest.mark.asyncio
@@ -267,7 +386,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 24
+    assert len(reg.skills) == 34
     assert len(reg.collaborations) == 2
 
 
