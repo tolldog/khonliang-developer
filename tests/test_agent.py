@@ -15,8 +15,8 @@ def harness(temp_config_file):
 # -- skills --
 
 def test_skill_count(harness):
-    # 34 existing skills + 4 milestone work-unit skills.
-    assert len(harness.skills) == 38
+    # 34 existing skills + 5 milestone work-unit skills.
+    assert len(harness.skills) == 39
 
 
 def test_skills_registered(harness):
@@ -26,7 +26,7 @@ def test_skills_registered(harness):
         "get_fr", "list_frs", "get_paper_context",
         "next_work_unit", "work_units",
         "propose_milestone_from_work_unit", "get_milestone",
-        "list_milestones", "draft_spec_from_milestone",
+        "list_milestones", "draft_spec_from_milestone", "review_milestone_scope",
         "run_tests",
         # developer-owned FR lifecycle (PR #10)
         "promote_fr", "update_fr_status", "set_fr_dependency",
@@ -73,6 +73,7 @@ def test_milestone_skills(harness):
     harness.assert_skill_exists("get_milestone", description="milestone")
     harness.assert_skill_exists("list_milestones", description="milestone")
     harness.assert_skill_exists("draft_spec_from_milestone", description="draft spec")
+    harness.assert_skill_exists("review_milestone_scope", description="duplicate")
 
 
 # -- collaborations --
@@ -426,7 +427,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 38
+    assert len(reg.skills) == 39
     assert len(reg.collaborations) == 2
 
 
@@ -608,6 +609,9 @@ async def test_propose_milestone_from_top_work_unit(harness):
     draft = await harness.call("draft_spec_from_milestone", {"milestone_id": milestone["id"]})
     assert draft["milestone_id"] == milestone["id"]
     assert "fr_developer_11111111" in draft["draft_spec"]
+
+    review = await harness.call("review_milestone_scope", {"milestone_id": milestone["id"]})
+    assert review["recommendation"] == "ready_for_spec"
 
 
 @pytest.mark.asyncio

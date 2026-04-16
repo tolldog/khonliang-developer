@@ -102,6 +102,11 @@ class DeveloperAgent(BaseAgent):
             Skill("draft_spec_from_milestone", "Return the milestone's deterministic draft spec",
                   {"milestone_id": {"type": "string", "required": True}},
                   since="0.8.0"),
+            Skill("review_milestone_scope",
+                  "Flag duplicate or review-term FRs before implementing a milestone",
+                  {"milestone_id": {"type": "string", "required": True},
+                   "review_terms": {"type": "string", "default": "AutoGen,GRA"}},
+                  since="0.8.0"),
             # Test run + distill (token-arbitrage: pay local pytest cost once,
             # serve cheap digest to Claude instead of raw pytest output)
             Skill("run_tests", "Run project pytest suite and return a distilled digest",
@@ -550,6 +555,22 @@ class DeveloperAgent(BaseAgent):
             "title": milestone.title,
             "draft_spec": milestone.draft_spec,
         }
+
+    @handler("review_milestone_scope")
+    async def handle_review_milestone_scope(self, args):
+        from developer.milestone_store import MilestoneError
+
+        milestone_id = args.get("milestone_id", "")
+        if not milestone_id:
+            return {"error": "milestone_id is required"}
+        try:
+            return self.pipeline.milestones.review_scope(
+                milestone_id,
+                review_terms=_parse_paths(args.get("review_terms", "AutoGen,GRA")),
+            )
+        except MilestoneError as e:
+            await self.report_gap("review_milestone_scope", str(e))
+            return {"error": str(e)}
 
     def _parse_and_rank_clusters(self, cluster_text: str, target: str) -> list[dict]:
         """Parse cluster_frs output and rank by aggregate importance.
