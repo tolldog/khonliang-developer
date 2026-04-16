@@ -15,6 +15,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import sys
@@ -81,6 +82,26 @@ class DeveloperAgent(BaseAgent):
                   {"target": {"type": "string", "default": ""},
                    "threshold": {"type": "number", "default": 0.85}},
                   since="0.2.0"),
+            Skill("propose_milestone_from_work_unit",
+                  "Create a durable milestone from a provided or top-ranked work unit",
+                  {"target": {"type": "string", "default": ""},
+                   "threshold": {"type": "number", "default": 0.85},
+                   "title": {"type": "string", "default": ""},
+                   "summary": {"type": "string", "default": ""},
+                   "work_unit": {"type": "string", "default": "",
+                                 "description": "optional JSON work unit; omitted uses next_work_unit"}},
+                  since="0.8.0"),
+            Skill("get_milestone", "Look up a developer milestone by id",
+                  {"milestone_id": {"type": "string", "required": True}},
+                  since="0.8.0"),
+            Skill("list_milestones", "List developer milestones",
+                  {"target": {"type": "string", "default": ""},
+                   "status": {"type": "string", "default": ""},
+                   "include_archived": {"type": "boolean", "default": False}},
+                  since="0.8.0"),
+            Skill("draft_spec_from_milestone", "Return the milestone's deterministic draft spec",
+                  {"milestone_id": {"type": "string", "required": True}},
+                  since="0.8.0"),
             # Test run + distill (token-arbitrage: pay local pytest cost once,
             # serve cheap digest to Claude instead of raw pytest output)
             Skill("run_tests", "Run project pytest suite and return a distilled digest",
@@ -461,6 +482,73 @@ class DeveloperAgent(BaseAgent):
             "work_unit": units[0],
             "remaining": len(units) - 1,
             "source": result.get("source", "unknown"),
+        }
+
+    @handler("propose_milestone_from_work_unit")
+    async def handle_propose_milestone_from_work_unit(self, args):
+        from developer.milestone_store import MilestoneError
+
+        try:
+            work_unit = _parse_work_unit_arg(args.get("work_unit"))
+            source = "provided_work_unit"
+            if not work_unit:
+                next_result = await self.handle_next_work_unit(args)
+                if "error" in next_result:
+                    return next_result
+                work_unit = next_result.get("work_unit") or {}
+                source = next_result.get("source", "work_unit")
+            milestone = self.pipeline.milestones.propose_from_work_unit(
+                work_unit,
+                target=args.get("target", ""),
+                title=args.get("title", ""),
+                summary=args.get("summary", ""),
+                source=source,
+            )
+        except (MilestoneError, ValueError, TypeError) as e:
+            await self.report_gap("propose_milestone_from_work_unit", str(e))
+            return {"error": str(e)}
+        return {"milestone": milestone.to_public_dict()}
+
+    @handler("get_milestone")
+    async def handle_get_milestone(self, args):
+        milestone_id = args.get("milestone_id", "")
+        if not milestone_id:
+            return {"error": "milestone_id is required"}
+        milestone = self.pipeline.milestones.get(milestone_id)
+        if milestone is None:
+            return {"milestone": None, "reason": f"unknown milestone id: {milestone_id}"}
+        return {"milestone": milestone.to_public_dict()}
+
+    @handler("list_milestones")
+    async def handle_list_milestones(self, args):
+        from developer.milestone_store import MilestoneError
+
+        try:
+            milestones = self.pipeline.milestones.list(
+                target=args.get("target", ""),
+                status=args.get("status", ""),
+                include_archived=bool(args.get("include_archived", False)),
+            )
+        except MilestoneError as e:
+            await self.report_gap("list_milestones", str(e))
+            return {"error": str(e)}
+        return {
+            "count": len(milestones),
+            "milestones": [m.to_public_dict() for m in milestones],
+        }
+
+    @handler("draft_spec_from_milestone")
+    async def handle_draft_spec_from_milestone(self, args):
+        milestone_id = args.get("milestone_id", "")
+        if not milestone_id:
+            return {"error": "milestone_id is required"}
+        milestone = self.pipeline.milestones.get(milestone_id)
+        if milestone is None:
+            return {"error": f"unknown milestone id: {milestone_id}"}
+        return {
+            "milestone_id": milestone.id,
+            "title": milestone.title,
+            "draft_spec": milestone.draft_spec,
         }
 
     def _parse_and_rank_clusters(self, cluster_text: str, target: str) -> list[dict]:
@@ -1143,6 +1231,20 @@ def _parse_paths(value) -> list[str]:
     if isinstance(value, list):
         return [str(p).strip() for p in value if str(p).strip()]
     return [p.strip() for p in str(value).split(",") if p.strip()]
+
+
+def _parse_work_unit_arg(value) -> dict:
+    """Parse an optional work_unit arg from bus JSON/string input."""
+    if value in (None, ""):
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        parsed = json.loads(value)
+        if not isinstance(parsed, dict):
+            raise ValueError("work_unit JSON must decode to an object")
+        return parsed
+    raise ValueError("work_unit must be a JSON object or JSON string")
 
 
 # ---------------------------------------------------------------------------

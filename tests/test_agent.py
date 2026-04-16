@@ -15,8 +15,8 @@ def harness(temp_config_file):
 # -- skills --
 
 def test_skill_count(harness):
-    # 24 existing skills + 10 expanded git workflow skills.
-    assert len(harness.skills) == 34
+    # 34 existing skills + 4 milestone work-unit skills.
+    assert len(harness.skills) == 38
 
 
 def test_skills_registered(harness):
@@ -25,6 +25,8 @@ def test_skills_registered(harness):
         "health_check", "developer_guide",
         "get_fr", "list_frs", "get_paper_context",
         "next_work_unit", "work_units",
+        "propose_milestone_from_work_unit", "get_milestone",
+        "list_milestones", "draft_spec_from_milestone",
         "run_tests",
         # developer-owned FR lifecycle (PR #10)
         "promote_fr", "update_fr_status", "set_fr_dependency",
@@ -64,6 +66,13 @@ def test_list_frs_skill(harness):
 
 def test_get_paper_context_skill(harness):
     harness.assert_skill_exists("get_paper_context", description="researcher")
+
+
+def test_milestone_skills(harness):
+    harness.assert_skill_exists("propose_milestone_from_work_unit", description="milestone")
+    harness.assert_skill_exists("get_milestone", description="milestone")
+    harness.assert_skill_exists("list_milestones", description="milestone")
+    harness.assert_skill_exists("draft_spec_from_milestone", description="draft spec")
 
 
 # -- collaborations --
@@ -417,7 +426,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 34
+    assert len(reg.skills) == 38
     assert len(reg.collaborations) == 2
 
 
@@ -568,3 +577,51 @@ async def test_next_work_unit_no_units_returns_error(harness):
     harness.agent.request = mock_request
     result = await harness.call("next_work_unit", {})
     assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_propose_milestone_from_top_work_unit(harness):
+    cluster_response = {"result": {"result": """## Cluster 1 (2 FRs, targets: developer)
+  [fr_developer_11111111] Milestone entity → developer [high]
+  [fr_developer_22222222] Draft spec artifact → developer [medium]
+"""}}
+
+    async def mock_request(**kwargs):
+        return cluster_response
+
+    harness.agent.request = mock_request
+    result = await harness.call("propose_milestone_from_work_unit", {"target": "developer"})
+
+    milestone = result["milestone"]
+    assert milestone["id"].startswith("ms_developer_")
+    assert milestone["target"] == "developer"
+    assert milestone["fr_ids"] == ["fr_developer_11111111", "fr_developer_22222222"]
+    assert "Draft spec artifact" in milestone["draft_spec"]
+
+    listed = await harness.call("list_milestones", {"target": "developer"})
+    assert listed["count"] == 1
+    assert listed["milestones"][0]["id"] == milestone["id"]
+
+    fetched = await harness.call("get_milestone", {"milestone_id": milestone["id"]})
+    assert fetched["milestone"]["id"] == milestone["id"]
+
+    draft = await harness.call("draft_spec_from_milestone", {"milestone_id": milestone["id"]})
+    assert draft["milestone_id"] == milestone["id"]
+    assert "fr_developer_11111111" in draft["draft_spec"]
+
+
+@pytest.mark.asyncio
+async def test_propose_milestone_accepts_json_work_unit(harness):
+    work_unit = """{
+      "name": "Cluster 9 (1 FR, targets: developer)",
+      "targets": ["developer"],
+      "frs": [{"fr_id": "fr_developer_33333333", "description": "Small slice", "priority": "high"}]
+    }"""
+
+    result = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": work_unit,
+        "title": "Small milestone",
+    })
+
+    assert result["milestone"]["title"] == "Small milestone"
+    assert result["milestone"]["fr_ids"] == ["fr_developer_33333333"]
