@@ -41,6 +41,8 @@ def test_propose_from_work_unit_persists_milestone(pipeline):
     assert milestone.status == MILESTONE_STATUS_PROPOSED
     assert milestone.fr_ids == ["fr_developer_11111111", "fr_developer_22222222"]
     assert "fr_developer_11111111" in milestone.draft_spec
+    assert "[high] [high]" not in milestone.draft_spec
+    assert "[medium] [medium]" not in milestone.draft_spec
 
     loaded = pipeline.milestones.get(milestone.id)
     assert loaded is not None
@@ -96,3 +98,12 @@ def test_reproposal_draft_spec_uses_existing_status(pipeline):
 
     assert second.status == MILESTONE_STATUS_IN_PROGRESS
     assert "**Status:** in_progress" in second.draft_spec
+
+
+def test_draft_spec_appends_priority_when_description_omits_it(pipeline):
+    work_unit = _work_unit()
+    work_unit["frs"][0]["description"] = "Create milestone records"
+
+    milestone = pipeline.milestones.propose_from_work_unit(work_unit)
+
+    assert "Create milestone records [high]" in milestone.draft_spec
