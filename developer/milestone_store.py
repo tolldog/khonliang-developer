@@ -270,10 +270,7 @@ def _draft_spec(
     for fr in work_unit.get("frs") or []:
         if isinstance(fr, dict):
             fr_id = _fr_id_from_item(fr)
-            description = str(fr.get("description") or fr.get("title") or "").strip()
-            priority = str(fr.get("priority") or "").strip()
-            suffix = f" [{priority}]" if priority else ""
-            lines.append(f"- `{fr_id}` {description}{suffix}".rstrip())
+            lines.append(f"- `{fr_id}` {_fr_description_with_priority(fr)}".rstrip())
         else:
             lines.append(f"- `{str(fr).strip()}`")
     lines.extend([
@@ -285,3 +282,11 @@ def _draft_spec(
         "- A follow-up spec can refine design decisions before coding starts.",
     ])
     return "\n".join(lines)
+
+
+def _fr_description_with_priority(fr: dict[str, Any]) -> str:
+    description = str(fr.get("description") or fr.get("title") or "").strip()
+    priority = str(fr.get("priority") or "").strip()
+    if priority and not description.endswith(f"[{priority}]"):
+        description = f"{description} [{priority}]".strip()
+    return description
