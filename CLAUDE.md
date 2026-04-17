@@ -10,8 +10,9 @@ handles upstream planning, evidence lookup, and dispatch.
 
 Active. Developer is the authoritative owner for FR lifecycle, dependencies,
 work-unit bundling, milestone/spec handoff, and development progress. It is
-served through the khonliang bus as a registered agent; direct MCP usage is
-legacy.
+served through the khonliang bus as a registered agent in the primary
+bus-native mode, while direct MCP usage remains supported for direct Claude
+connections.
 
 ## Stack
 
@@ -26,7 +27,7 @@ legacy.
 ```
 INFRASTRUCTURE (services)
 ├─ khonliang-scheduler  — LLM inference scheduling (Go)
-└─ khonliang-bus        — Python agent bus, service registry, artifacts, MCP adapter
+└─ khonliang-bus        — agent bus service, service registry, artifacts, MCP adapter
 
 LIBRARIES (Python)
 ├─ khonliang            — agents, MCP transport, stores, consensus
@@ -68,7 +69,7 @@ When in doubt: if it's about producing artifacts (specs, code, FRs, worktrees), 
 ### FR lifecycle
 - Own FR storage and lifecycle. Researcher may suggest/promote ideas, but active
   FR state lives in developer.
-- Manage status progression (open → planned → in_progress → review → completed)
+- Manage status progression (open → planned → in_progress → completed)
 - Detect overlaps, bundle related FRs into work units
 
 ### Worktree orchestration
