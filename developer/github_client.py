@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -431,7 +432,7 @@ def _latest_copilot_clear_comment(comments: list[dict], *, head_sha: str = "") -
             continue
         if not any(marker in body_lower for marker in clear_markers):
             continue
-        if head_sha and head_sha_lower[:7] not in body_lower:
+        if head_sha and not _contains_head_sha_reference(body_lower, head_sha_lower):
             continue
         return body
     return ""
@@ -443,3 +444,11 @@ def _is_copilot_login(login: str) -> bool:
         "copilot-pull-request-reviewer",
         "copilot-pull-request-reviewer[bot]",
     }
+
+
+def _contains_head_sha_reference(body_lower: str, head_sha_lower: str) -> bool:
+    short_sha = head_sha_lower[:7]
+    pattern = re.compile(
+        rf"(?<![0-9a-f])(?:{re.escape(head_sha_lower)}|{re.escape(short_sha)})(?![0-9a-f])"
+    )
+    return bool(pattern.search(body_lower))

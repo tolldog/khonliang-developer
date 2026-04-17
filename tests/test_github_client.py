@@ -428,6 +428,34 @@ async def test_pr_readiness_matches_head_sha_case_insensitively():
 
 
 @pytest.mark.asyncio
+async def test_pr_readiness_matches_full_head_sha_case_insensitively():
+    c = GithubClient(token="t")
+    _install_fake_gh(c, pr=_FakePR(head_sha="b348b3f123"), issue_comments=[
+        _FakeIssueComment(
+            100,
+            "Re-reviewed B348B3F123 and I don't see additional blocking issues in this scope.",
+            user=_FakeUser(login="copilot-swe-agent"),
+        )
+    ])
+    out = await c.pr_readiness("o/n", 42)
+    assert out.copilot_verdict == "clear"
+
+
+@pytest.mark.asyncio
+async def test_pr_readiness_does_not_match_sha_inside_longer_hex_token():
+    c = GithubClient(token="t")
+    _install_fake_gh(c, pr=_FakePR(head_sha="b348b3f123"), issue_comments=[
+        _FakeIssueComment(
+            100,
+            "Re-reviewed xb348b3f1234 and I don't see additional blocking issues in this scope.",
+            user=_FakeUser(login="copilot-swe-agent"),
+        )
+    ])
+    out = await c.pr_readiness("o/n", 42)
+    assert out.copilot_verdict == "pending"
+
+
+@pytest.mark.asyncio
 async def test_pr_readiness_keeps_human_changes_requested_even_with_copilot_clear():
     c = GithubClient(token="t")
     _install_fake_gh(c, pr=_FakePR(head_sha="b348b3f1234567890"), reviews=[
