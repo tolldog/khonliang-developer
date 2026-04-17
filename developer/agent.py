@@ -499,6 +499,8 @@ class DeveloperAgent(BaseAgent):
     async def handle_next_work_unit(self, args):
         """Get the single highest-ranked work unit."""
         result = await self.handle_work_units(args)
+        if "error" in result:
+            return {"error": result["error"]}
         units = result.get("work_units", [])
         if not units:
             return {"error": "no work units available"}
@@ -506,6 +508,7 @@ class DeveloperAgent(BaseAgent):
             "work_unit": units[0],
             "remaining": len(units) - 1,
             "source": result.get("source", "unknown"),
+            "max_frs": result.get("max_frs"),
         }
 
     @handler("propose_milestone_from_work_unit")

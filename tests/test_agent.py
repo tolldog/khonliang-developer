@@ -615,6 +615,32 @@ async def test_work_units_reject_bad_max_frs(harness):
 
 
 @pytest.mark.asyncio
+async def test_next_work_unit_honors_max_frs(harness):
+    for idx in range(3):
+        harness.agent.pipeline.frs.promote(
+            target="developer",
+            title=f"Runtime task {idx}",
+            description=f"task {idx}",
+            priority="high",
+            concept="runtime",
+        )
+
+    result = await harness.call("next_work_unit", {"target": "developer", "max_frs": 2})
+
+    assert result["work_unit"]["size"] == 2
+    assert len(result["work_unit"]["frs"]) == 2
+    assert result["remaining"] == 1
+    assert result["max_frs"] == 2
+
+
+@pytest.mark.asyncio
+async def test_next_work_unit_rejects_bad_max_frs(harness):
+    result = await harness.call("next_work_unit", {"max_frs": 0})
+
+    assert result == {"error": "max_frs must be a positive integer, got 0"}
+
+
+@pytest.mark.asyncio
 async def test_next_work_unit_no_units_returns_error(harness):
     """next_work_unit returns an error dict when no work units are available."""
     result = await harness.call("next_work_unit", {})
