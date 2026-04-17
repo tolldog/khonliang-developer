@@ -15,8 +15,8 @@ def harness(temp_config_file):
 # -- skills --
 
 def test_skill_count(harness):
-    # 34 existing skills + 5 milestone work-unit skills + concept FR candidates.
-    assert len(harness.skills) == 40
+    # 34 existing skills + 6 milestone/handoff skills + concept FR candidates.
+    assert len(harness.skills) == 41
 
 
 def test_skills_registered(harness):
@@ -28,6 +28,7 @@ def test_skills_registered(harness):
         "next_work_unit", "work_units",
         "propose_milestone_from_work_unit", "get_milestone",
         "list_milestones", "draft_spec_from_milestone", "review_milestone_scope",
+        "prepare_development_handoff",
         "run_tests",
         # developer-owned FR lifecycle (PR #10)
         "promote_fr", "update_fr_status", "set_fr_dependency",
@@ -79,6 +80,7 @@ def test_milestone_skills(harness):
     harness.assert_skill_exists("list_milestones", description="milestone")
     harness.assert_skill_exists("draft_spec_from_milestone", description="draft spec")
     harness.assert_skill_exists("review_milestone_scope", description="duplicate")
+    harness.assert_skill_exists("prepare_development_handoff", description="handoff")
 
 
 # -- collaborations --
@@ -432,7 +434,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 40
+    assert len(reg.skills) == 41
     assert len(reg.collaborations) == 2
 
 
@@ -735,3 +737,52 @@ async def test_propose_milestone_accepts_json_work_unit(harness):
 
     assert result["milestone"]["title"] == "Small milestone"
     assert result["milestone"]["fr_ids"] == ["fr_developer_33333333"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_development_handoff_from_top_work_unit(harness):
+    cluster_response = {"result": {"result": """## Cluster 1 (2 FRs, targets: developer)
+  [fr_developer_11111111] Milestone entity → developer [high]
+  [fr_developer_22222222] Draft spec artifact → developer [medium]
+"""}}
+
+    async def mock_request(**kwargs):
+        return cluster_response
+
+    harness.agent.request = mock_request
+    result = await harness.call("prepare_development_handoff", {"target": "developer"})
+
+    assert result["status"] == "ready"
+    assert result["source"] == "clusters"
+    assert result["remaining_work_units"] == 0
+    assert result["milestone"]["id"].startswith("ms_developer_")
+    assert result["milestone"]["fr_ids"] == ["fr_developer_11111111", "fr_developer_22222222"]
+    assert result["work_unit"]["name"] == "Cluster 1 (2 FRs, targets: developer)"
+    assert result["scope_review"]["recommendation"] == "ready_for_spec"
+    assert "fr_developer_11111111" in result["draft_spec"]
+    assert result["suggested_next_actions"][1].endswith("review_terms=AutoGen,GRA")
+    assert result["suggested_next_actions"][-1] == (
+        "create implementation branch and start the scoped milestone"
+    )
+
+
+@pytest.mark.asyncio
+async def test_prepare_development_handoff_flags_review_terms(harness):
+    work_unit = """{
+      "name": "Cluster 9 (1 FR, targets: developer)",
+      "targets": ["developer"],
+      "frs": [{"fr_id": "fr_developer_33333333", "description": "Create AutoGen template", "priority": "high"}]
+    }"""
+
+    result = await harness.call("prepare_development_handoff", {
+        "work_unit": work_unit,
+        "review_terms": "AutoGen",
+    })
+
+    assert result["status"] == "needs_review"
+    assert "remaining_work_units" not in result
+    assert result["scope_review"]["recommendation"] == "refine_before_implementation"
+    assert result["suggested_next_actions"][1].endswith("review_terms=AutoGen")
+    assert result["suggested_next_actions"][-1] == (
+        "refine or split the milestone before implementation"
+    )

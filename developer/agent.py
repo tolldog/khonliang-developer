@@ -115,6 +115,16 @@ class DeveloperAgent(BaseAgent):
                   {"milestone_id": {"type": "string", "required": True},
                    "review_terms": {"type": "string", "default": "AutoGen,GRA"}},
                   since="0.8.0"),
+            Skill("prepare_development_handoff",
+                  "Return a compact bundle → milestone → draft spec handoff for implementation",
+                  {"target": {"type": "string", "default": ""},
+                   "threshold": {"type": "number", "default": 0.85},
+                   "title": {"type": "string", "default": ""},
+                   "summary": {"type": "string", "default": ""},
+                   "work_unit": {"type": "string", "default": "",
+                                 "description": "optional JSON work unit; omitted uses next_work_unit"},
+                   "review_terms": {"type": "string", "default": "AutoGen,GRA"}},
+                  since="0.10.0"),
             # Test run + distill (token-arbitrage: pay local pytest cost once,
             # serve cheap digest to Claude instead of raw pytest output)
             Skill("run_tests", "Run project pytest suite and return a distilled digest",
@@ -633,6 +643,57 @@ class DeveloperAgent(BaseAgent):
         except MilestoneError as e:
             await self.report_gap("review_milestone_scope", str(e))
             return {"error": str(e)}
+
+    @handler("prepare_development_handoff")
+    async def handle_prepare_development_handoff(self, args):
+        """Create the compact handoff a coding session needs to start work."""
+        from developer.milestone_store import MilestoneError
+
+        try:
+            work_unit = _parse_work_unit_arg(args.get("work_unit"))
+            source = "provided_work_unit"
+            remaining = None
+            if not work_unit:
+                next_result = await self.handle_next_work_unit(args)
+                if "error" in next_result:
+                    return next_result
+                work_unit = next_result.get("work_unit") or {}
+                source = next_result.get("source", "work_unit")
+                remaining = next_result.get("remaining")
+
+            milestone = self.pipeline.milestones.propose_from_work_unit(
+                work_unit,
+                target=args.get("target", ""),
+                title=args.get("title", ""),
+                summary=args.get("summary", ""),
+                source=source,
+            )
+            review_terms = _parse_paths(args.get("review_terms", "AutoGen,GRA"))
+            review = self.pipeline.milestones.review_scope(
+                milestone.id,
+                review_terms=review_terms,
+            )
+        except (MilestoneError, ValueError, TypeError) as e:
+            await self.report_gap("prepare_development_handoff", str(e))
+            return {"error": str(e)}
+
+        recommendation = review.get("recommendation", "")
+        response = {
+            "status": "ready" if recommendation == "ready_for_spec" else "needs_review",
+            "source": source,
+            "milestone": milestone.to_public_dict(),
+            "work_unit": work_unit,
+            "scope_review": review,
+            "draft_spec": milestone.draft_spec,
+            "suggested_next_actions": _handoff_next_actions(
+                milestone.id,
+                recommendation,
+                review_terms=review_terms,
+            ),
+        }
+        if remaining is not None:
+            response["remaining_work_units"] = remaining
+        return response
 
     def _parse_and_rank_clusters(self, cluster_text: str, target: str) -> list[dict]:
         """Parse cluster_frs output and rank by aggregate importance.
@@ -1314,6 +1375,26 @@ def _parse_paths(value) -> list[str]:
     if isinstance(value, list):
         return [str(p).strip() for p in value if str(p).strip()]
     return [p.strip() for p in str(value).split(",") if p.strip()]
+
+
+def _handoff_next_actions(
+    milestone_id: str,
+    recommendation: str,
+    *,
+    review_terms: list[str],
+) -> list[str]:
+    review_action = f"review_milestone_scope milestone_id={milestone_id}"
+    if review_terms:
+        review_action += f" review_terms={','.join(review_terms)}"
+    actions = [
+        f"draft_spec_from_milestone milestone_id={milestone_id}",
+        review_action,
+    ]
+    if recommendation == "ready_for_spec":
+        actions.append("create implementation branch and start the scoped milestone")
+    else:
+        actions.append("refine or split the milestone before implementation")
+    return actions
 
 
 def _parse_work_unit_arg(value) -> dict:
