@@ -586,6 +586,35 @@ async def test_next_work_unit_returns_top(harness):
 
 
 @pytest.mark.asyncio
+async def test_work_units_bound_large_concept_groups(harness):
+    """work_units splits same-concept FR groups into implementation-sized bundles."""
+    for idx in range(6):
+        harness.agent.pipeline.frs.promote(
+            target="developer",
+            title=f"Runtime slice {idx}",
+            description=f"slice {idx}",
+            priority="medium",
+            concept="runtime",
+        )
+
+    result = await harness.call("work_units", {"target": "developer", "max_frs": 2})
+
+    assert result["source"] == "developer_local"
+    assert result["max_frs"] == 2
+    assert result["count"] == 3
+    assert [unit["size"] for unit in result["work_units"]] == [2, 2, 2]
+    assert all(len(unit["frs"]) <= 2 for unit in result["work_units"])
+    assert "slice 1" in result["work_units"][0]["name"]
+
+
+@pytest.mark.asyncio
+async def test_work_units_reject_bad_max_frs(harness):
+    result = await harness.call("work_units", {"max_frs": 0})
+
+    assert result == {"error": "max_frs must be a positive integer, got 0"}
+
+
+@pytest.mark.asyncio
 async def test_next_work_unit_no_units_returns_error(harness):
     """next_work_unit returns an error dict when no work units are available."""
     result = await harness.call("next_work_unit", {})
