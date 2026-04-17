@@ -522,6 +522,32 @@ async def test_work_units_from_local_frs(harness):
 
 
 @pytest.mark.asyncio
+async def test_work_units_are_deterministic_for_equal_rank_groups(harness):
+    """Equal-priority work units sort by stable target/concept keys."""
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Zeta",
+        description="Z",
+        priority="medium",
+        concept="zeta",
+    )
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Alpha",
+        description="A",
+        priority="medium",
+        concept="alpha",
+    )
+
+    result = await harness.call("work_units", {"target": "developer"})
+    units = result["work_units"]
+    assert [u["concept"] for u in units] == ["alpha", "zeta"]
+    assert units[0]["name"] == "Developer FR work unit (1 FRs, target: developer, concept: alpha)"
+    assert units[1]["name"] == "Developer FR work unit (1 FRs, target: developer, concept: zeta)"
+    assert [u["rank"] for u in units] == [1, 2]
+
+
+@pytest.mark.asyncio
 async def test_work_units_no_local_frs(harness):
     """work_units no longer falls back to researcher-owned FRs."""
     result = await harness.call("work_units", {"target": "developer"})

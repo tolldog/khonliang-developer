@@ -83,19 +83,16 @@ class DeveloperAgent(BaseAgent):
                    "detail": {"type": "string", "default": "brief"},
                    "timeout_s": {"type": "number", "default": 90}},
                   since="0.9.0"),
-            # Clustered FR work planning
-            Skill("next_work_unit", "Get the highest-ranked FR cluster as a work unit",
-                  {"target": {"type": "string", "default": ""},
-                   "threshold": {"type": "number", "default": 0.85}},
+            # Developer-owned FR work planning
+            Skill("next_work_unit", "Get the highest-ranked developer FR work unit",
+                  {"target": {"type": "string", "default": ""}},
                   since="0.2.0"),
             Skill("work_units", "List developer-owned FR work units ranked by importance",
-                  {"target": {"type": "string", "default": ""},
-                   "threshold": {"type": "number", "default": 0.85}},
+                  {"target": {"type": "string", "default": ""}},
                   since="0.2.0"),
             Skill("propose_milestone_from_work_unit",
                   "Create a durable milestone from a provided or top-ranked work unit",
                   {"target": {"type": "string", "default": ""},
-                   "threshold": {"type": "number", "default": 0.85},
                    "title": {"type": "string", "default": ""},
                    "summary": {"type": "string", "default": ""},
                    "work_unit": {"type": "string", "default": "",
@@ -125,7 +122,6 @@ class DeveloperAgent(BaseAgent):
             Skill("prepare_development_handoff",
                   "Return a compact bundle → milestone → draft spec handoff for implementation",
                   {"target": {"type": "string", "default": ""},
-                   "threshold": {"type": "number", "default": 0.85},
                    "title": {"type": "string", "default": ""},
                    "summary": {"type": "string", "default": ""},
                    "work_unit": {"type": "string", "default": "",
@@ -473,7 +469,7 @@ class DeveloperAgent(BaseAgent):
             "candidates": candidates,
         }
 
-    # -- clustered FR work planning --
+    # -- developer-owned FR work planning --
 
     @handler("work_units")
     async def handle_work_units(self, args):
@@ -1265,15 +1261,17 @@ def _work_units_from_local_frs(frs) -> list[dict]:
         groups.setdefault((fr.target, concept), []).append(fr)
 
     units = []
-    for idx, ((target, concept), group) in enumerate(groups.items(), start=1):
+    for target, concept in sorted(groups):
+        group = sorted(groups[(target, concept)], key=lambda fr: fr.id)
         priorities = [fr.priority for fr in group]
         max_priority = _max_priority(priorities)
         title_concept = concept if concept != "general" else "general"
         units.append({
-            "name": f"Developer FR work unit {idx} ({len(group)} FRs, target: {target}, concept: {title_concept})",
-            "rank": idx,
+            "name": f"Developer FR work unit ({len(group)} FRs, target: {target}, concept: {title_concept})",
+            "rank": 0,
             "size": len(group),
             "targets": [target],
+            "concept": title_concept,
             "max_priority": max_priority,
             "source": "developer_local",
             "frs": [
@@ -1292,7 +1290,8 @@ def _work_units_from_local_frs(frs) -> list[dict]:
     units.sort(key=lambda u: (
         priority_order.get(u["max_priority"], 99),
         -int(u["size"]),
-        u["name"],
+        u["targets"][0],
+        u["concept"],
     ))
     for idx, unit in enumerate(units, start=1):
         unit["rank"] = idx

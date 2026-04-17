@@ -123,12 +123,10 @@ class SpecReader:
         self,
         reader: LocalDocReader,
         projects: dict[str, ProjectConfig],
-        researcher: ResearcherClient,
         fr_store: FRStore | None = None,
     ):
         self._reader = reader
         self._projects = projects
-        self._researcher = researcher
         self._fr_store = fr_store
 
     # ------------------------------------------------------------------

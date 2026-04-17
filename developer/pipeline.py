@@ -92,7 +92,6 @@ class Pipeline:
         specs = SpecReader(
             reader=reader,
             projects=config.projects,
-            researcher=researcher,
             fr_store=frs,
         )
 
