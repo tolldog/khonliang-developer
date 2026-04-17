@@ -586,6 +586,63 @@ async def test_next_work_unit_returns_top(harness):
 
 
 @pytest.mark.asyncio
+async def test_work_units_bound_large_concept_groups(harness):
+    """work_units splits same-concept FR groups into implementation-sized bundles."""
+    for idx in range(6):
+        harness.agent.pipeline.frs.promote(
+            target="developer",
+            title=f"Runtime slice {idx}",
+            description=f"slice {idx}",
+            priority="medium",
+            concept="runtime",
+        )
+
+    result = await harness.call("work_units", {"target": "developer", "max_frs": 2})
+
+    assert result["source"] == "developer_local"
+    assert result["max_frs"] == 2
+    assert result["count"] == 3
+    assert [unit["size"] for unit in result["work_units"]] == [2, 2, 2]
+    assert all(len(unit["frs"]) <= 2 for unit in result["work_units"])
+    assert "slice 1" in result["work_units"][0]["name"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_value", [0, -1])
+async def test_work_units_reject_bad_max_frs(harness, bad_value):
+    result = await harness.call("work_units", {"max_frs": bad_value})
+
+    assert result == {"error": f"max_frs must be a positive integer, got {bad_value}"}
+
+
+@pytest.mark.asyncio
+async def test_next_work_unit_honors_max_frs(harness):
+    for idx in range(3):
+        harness.agent.pipeline.frs.promote(
+            target="developer",
+            title=f"Runtime task {idx}",
+            description=f"task {idx}",
+            priority="high",
+            concept="runtime",
+        )
+
+    result = await harness.call("next_work_unit", {"target": "developer", "max_frs": 2})
+
+    assert result["work_unit"]["size"] == 2
+    assert len(result["work_unit"]["frs"]) == 2
+    assert result["remaining"] == 1
+    assert result["max_frs"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_value", [0, -1])
+async def test_next_work_unit_rejects_bad_max_frs(harness, bad_value):
+    result = await harness.call("next_work_unit", {"max_frs": bad_value})
+
+    assert result == {"error": f"max_frs must be a positive integer, got {bad_value}"}
+
+
+@pytest.mark.asyncio
 async def test_next_work_unit_no_units_returns_error(harness):
     """next_work_unit returns an error dict when no work units are available."""
     result = await harness.call("next_work_unit", {})

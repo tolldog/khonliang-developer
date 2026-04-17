@@ -85,10 +85,14 @@ class DeveloperAgent(BaseAgent):
                   since="0.9.0"),
             # Developer-owned FR work planning
             Skill("next_work_unit", "Get the highest-ranked developer FR work unit",
-                  {"target": {"type": "string", "default": ""}},
+                  {"target": {"type": "string", "default": ""},
+                   "max_frs": {"type": "integer", "default": 5,
+                               "description": "maximum FRs per returned implementation bundle"}},
                   since="0.2.0"),
             Skill("work_units", "List developer-owned FR work units ranked by importance",
-                  {"target": {"type": "string", "default": ""}},
+                  {"target": {"type": "string", "default": ""},
+                   "max_frs": {"type": "integer", "default": 5,
+                               "description": "maximum FRs per implementation bundle"}},
                   since="0.2.0"),
             Skill("propose_milestone_from_work_unit",
                   "Create a durable milestone from a provided or top-ranked work unit",
@@ -475,21 +479,28 @@ class DeveloperAgent(BaseAgent):
     async def handle_work_units(self, args):
         """Return developer-owned FR work units ranked by local FR state."""
         target = args.get("target") or None
+        max_frs = _positive_int_arg(args, "max_frs", default=5)
+        if isinstance(max_frs, dict):
+            await self._safe_report_gap("work_units", max_frs["error"])
+            return max_frs
         frs = self.pipeline.frs.list(target=target)
         if not frs:
             return {"work_units": [], "source": "none", "error": "no developer-owned FRs available"}
 
-        work_units = _work_units_from_local_frs(frs)
+        work_units = _work_units_from_local_frs(frs, max_size=max_frs)
         return {
             "work_units": work_units,
             "source": "developer_local",
             "count": len(work_units),
+            "max_frs": max_frs,
         }
 
     @handler("next_work_unit")
     async def handle_next_work_unit(self, args):
         """Get the single highest-ranked work unit."""
         result = await self.handle_work_units(args)
+        if "error" in result:
+            return {"error": result["error"]}
         units = result.get("work_units", [])
         if not units:
             return {"error": "no work units available"}
@@ -497,6 +508,7 @@ class DeveloperAgent(BaseAgent):
             "work_unit": units[0],
             "remaining": len(units) - 1,
             "source": result.get("source", "unknown"),
+            "max_frs": result.get("max_frs", 5),
         }
 
     @handler("propose_milestone_from_work_unit")
@@ -1253,8 +1265,9 @@ def _parse_paths(value) -> list[str]:
     return [p.strip() for p in str(value).split(",") if p.strip()]
 
 
-def _work_units_from_local_frs(frs) -> list[dict]:
+def _work_units_from_local_frs(frs, *, max_size: int = 5) -> list[dict]:
     """Build deterministic work units from developer-owned FR records."""
+    max_size = max(1, int(max_size))
     groups: dict[tuple[str, str], list] = {}
     for fr in frs:
         concept = (fr.concept or "general").strip().lower()
@@ -1263,28 +1276,34 @@ def _work_units_from_local_frs(frs) -> list[dict]:
     units = []
     for target, concept in sorted(groups):
         group = sorted(groups[(target, concept)], key=lambda fr: fr.id)
-        priorities = [fr.priority for fr in group]
-        max_priority = _max_priority(priorities)
         title_concept = concept if concept != "general" else "general"
-        units.append({
-            "name": f"Developer FR work unit ({len(group)} FRs, target: {target}, concept: {title_concept})",
-            "rank": 0,
-            "size": len(group),
-            "targets": [target],
-            "concept": title_concept,
-            "max_priority": max_priority,
-            "source": "developer_local",
-            "frs": [
-                {
-                    "fr_id": fr.id,
-                    "description": f"{fr.title} → {fr.target} [{fr.priority}]",
-                    "priority": fr.priority,
-                    "status": fr.status,
-                    "target": fr.target,
-                }
-                for fr in group
-            ],
-        })
+        for chunk_index, chunk_start in enumerate(range(0, len(group), max_size), start=1):
+            chunk = group[chunk_start:chunk_start + max_size]
+            priorities = [fr.priority for fr in chunk]
+            max_priority = _max_priority(priorities)
+            suffix = "" if len(group) <= max_size else f", slice {chunk_index}"
+            units.append({
+                "name": (
+                    f"Developer FR work unit ({len(chunk)} FRs, target: {target}, "
+                    f"concept: {title_concept}{suffix})"
+                ),
+                "rank": 0,
+                "size": len(chunk),
+                "targets": [target],
+                "concept": title_concept,
+                "max_priority": max_priority,
+                "source": "developer_local",
+                "frs": [
+                    {
+                        "fr_id": fr.id,
+                        "description": f"{fr.title} → {fr.target} [{fr.priority}]",
+                        "priority": fr.priority,
+                        "status": fr.status,
+                        "target": fr.target,
+                    }
+                    for fr in chunk
+                ],
+            })
 
     priority_order = {"high": 0, "medium": 1, "low": 2}
     units.sort(key=lambda u: (
@@ -1296,6 +1315,17 @@ def _work_units_from_local_frs(frs) -> list[dict]:
     for idx, unit in enumerate(units, start=1):
         unit["rank"] = idx
     return units
+
+
+def _positive_int_arg(args: dict, name: str, *, default: int) -> int | dict:
+    raw = args.get(name, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return {"error": f"{name} must be a positive integer, got {raw!r}"}
+    if value < 1:
+        return {"error": f"{name} must be a positive integer, got {raw!r}"}
+    return value
 
 
 def _max_priority(priorities: list[str]) -> str:
