@@ -74,15 +74,38 @@ async def test_traverse_milestone_walks_back_to_specs(pipeline):
 
 
 @pytest.mark.asyncio
-async def test_traverse_milestone_resolves_frs_via_stub(pipeline):
-    """ResearcherClient is stubbed in MS-01 — every FR comes back unresolved."""
+async def test_traverse_milestone_resolves_frs_from_developer_store(pipeline):
+    """FR references resolve from developer's authoritative FR store."""
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+
+    pipeline.knowledge.add(
+        KnowledgeEntry(
+            id="fr_developer_28a11ce2",
+            tier=Tier.DERIVED,
+            title="MS-01 FR",
+            content="developer-owned FR",
+            source="developer.fr_store",
+            scope="development",
+            confidence=1.0,
+            status=EntryStatus.DISTILLED,
+            tags=["fr", "target:developer", "app"],
+            metadata={
+                "fr_status": "open",
+                "priority": "high",
+                "concept": "specs",
+                "classification": "app",
+                "target": "developer",
+            },
+        )
+    )
     chain = await pipeline.specs.traverse_milestone(str(MILESTONE_PATH))
     assert len(chain.frs) >= 1
     fr_ids = [f.fr_id for f in chain.frs]
     assert "fr_developer_28a11ce2" in fr_ids
-    # Stub guarantees: every FR is unresolved in MS-01.
-    assert all(not f.resolved for f in chain.frs)
-    assert all(f.record is None for f in chain.frs)
+    target = next(f for f in chain.frs if f.fr_id == "fr_developer_28a11ce2")
+    assert target.resolved is True
+    assert target.record is not None
+    assert target.record.fr_id == "fr_developer_28a11ce2"
 
 
 # ---------------------------------------------------------------------------

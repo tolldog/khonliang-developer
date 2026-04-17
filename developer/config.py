@@ -6,7 +6,7 @@ back) and adds typed dataclass wrappers for the structured blocks.
 
 Validates ``models``, ``bus`` and ``researcher_mcp`` config blocks.
 The bus URL is used by :class:`~developer.researcher_client.ResearcherClient`
-to reach the researcher agent; model construction lands in MS-02.
+for researcher evidence/context calls; FR ownership lives in developer.
 """
 
 from __future__ import annotations
@@ -71,7 +71,7 @@ class BusConfig:
 
 @dataclass
 class ResearcherMCPConfig:
-    """How to reach the researcher MCP server. Stub in MS-01."""
+    """How to reach researcher for evidence/context calls."""
 
     transport: str = "stdio"  # stdio | http
     command: str = ""
@@ -229,9 +229,8 @@ def _parse_bus(block: Any) -> BusConfig:
 def _parse_researcher_mcp(block: Any) -> ResearcherMCPConfig:
     if block is None:
         raise ConfigError(
-            "missing 'researcher_mcp' block — MS-01 requires the block to "
-            "exist (no connection is attempted; the ResearcherClient is "
-            "stubbed until MS-02)"
+            "missing 'researcher_mcp' block — developer still needs "
+            "researcher connection settings for evidence/context calls"
         )
     if not isinstance(block, dict):
         raise ConfigError("'researcher_mcp' must be a mapping")

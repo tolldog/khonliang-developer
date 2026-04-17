@@ -1,9 +1,8 @@
 """Pipeline composition for the developer MCP server.
 
 Mirrors khonliang-researcher's ``create_pipeline`` factory pattern but
-holds developer-only stores and the :class:`ResearcherClient` seam
-instead of sharing storage with researcher (per spec rev 2's
-Architecture A: independent storage + MCP-to-MCP for narrow interfaces).
+holds developer-only stores and keeps :class:`ResearcherClient` limited
+to evidence/context calls instead of sharing storage with researcher.
 
 The :meth:`Pipeline.from_config` factory **enforces store isolation**:
 it asserts that ``KnowledgeStore``, ``TripleStore`` and ``DigestStore``
@@ -62,14 +61,15 @@ class Pipeline:
           2. **Assert store isolation** — every store's ``db_path`` must
              equal the resolved ``developer.db`` path. Refuse to start
              otherwise (acceptance #9).
-          3. Construct the LocalDocReader, ResearcherClient, SpecReader.
+          3. Construct the LocalDocReader, FRStore, ResearcherClient, SpecReader.
           4. Load ``prompts/developer_guide.md`` into ``developer_guide_text``
              at startup so the ``developer_guide`` MCP tool can return it
              without re-reading the file on every call.
 
-        Note: ``ResearcherClient`` is wired here for the MCP server path
-        (standalone stdio usage). The bus-agent path (``DeveloperAgent``)
-        uses ``self.request()`` from bus-lib for cross-agent calls instead.
+        Note: ``ResearcherClient`` is wired here for researcher evidence
+        calls in the MCP server path. The bus-agent path
+        (``DeveloperAgent``) uses ``self.request()`` from bus-lib for
+        cross-agent calls instead.
         """
         db_path = str(config.db_path)
 
@@ -85,14 +85,18 @@ class Pipeline:
         # reference extraction doesn't pick up python identifiers like ``fr_status``
         # from prose. It matches only ``fr_<target>_<8 hex chars>``.
         reader = LocalDocReader(reference_pattern=FR_ID_PATTERN)
-        # ResearcherClient for the MCP server path (standalone, uses config bus URL).
-        # The bus agent path uses self.request() from bus-lib instead.
+        frs = FRStore(knowledge=knowledge)
+        # ResearcherClient remains only for evidence/context calls. FR
+        # lifecycle and FR-id resolution are developer-owned.
         researcher = ResearcherClient(bus_url=config.bus.url or "http://localhost:8787")
-        specs = SpecReader(reader=reader, projects=config.projects, researcher=researcher)
+        specs = SpecReader(
+            reader=reader,
+            projects=config.projects,
+            fr_store=frs,
+        )
 
         guide_text = _load_developer_guide(config.prompts_dir)
 
-        frs = FRStore(knowledge=knowledge)
         milestones = MilestoneStore(knowledge=knowledge)
 
         return cls(

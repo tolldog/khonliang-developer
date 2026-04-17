@@ -110,9 +110,9 @@ def create_developer_server(pipeline: Pipeline):
     async def traverse_milestone(path: str, detail: str = "brief") -> str:
         """Backward-walk a milestone document to its specs and FRs.
 
-        FRs are resolved via ``ResearcherClient`` (stubbed in MS-01 — every
-        FR comes back ``(unresolved)``). The unresolved markers are how
-        callers know MS-01 is the current milestone state.
+        FRs are resolved from developer's authoritative FR store. Unresolved
+        markers mean the milestone references an FR id that has not been
+        migrated or promoted into developer yet.
         """
         try:
             chain = await pipeline.specs.traverse_milestone(path)
@@ -298,7 +298,7 @@ def _format_chain_full(chain) -> str:
         parts.append("--- fr details ---")
         for fr in chain.frs:
             if fr.record is None:
-                parts.append(f"{fr.fr_id}: (unresolved — ResearcherClient stubbed in MS-01)")
+                parts.append(f"{fr.fr_id}: (unresolved - not in developer FR store)")
             else:
                 parts.append(
                     f"{fr.fr_id}: {fr.record.title} "
