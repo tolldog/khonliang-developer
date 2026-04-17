@@ -25,7 +25,7 @@ from khonliang_researcher.doc_reader import DocContent, LocalDocReader
 
 from developer.config import ProjectConfig
 from developer.fr_store import FRStore
-from developer.researcher_client import FRRecord, ResearcherClient
+from developer.researcher_client import FRRecord
 
 
 # ---------------------------------------------------------------------------
