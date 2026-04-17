@@ -431,7 +431,7 @@ def _latest_copilot_clear_comment(comments: list[dict], *, head_sha: str = "") -
             continue
         if not any(marker in body_lower for marker in clear_markers):
             continue
-        if head_sha and head_sha_lower[:7] not in body_lower and head_sha_lower not in body_lower:
+        if head_sha and head_sha_lower[:7] not in body_lower:
             continue
         return body
     return ""

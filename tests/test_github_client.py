@@ -414,6 +414,20 @@ async def test_pr_readiness_requires_copilot_rereview_when_clear_is_stale():
 
 
 @pytest.mark.asyncio
+async def test_pr_readiness_matches_head_sha_case_insensitively():
+    c = GithubClient(token="t")
+    _install_fake_gh(c, pr=_FakePR(head_sha="B348B3F123"), issue_comments=[
+        _FakeIssueComment(
+            100,
+            "Re-reviewed b348b3f and I don't see additional blocking issues in this scope.",
+            user=_FakeUser(login="copilot-swe-agent"),
+        )
+    ])
+    out = await c.pr_readiness("o/n", 42)
+    assert out.copilot_verdict == "clear"
+
+
+@pytest.mark.asyncio
 async def test_pr_readiness_keeps_human_changes_requested_even_with_copilot_clear():
     c = GithubClient(token="t")
     _install_fake_gh(c, reviews=[
