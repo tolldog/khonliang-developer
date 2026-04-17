@@ -98,6 +98,24 @@ def test_review_comment_dataclass_roundtrip():
     assert c.line == 10
 
 
+def test_pr_readiness_dataclass_roundtrip():
+    from developer.github_client import GithubPRReadiness
+
+    r = GithubPRReadiness(
+        state="ready_admin_merge_policy_blocked",
+        recommended_action="admin_merge_if_operator_approves",
+        copilot_verdict="clear",
+        latest_copilot_comment="no additional blocking issues in b348b3f",
+        actionable_comments=0,
+        review_decision="unknown",
+        merge_state="blocked",
+        head_ref="feat/x",
+        head_sha="b348b3f",
+        url="https://github.com/o/n/pull/1",
+    )
+    assert r.state == "ready_admin_merge_policy_blocked"
+
+
 # -- typed merge errors --
 
 class _FakeResponse:
@@ -198,20 +216,22 @@ class _FakeIssueComment:
 
 class _FakePR:
     def __init__(self, number=42, title="t", state="open", draft=False,
-                 mergeable=True, author="tolldog", head="feat/x", base="main"):
+                 mergeable=True, author="tolldog", head="feat/x", base="main",
+                 head_sha="b348b3f1234567890", mergeable_state="blocked"):
         self.number = number
         self.title = title
         self.state = state
         self.draft = draft
         self.mergeable = mergeable
-        self.mergeable_state = "blocked"
+        self.mergeable_state = mergeable_state
         self.user = _FakeUser(login=author)
 
         class _Ref:
-            def __init__(self, ref):
+            def __init__(self, ref, sha=""):
                 self.ref = ref
+                self.sha = sha
 
-        self.head = _Ref(head)
+        self.head = _Ref(head, head_sha)
         self.base = _Ref(base)
         self.html_url = f"https://github.com/o/n/pull/{number}"
 
@@ -333,8 +353,52 @@ async def test_get_pr_returns_normalized_metadata():
     out = await c.get_pr("o/n", 42)
     assert out["number"] == 42
     assert out["head"] == "feat/x"
+    assert out["head_sha"].startswith("b348b3f")
     assert out["base"] == "main"
     assert out["html_url"].endswith("/pull/42")
+
+
+@pytest.mark.asyncio
+async def test_pr_readiness_classifies_policy_blocked_after_copilot_clear():
+    c = GithubClient(token="t")
+    _install_fake_gh(c, pr=_FakePR(mergeable_state="blocked"), issue_comments=[
+        _FakeIssueComment(
+            100,
+            "Re-reviewed b348b3f and I don't see additional blocking issues in this scope.",
+            user=_FakeUser(login="copilot-swe-agent"),
+        )
+    ])
+    out = await c.pr_readiness("o/n", 42)
+    assert out.state == "ready_admin_merge_policy_blocked"
+    assert out.recommended_action == "admin_merge_if_operator_approves"
+    assert out.copilot_verdict == "clear"
+
+
+@pytest.mark.asyncio
+async def test_pr_readiness_requires_copilot_rereview_when_clear_is_stale():
+    c = GithubClient(token="t")
+    _install_fake_gh(c, pr=_FakePR(head_sha="fffffff123"), issue_comments=[
+        _FakeIssueComment(
+            100,
+            "Re-reviewed b348b3f and I don't see additional blocking issues in this scope.",
+            user=_FakeUser(login="copilot-swe-agent"),
+        )
+    ])
+    out = await c.pr_readiness("o/n", 42)
+    assert out.state == "needs_copilot_rereview"
+    assert out.copilot_verdict == "pending"
+
+
+@pytest.mark.asyncio
+async def test_pr_readiness_reports_review_comments_before_clear():
+    c = GithubClient(token="t")
+    _install_fake_gh(c, review_comments=[
+        _FakeReviewComment(10, "a.py", 5, "please fix"),
+    ])
+    out = await c.pr_readiness("o/n", 42)
+    assert out.state == "needs_fixes"
+    assert out.recommended_action == "address_review_comments"
+    assert out.actionable_comments == 1
 
 
 @pytest.mark.asyncio
