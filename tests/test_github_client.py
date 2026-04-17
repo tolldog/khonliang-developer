@@ -377,7 +377,7 @@ async def test_pr_readiness_classifies_policy_blocked_after_copilot_clear():
 @pytest.mark.asyncio
 async def test_pr_readiness_ignores_stale_copilot_changes_requested_after_clear():
     c = GithubClient(token="t")
-    _install_fake_gh(c, pr=_FakePR(mergeable_state="blocked"), reviews=[
+    _install_fake_gh(c, pr=_FakePR(head_sha="b348b3f1234567890", mergeable_state="blocked"), reviews=[
         _FakeReview(
             1,
             "CHANGES_REQUESTED",
@@ -430,7 +430,7 @@ async def test_pr_readiness_matches_head_sha_case_insensitively():
 @pytest.mark.asyncio
 async def test_pr_readiness_keeps_human_changes_requested_even_with_copilot_clear():
     c = GithubClient(token="t")
-    _install_fake_gh(c, reviews=[
+    _install_fake_gh(c, pr=_FakePR(head_sha="b348b3f1234567890"), reviews=[
         _FakeReview(
             1,
             "CHANGES_REQUESTED",
