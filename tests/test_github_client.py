@@ -456,6 +456,20 @@ async def test_pr_readiness_does_not_match_sha_inside_longer_hex_token():
 
 
 @pytest.mark.asyncio
+async def test_pr_readiness_does_not_match_sha_with_hex_suffix():
+    c = GithubClient(token="t")
+    _install_fake_gh(c, pr=_FakePR(head_sha="b348b3f123"), issue_comments=[
+        _FakeIssueComment(
+            100,
+            "Re-reviewed b348b3f1234a and I don't see additional blocking issues in this scope.",
+            user=_FakeUser(login="copilot-swe-agent"),
+        )
+    ])
+    out = await c.pr_readiness("o/n", 42)
+    assert out.copilot_verdict == "pending"
+
+
+@pytest.mark.asyncio
 async def test_pr_readiness_keeps_human_changes_requested_even_with_copilot_clear():
     c = GithubClient(token="t")
     _install_fake_gh(c, pr=_FakePR(head_sha="b348b3f1234567890"), reviews=[

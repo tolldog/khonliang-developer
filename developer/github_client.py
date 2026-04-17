@@ -447,6 +447,10 @@ def _is_copilot_login(login: str) -> bool:
 
 
 def _contains_head_sha_reference(body_lower: str, head_sha_lower: str) -> bool:
+    """Return True when body contains short/full SHA as a standalone hex token.
+
+    Callers pass lowercased inputs, so boundary checks use lowercase hex.
+    """
     short_sha = head_sha_lower[:7]
     pattern = re.compile(
         rf"(?<![0-9a-f])(?:{re.escape(head_sha_lower)}|{re.escape(short_sha)})(?![0-9a-f])"
