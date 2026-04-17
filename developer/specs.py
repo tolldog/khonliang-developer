@@ -8,8 +8,8 @@ developer-specific glue:
     :class:`SpecSummary`.
   * Glob spec files under ``{project.repo}/{project.specs_dir}/**/spec.md``.
   * Backward-traverse a milestone document to its linked specs and the FRs
-    referenced therein. FRs are resolved via :class:`ResearcherClient`,
-    which is stubbed in MS-01 (so all resolutions come back ``(unresolved)``).
+    referenced therein. FRs are resolved from developer's authoritative
+    FR store; researcher remains an evidence/concept source only.
 
 No persistence. No LLM calls. Spec/milestone documents are workspace
 artifacts and are never written to ``KnowledgeStore``.
@@ -24,6 +24,7 @@ from pathlib import Path
 from khonliang_researcher.doc_reader import DocContent, LocalDocReader
 
 from developer.config import ProjectConfig
+from developer.fr_store import FRStore
 from developer.researcher_client import FRRecord, ResearcherClient
 
 
@@ -77,11 +78,7 @@ class SpecSummary:
 
 @dataclass
 class FRResolution:
-    """One FR reference + the result of resolving it via ResearcherClient.
-
-    In MS-01 ``record`` is always ``None`` because the client is stubbed.
-    Callers should treat ``None`` as "unresolved" and render accordingly.
-    """
+    """One FR reference plus its developer-owned FR record, when present."""
 
     fr_id: str
     record: FRRecord | None
@@ -127,10 +124,12 @@ class SpecReader:
         reader: LocalDocReader,
         projects: dict[str, ProjectConfig],
         researcher: ResearcherClient,
+        fr_store: FRStore | None = None,
     ):
         self._reader = reader
         self._projects = projects
         self._researcher = researcher
+        self._fr_store = fr_store
 
     # ------------------------------------------------------------------
     # Path boundary
@@ -243,12 +242,7 @@ class SpecReader:
           3. Read each linked spec.
           4. Collect every ``fr_*`` reference from the milestone body and
              from each linked spec.
-          5. For each unique FR, call ``ResearcherClient.get_fr`` and wrap
-             the result in :class:`FRResolution`.
-
-        In MS-01 every FR comes back unresolved (the client is stubbed).
-        Acceptance #6 verifies the call path is exercised and the
-        unresolved markers render correctly.
+          5. For each unique FR, resolve it from developer's FR store.
         """
         milestone_path = self._resolve_within_projects(path)
         milestone_doc = self.read(str(milestone_path))
@@ -281,7 +275,7 @@ class SpecReader:
 
         frs: list[FRResolution] = []
         for fr_id in all_fr_refs:
-            record = await self._researcher.get_fr(fr_id)
+            record = self._get_local_fr_record(fr_id)
             frs.append(FRResolution(fr_id=fr_id, record=record))
 
         return MilestoneChain(
@@ -290,6 +284,22 @@ class SpecReader:
             specs=spec_summaries,
             frs=frs,
             unresolved_links=unresolved_links,
+        )
+
+    def _get_local_fr_record(self, fr_id: str) -> FRRecord | None:
+        if self._fr_store is None:
+            return None
+        fr = self._fr_store.get(fr_id)
+        if fr is None:
+            return None
+        return FRRecord(
+            fr_id=fr.id,
+            title=fr.title,
+            target=fr.target,
+            priority=fr.priority,
+            status=fr.status,
+            description=fr.description,
+            metadata=fr.to_public_dict(),
         )
 
 

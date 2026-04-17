@@ -64,11 +64,13 @@ class DeveloperAgent(BaseAgent):
             Skill("developer_guide", "Development workflow guide",
                   since="0.1.0"),
             # Cross-agent skills (use self.request() via bus-lib)
-            Skill("get_fr", "Look up an FR via researcher on the bus",
+            Skill("get_fr", "Look up an FR from developer's FR store",
                   {"fr_id": {"type": "string", "required": True}},
                   since="0.2.0"),
-            Skill("list_frs", "List FRs for a target via researcher on the bus",
-                  {"target": {"type": "string", "required": True}},
+            Skill("list_frs", "List FRs from developer's FR store",
+                  {"target": {"type": "string", "default": ""},
+                   "status": {"type": "string", "default": ""},
+                   "include_all": {"type": "boolean", "default": False}},
                   since="0.2.0"),
             Skill("get_paper_context", "Get research evidence for a query via researcher",
                   {"query": {"type": "string", "required": True}},
@@ -86,7 +88,7 @@ class DeveloperAgent(BaseAgent):
                   {"target": {"type": "string", "default": ""},
                    "threshold": {"type": "number", "default": 0.85}},
                   since="0.2.0"),
-            Skill("work_units", "List all FR clusters ranked by importance",
+            Skill("work_units", "List developer-owned FR work units ranked by importance",
                   {"target": {"type": "string", "default": ""},
                    "threshold": {"type": "number", "default": 0.85}},
                   since="0.2.0"),
@@ -115,6 +117,11 @@ class DeveloperAgent(BaseAgent):
                   {"milestone_id": {"type": "string", "required": True},
                    "review_terms": {"type": "string", "default": "AutoGen,GRA"}},
                   since="0.8.0"),
+            Skill("migrate_frs_from_researcher",
+                  "One-way migration of researcher-owned FRs into developer's store",
+                  {"source_db": {"type": "string", "required": True},
+                   "apply": {"type": "boolean", "default": False}},
+                  since="0.10.0"),
             Skill("prepare_development_handoff",
                   "Return a compact bundle → milestone → draft spec handoff for implementation",
                   {"target": {"type": "string", "default": ""},
@@ -133,9 +140,9 @@ class DeveloperAgent(BaseAgent):
                    "detail": {"type": "string", "default": "brief"},
                    "timeout_s": {"type": "number", "default": 300}},
                   since="0.3.0"),
-            # Developer-owned FR lifecycle (Bundle A PR 1). These write to
-            # developer.db; legacy get_fr/list_frs still proxy to researcher
-            # for pre-migration records until fr_developer_0ab2aa9b lands.
+            # Developer-owned FR lifecycle. Researcher is no longer an FR
+            # authority; migrate old researcher FR ids into developer before
+            # executing against them so external references keep working.
             Skill("promote_fr", "Create a new FR in developer's store",
                   {"target": {"type": "string", "required": True},
                    "title": {"type": "string", "required": True},
@@ -285,16 +292,6 @@ class DeveloperAgent(BaseAgent):
                     {"call": "researcher.paper_context", "args": {"query": "{{spec.title}}"}, "output": "evidence"},
                 ],
             ),
-            Collaboration(
-                "full_fr_review",
-                "Pull FRs, cluster, deduplicate, and rank for a target",
-                requires={"researcher": ">=0.1.0"},
-                steps=[
-                    {"call": "researcher.feature_requests", "args": {"target": "{{args.target}}"}, "output": "frs"},
-                    {"call": "researcher.cluster_frs", "args": {"target": "{{args.target}}"}, "output": "clusters"},
-                    {"call": "researcher.auto_deduplicate_frs", "args": {"target": "{{args.target}}", "dry_run": True}, "output": "dedup"},
-                ],
-            ),
         ]
 
     # -- handlers --
@@ -398,35 +395,15 @@ class DeveloperAgent(BaseAgent):
     async def handle_developer_guide(self, args):
         return {"guide": self.pipeline.developer_guide_text}
 
-    # -- cross-agent skills (via bus-lib self.request) --
+    # -- researcher evidence/concept skills (via bus-lib self.request) --
 
     @handler("get_fr")
     async def handle_get_fr(self, args):
-        fr_id = args.get("fr_id", "")
-        try:
-            result = await self.request(
-                agent_type="researcher",
-                operation="knowledge_search",
-                args={"query": fr_id, "detail": "full", "max_results": 1},
-            )
-        except Exception as e:
-            await self.report_gap("get_fr", f"Bus request failed for {fr_id}: {e}")
-            raise
-        return (result and result.get("result")) or {"error": "no result from researcher"}
+        return await self.handle_get_fr_local(args)
 
     @handler("list_frs")
     async def handle_list_frs(self, args):
-        target = args.get("target", "")
-        try:
-            result = await self.request(
-                agent_type="researcher",
-                operation="feature_requests",
-                args={"target": target, "detail": "brief"},
-            )
-        except Exception as e:
-            await self.report_gap("list_frs", f"Bus request failed for {target}: {e}")
-            raise
-        return (result and result.get("result")) or {"error": "no result from researcher"}
+        return await self.handle_list_frs_local(args)
 
     @handler("get_paper_context")
     async def handle_get_paper_context(self, args):
@@ -500,51 +477,16 @@ class DeveloperAgent(BaseAgent):
 
     @handler("work_units")
     async def handle_work_units(self, args):
-        """Pull FR clusters from researcher, rank by aggregate importance."""
-        target = args.get("target", "")
-        threshold = args.get("threshold", 0.85)
+        """Return developer-owned FR work units ranked by local FR state."""
+        target = args.get("target") or None
+        frs = self.pipeline.frs.list(target=target)
+        if not frs:
+            return {"work_units": [], "source": "none", "error": "no developer-owned FRs available"}
 
-        # Get clusters from researcher via bus
-        try:
-            cluster_result = await self.request(
-                agent_type="researcher",
-                operation="cluster_frs",
-                args={"target": target, "threshold": threshold, "detail": "full"},
-            )
-        except Exception as e:
-            await self.report_gap("work_units", f"Failed to get clusters: {e}")
-            raise
-
-        cluster_text = ""
-        if cluster_result and cluster_result.get("result"):
-            r = cluster_result["result"]
-            cluster_text = r.get("result", "") if isinstance(r, dict) else str(r)
-
-        # Parse clusters — if parsing yields nothing, fall back to flat list.
-        # This handles: empty text, "No clusters" message, or a format
-        # change that doesn't produce any parseable cluster headers.
-        work_units = self._parse_and_rank_clusters(cluster_text, target) if cluster_text else []
-
-        if not work_units:
-            try:
-                fr_result = await self.request(
-                    agent_type="researcher",
-                    operation="feature_requests",
-                    args={"target": target, "detail": "full"},
-                )
-            except Exception:
-                return {"work_units": [], "source": "none", "error": "no clusters and no FRs available"}
-
-            return {
-                "work_units": [{"type": "flat", "description": "No clusters found — flat FR list",
-                                "frs": (fr_result and fr_result.get("result")) or {}}],
-                "source": "flat_list",
-            }
-
+        work_units = _work_units_from_local_frs(frs)
         return {
             "work_units": work_units,
-            "source": "clusters",
-            "threshold": threshold,
+            "source": "developer_local",
             "count": len(work_units),
         }
 
@@ -644,6 +586,33 @@ class DeveloperAgent(BaseAgent):
             await self.report_gap("review_milestone_scope", str(e))
             return {"error": str(e)}
 
+    @handler("migrate_frs_from_researcher")
+    async def handle_migrate_frs_from_researcher(self, args):
+        """Copy researcher FR records into developer's authoritative FR store."""
+        from developer.migrations.fr_data_from_researcher import migrate
+
+        source_db = args.get("source_db", "")
+        if not source_db:
+            return {"error": "source_db is required"}
+        try:
+            report = migrate(source_db, self.pipeline.frs, apply=bool(args.get("apply", False)))
+        except Exception as e:
+            await self.report_gap("migrate_frs_from_researcher", str(e))
+            return {"error": str(e)}
+        return {
+            "dry_run": report.dry_run,
+            "source_db": report.source_db,
+            "target_db": report.target_db,
+            "frs_found": report.frs_found,
+            "frs_migrated": report.frs_migrated,
+            "frs_already_present": report.frs_already_present,
+            "frs_skipped": list(report.frs_skipped),
+            "capabilities_found": report.capabilities_found,
+            "capabilities_migrated": report.capabilities_migrated,
+            "capabilities_already_present": report.capabilities_already_present,
+            "summary": report.summary(),
+        }
+
     @handler("prepare_development_handoff")
     async def handle_prepare_development_handoff(self, args):
         """Create the compact handoff a coding session needs to start work."""
@@ -695,96 +664,7 @@ class DeveloperAgent(BaseAgent):
             response["remaining_work_units"] = remaining
         return response
 
-    def _parse_and_rank_clusters(self, cluster_text: str, target: str) -> list[dict]:
-        """Parse cluster_frs output and rank by aggregate importance.
-
-        Ranking signals (highest to lowest weight):
-          1. Highest priority in the cluster
-          2. Cluster size (more FRs = more evidence of need)
-          3. Number of targets touched (cross-cutting = higher value)
-          4. Whether any FRs mention the requested target
-        """
-        PRIORITY_SCORE = {"high": 3, "medium": 2, "low": 1}
-        clusters = []
-        current_cluster = None
-
-        for line in cluster_text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-
-            # Detect cluster headers like "## Cluster 1 (4 FRs, targets: khonliang,developer)"
-            # Skip summary lines like "# FR Clusters (3 clusters, 10 FRs)"
-            if "Cluster" in line and "FRs" in line and "clusters" not in line.lower():
-                if current_cluster:
-                    clusters.append(current_cluster)
-                # Extract size and targets from header
-                # Format: "## Cluster 1 (4 FRs, targets: khonliang,developer)"
-                size = 0
-                targets = set()
-                if "(" in line:
-                    meta = line.split("(", 1)[1].rstrip(")")
-                    # Size is before "FRs"
-                    size_match = re.search(r"(\d+)\s*FRs?", meta)
-                    if size_match:
-                        size = int(size_match.group(1))
-                    # Targets are after "targets:"
-                    if "targets:" in meta:
-                        targets_str = meta.split("targets:")[1].strip()
-                        targets = {t.strip() for t in targets_str.split(",") if t.strip()}
-                current_cluster = {
-                    "name": line.lstrip("#").strip(),
-                    "size": size,
-                    "targets": sorted(targets),
-                    "frs": [],
-                    "max_priority": "low",
-                }
-                continue
-
-            # Detect FR lines like "  [fr_xxx] Title → target [priority]"
-            if current_cluster and line.startswith("[fr_"):
-                fr_id = line.split("]")[0].lstrip("[")
-                rest = line.split("]", 1)[1].strip() if "]" in line else ""
-                priority = "medium"
-                for p in ("high", "medium", "low"):
-                    if f"[{p}]" in rest:
-                        priority = p
-                        break
-                current_cluster["frs"].append({
-                    "fr_id": fr_id,
-                    "description": rest,
-                    "priority": priority,
-                })
-                if PRIORITY_SCORE.get(priority, 0) > PRIORITY_SCORE.get(current_cluster["max_priority"], 0):
-                    current_cluster["max_priority"] = priority
-
-        if current_cluster:
-            clusters.append(current_cluster)
-
-        # Rank clusters
-        def rank_key(c):
-            return (
-                PRIORITY_SCORE.get(c["max_priority"], 0),  # highest priority first
-                c["size"],                                   # larger clusters first
-                len(c["targets"]),                           # cross-cutting first
-                1 if target and target in c["targets"] else 0,  # matching target first
-            )
-
-        clusters.sort(key=rank_key, reverse=True)
-
-        # Add rank
-        for i, c in enumerate(clusters, 1):
-            c["rank"] = i
-
-        return clusters
-
-    # -- developer-owned FR lifecycle (Bundle A PR 1) --
-    #
-    # These write to developer.db. The existing get_fr / list_frs handlers
-    # (which proxy to researcher.knowledge_search / researcher.feature_requests)
-    # stay in place for backward compat with pre-migration records. After
-    # the data migration (fr_developer_0ab2aa9b), those proxies get updated
-    # to read from developer's store first, falling back to researcher.
+    # -- developer-owned FR lifecycle --
 
     @handler("promote_fr")
     async def handle_promote_fr(self, args):
@@ -1375,6 +1255,57 @@ def _parse_paths(value) -> list[str]:
     if isinstance(value, list):
         return [str(p).strip() for p in value if str(p).strip()]
     return [p.strip() for p in str(value).split(",") if p.strip()]
+
+
+def _work_units_from_local_frs(frs) -> list[dict]:
+    """Build deterministic work units from developer-owned FR records."""
+    groups: dict[tuple[str, str], list] = {}
+    for fr in frs:
+        concept = (fr.concept or "general").strip().lower()
+        groups.setdefault((fr.target, concept), []).append(fr)
+
+    units = []
+    for idx, ((target, concept), group) in enumerate(groups.items(), start=1):
+        priorities = [fr.priority for fr in group]
+        max_priority = _max_priority(priorities)
+        title_concept = concept if concept != "general" else "general"
+        units.append({
+            "name": f"Developer FR work unit {idx} ({len(group)} FRs, target: {target}, concept: {title_concept})",
+            "rank": idx,
+            "size": len(group),
+            "targets": [target],
+            "max_priority": max_priority,
+            "source": "developer_local",
+            "frs": [
+                {
+                    "fr_id": fr.id,
+                    "description": f"{fr.title} → {fr.target} [{fr.priority}]",
+                    "priority": fr.priority,
+                    "status": fr.status,
+                    "target": fr.target,
+                }
+                for fr in group
+            ],
+        })
+
+    priority_order = {"high": 0, "medium": 1, "low": 2}
+    units.sort(key=lambda u: (
+        priority_order.get(u["max_priority"], 99),
+        -int(u["size"]),
+        u["name"],
+    ))
+    for idx, unit in enumerate(units, start=1):
+        unit["rank"] = idx
+    return units
+
+
+def _max_priority(priorities: list[str]) -> str:
+    order = {"high": 3, "medium": 2, "low": 1}
+    best = "low"
+    for priority in priorities:
+        if order.get(priority, 0) > order.get(best, 0):
+            best = priority
+    return best
 
 
 def _handoff_next_actions(

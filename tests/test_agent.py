@@ -15,8 +15,8 @@ def harness(temp_config_file):
 # -- skills --
 
 def test_skill_count(harness):
-    # 34 existing skills + 6 milestone/handoff skills + concept FR candidates.
-    assert len(harness.skills) == 41
+    # 34 existing skills + 7 milestone/handoff/migration skills + concept FR candidates.
+    assert len(harness.skills) == 42
 
 
 def test_skills_registered(harness):
@@ -29,6 +29,7 @@ def test_skills_registered(harness):
         "propose_milestone_from_work_unit", "get_milestone",
         "list_milestones", "draft_spec_from_milestone", "review_milestone_scope",
         "prepare_development_handoff",
+        "migrate_frs_from_researcher",
         "run_tests",
         # developer-owned FR lifecycle (PR #10)
         "promote_fr", "update_fr_status", "set_fr_dependency",
@@ -59,11 +60,11 @@ def test_traverse_milestone_skill(harness):
 
 
 def test_get_fr_skill(harness):
-    harness.assert_skill_exists("get_fr", description="researcher")
+    harness.assert_skill_exists("get_fr", description="developer")
 
 
 def test_list_frs_skill(harness):
-    harness.assert_skill_exists("list_frs", description="researcher")
+    harness.assert_skill_exists("list_frs", description="developer")
 
 
 def test_get_paper_context_skill(harness):
@@ -81,25 +82,18 @@ def test_milestone_skills(harness):
     harness.assert_skill_exists("draft_spec_from_milestone", description="draft spec")
     harness.assert_skill_exists("review_milestone_scope", description="duplicate")
     harness.assert_skill_exists("prepare_development_handoff", description="handoff")
+    harness.assert_skill_exists("migrate_frs_from_researcher", description="migration")
 
 
 # -- collaborations --
 
 def test_collaborations_declared(harness):
     assert "evaluate_spec_against_corpus" in harness.collaboration_names
-    assert "full_fr_review" in harness.collaboration_names
 
 
 def test_evaluate_spec_requires_researcher(harness):
     harness.assert_collaboration_exists(
         "evaluate_spec_against_corpus",
-        requires={"researcher": ">=0.1.0"},
-    )
-
-
-def test_full_fr_review_requires_researcher(harness):
-    harness.assert_collaboration_exists(
-        "full_fr_review",
         requires={"researcher": ">=0.1.0"},
     )
 
@@ -434,62 +428,8 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 41
-    assert len(reg.collaborations) == 2
-
-
-# -- cluster parsing + ranking --
-
-def test_parse_clusters():
-    from developer.agent import DeveloperAgent
-    agent = DeveloperAgent(agent_id="test", bus_url="http://x", config_path="")
-    text = """# FR Clusters (3 clusters, 10 FRs)
-
-## Cluster 1 (4 FRs, targets: khonliang,developer)
-  [fr_a_12345678] Implement AutoGen Framework → khonliang [high]
-  [fr_b_12345678] Build Developer AutoGen → developer [high]
-  [fr_c_12345678] Create Template → developer [medium]
-  [fr_d_12345678] Domain Agents → developer [medium]
-
-## Cluster 2 (3 FRs, targets: khonliang)
-  [fr_e_12345678] EvoAgent Generation → khonliang [high]
-  [fr_f_12345678] EvoAgent Optimization → khonliang [medium]
-  [fr_g_12345678] Dynamic Optimization → khonliang [medium]
-
-## Cluster 3 (3 FRs, targets: khonliang)
-  [fr_h_12345678] GRA Framework → khonliang [high]
-  [fr_i_12345678] GRA Collaborative → khonliang [medium]
-  [fr_j_12345678] GRA Synthesis → khonliang [medium]
-"""
-    units = agent._parse_and_rank_clusters(text, "developer")
-    assert len(units) == 3
-    # Cluster 1 should rank highest: same max priority (high), largest (4), most targets (2), matches target
-    assert units[0]["size"] == 4
-    assert "developer" in units[0]["targets"]
-    assert units[0]["rank"] == 1
-
-
-def test_parse_clusters_ranks_by_priority():
-    from developer.agent import DeveloperAgent
-    agent = DeveloperAgent(agent_id="test", bus_url="http://x", config_path="")
-    text = """## Cluster 1 (2 FRs, targets: khonliang)
-  [fr_a_12345678] Low thing → khonliang [low]
-  [fr_b_12345678] Low thing 2 → khonliang [low]
-
-## Cluster 2 (2 FRs, targets: khonliang)
-  [fr_c_12345678] High thing → khonliang [high]
-  [fr_d_12345678] Medium thing → khonliang [medium]
-"""
-    units = agent._parse_and_rank_clusters(text, "")
-    assert units[0]["max_priority"] == "high"
-    assert units[1]["max_priority"] == "low"
-
-
-def test_parse_empty_clusters():
-    from developer.agent import DeveloperAgent
-    agent = DeveloperAgent(agent_id="test", bus_url="http://x", config_path="")
-    units = agent._parse_and_rank_clusters("No clusters found", "")
-    assert units == []
+    assert len(reg.skills) == 42
+    assert len(reg.collaborations) == 1
 
 
 def test_parse_concept_bundles():
@@ -533,57 +473,86 @@ def test_next_work_unit_skill_exists(harness):
 # -- handler flow tests (mock self.request) --
 
 @pytest.mark.asyncio
-async def test_work_units_with_clusters(harness):
-    """work_units returns ranked clusters when researcher provides them."""
-    cluster_response = {"result": {"result": """## Cluster 1 (3 FRs, targets: khonliang)
-  [fr_a_12345678] Thing A → khonliang [high]
-  [fr_b_12345678] Thing B → khonliang [medium]
-  [fr_c_12345678] Thing C → khonliang [low]
-"""}}
+async def test_get_and_list_frs_read_developer_store(harness):
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Developer-owned FR",
+        description="local FR",
+        priority="high",
+        concept="ownership",
+    )
 
-    async def mock_request(**kwargs):
-        if kwargs.get("operation") == "cluster_frs":
-            return cluster_response
-        return {"result": {}}
+    fetched = await harness.call("get_fr", {"fr_id": fr.id})
+    assert fetched["id"] == fr.id
 
-    harness.agent.request = mock_request
+    listed = await harness.call("list_frs", {"target": "developer"})
+    assert listed["count"] == 1
+    assert listed["frs"][0]["id"] == fr.id
+
+@pytest.mark.asyncio
+async def test_work_units_from_local_frs(harness):
+    """work_units returns ranked units from developer-owned FRs."""
+    harness.agent.pipeline.frs.promote(
+        target="khonliang",
+        title="Thing A",
+        description="A",
+        priority="high",
+        concept="runtime",
+    )
+    harness.agent.pipeline.frs.promote(
+        target="khonliang",
+        title="Thing B",
+        description="B",
+        priority="medium",
+        concept="runtime",
+    )
+    harness.agent.pipeline.frs.promote(
+        target="khonliang",
+        title="Thing C",
+        description="C",
+        priority="low",
+        concept="runtime",
+    )
+
     result = await harness.call("work_units", {"target": "khonliang"})
-    assert result["source"] == "clusters"
+    assert result["source"] == "developer_local"
     assert result["count"] == 1
     assert result["work_units"][0]["size"] == 3
+    assert result["work_units"][0]["max_priority"] == "high"
 
 
 @pytest.mark.asyncio
-async def test_work_units_falls_back_to_flat(harness):
-    """work_units falls back to flat FR list when no clusters found."""
-    async def mock_request(**kwargs):
-        if kwargs.get("operation") == "cluster_frs":
-            return {"result": {"result": "No clusters of 2+ FRs at 85% threshold."}}
-        if kwargs.get("operation") == "feature_requests":
-            return {"result": {"result": "fr_x | [high] Some FR"}}
-        return {"result": {}}
-
-    harness.agent.request = mock_request
+async def test_work_units_no_local_frs(harness):
+    """work_units no longer falls back to researcher-owned FRs."""
     result = await harness.call("work_units", {"target": "developer"})
-    assert result["source"] == "flat_list"
+    assert result["source"] == "none"
+    assert "developer-owned FRs" in result["error"]
 
 
 @pytest.mark.asyncio
 async def test_next_work_unit_returns_top(harness):
-    """next_work_unit returns the highest-ranked cluster."""
-    cluster_response = {"result": {"result": """## Cluster 1 (2 FRs, targets: khonliang)
-  [fr_a_12345678] Low → khonliang [low]
-  [fr_b_12345678] Low → khonliang [low]
-
-## Cluster 2 (2 FRs, targets: developer)
-  [fr_c_12345678] High → developer [high]
-  [fr_d_12345678] Med → developer [medium]
-"""}}
-
-    async def mock_request(**kwargs):
-        return cluster_response
-
-    harness.agent.request = mock_request
+    """next_work_unit returns the highest-ranked developer-local unit."""
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Low",
+        description="low",
+        priority="low",
+        concept="docs",
+    )
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="High",
+        description="high",
+        priority="high",
+        concept="runtime",
+    )
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Med",
+        description="med",
+        priority="medium",
+        concept="runtime",
+    )
     result = await harness.call("next_work_unit", {"target": "developer"})
     assert "work_unit" in result
     assert result["work_unit"]["max_priority"] == "high"
@@ -591,30 +560,47 @@ async def test_next_work_unit_returns_top(harness):
 
 
 @pytest.mark.asyncio
-async def test_work_units_no_clusters_and_no_frs(harness):
-    """Returns source='none' with error when both cluster and FR requests fail."""
-    async def mock_request(**kwargs):
-        if kwargs.get("operation") == "cluster_frs":
-            return {"result": None}  # empty result, no exception
-        raise RuntimeError("researcher unavailable")
-
-    harness.agent.request = mock_request
-    result = await harness.call("work_units", {})
-    assert result["source"] == "none"
+async def test_next_work_unit_no_units_returns_error(harness):
+    """next_work_unit returns an error dict when no work units are available."""
+    result = await harness.call("next_work_unit", {})
     assert "error" in result
 
 
 @pytest.mark.asyncio
-async def test_next_work_unit_no_units_returns_error(harness):
-    """next_work_unit returns an error dict when no work units are available."""
-    async def mock_request(**kwargs):
-        if kwargs.get("operation") == "cluster_frs":
-            return {"result": None}
-        raise RuntimeError("no FRs")
+async def test_migrate_frs_from_researcher_skill_preserves_ids(harness, tmp_path):
+    import sqlite3
+    from tests.test_fr_migration import _SCHEMA, _seed_fr
 
-    harness.agent.request = mock_request
-    result = await harness.call("next_work_unit", {})
-    assert "error" in result
+    researcher_db = tmp_path / "researcher.db"
+    conn = sqlite3.connect(str(researcher_db))
+    conn.executescript(_SCHEMA)
+    conn.commit()
+    conn.close()
+    _seed_fr(
+        str(researcher_db),
+        fr_id="fr_developer_aaaaaaaa",
+        title="Migrated FR",
+        content="description",
+        target="developer",
+        status_tags=[],
+        metadata={
+            "concept": "ownership",
+            "classification": "app",
+            "priority": "high",
+            "target": "developer",
+        },
+    )
+
+    result = await harness.call("migrate_frs_from_researcher", {
+        "source_db": str(researcher_db),
+        "apply": True,
+    })
+
+    assert result["frs_found"] == 1
+    assert result["frs_migrated"] == 1
+    migrated = await harness.call("get_fr", {"fr_id": "fr_developer_aaaaaaaa"})
+    assert migrated["id"] == "fr_developer_aaaaaaaa"
+    assert migrated["title"] == "Migrated FR"
 
 
 @pytest.mark.asyncio
@@ -690,21 +676,26 @@ async def test_fr_candidates_from_concepts_rejects_non_positive_timeout(harness)
 
 @pytest.mark.asyncio
 async def test_propose_milestone_from_top_work_unit(harness):
-    cluster_response = {"result": {"result": """## Cluster 1 (2 FRs, targets: developer)
-  [fr_developer_11111111] Milestone entity → developer [high]
-  [fr_developer_22222222] Draft spec artifact → developer [medium]
-"""}}
-
-    async def mock_request(**kwargs):
-        return cluster_response
-
-    harness.agent.request = mock_request
+    fr1 = harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Milestone entity",
+        description="Milestone entity",
+        priority="high",
+        concept="milestones",
+    )
+    fr2 = harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Draft spec artifact",
+        description="Draft spec artifact",
+        priority="medium",
+        concept="milestones",
+    )
     result = await harness.call("propose_milestone_from_work_unit", {"target": "developer"})
 
     milestone = result["milestone"]
     assert milestone["id"].startswith("ms_developer_")
     assert milestone["target"] == "developer"
-    assert milestone["fr_ids"] == ["fr_developer_11111111", "fr_developer_22222222"]
+    assert milestone["fr_ids"] == [fr1.id, fr2.id]
     assert "Draft spec artifact" in milestone["draft_spec"]
 
     listed = await harness.call("list_milestones", {"target": "developer"})
@@ -716,7 +707,7 @@ async def test_propose_milestone_from_top_work_unit(harness):
 
     draft = await harness.call("draft_spec_from_milestone", {"milestone_id": milestone["id"]})
     assert draft["milestone_id"] == milestone["id"]
-    assert "fr_developer_11111111" in draft["draft_spec"]
+    assert fr1.id in draft["draft_spec"]
 
     review = await harness.call("review_milestone_scope", {"milestone_id": milestone["id"]})
     assert review["recommendation"] == "ready_for_spec"
@@ -741,25 +732,30 @@ async def test_propose_milestone_accepts_json_work_unit(harness):
 
 @pytest.mark.asyncio
 async def test_prepare_development_handoff_from_top_work_unit(harness):
-    cluster_response = {"result": {"result": """## Cluster 1 (2 FRs, targets: developer)
-  [fr_developer_11111111] Milestone entity → developer [high]
-  [fr_developer_22222222] Draft spec artifact → developer [medium]
-"""}}
-
-    async def mock_request(**kwargs):
-        return cluster_response
-
-    harness.agent.request = mock_request
+    fr1 = harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Milestone entity",
+        description="Milestone entity",
+        priority="high",
+        concept="handoff",
+    )
+    fr2 = harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Draft spec artifact",
+        description="Draft spec artifact",
+        priority="medium",
+        concept="handoff",
+    )
     result = await harness.call("prepare_development_handoff", {"target": "developer"})
 
     assert result["status"] == "ready"
-    assert result["source"] == "clusters"
+    assert result["source"] == "developer_local"
     assert result["remaining_work_units"] == 0
     assert result["milestone"]["id"].startswith("ms_developer_")
-    assert result["milestone"]["fr_ids"] == ["fr_developer_11111111", "fr_developer_22222222"]
-    assert result["work_unit"]["name"] == "Cluster 1 (2 FRs, targets: developer)"
+    assert result["milestone"]["fr_ids"] == [fr1.id, fr2.id]
+    assert result["work_unit"]["source"] == "developer_local"
     assert result["scope_review"]["recommendation"] == "ready_for_spec"
-    assert "fr_developer_11111111" in result["draft_spec"]
+    assert fr1.id in result["draft_spec"]
     assert result["suggested_next_actions"][1].endswith("review_terms=AutoGen,GRA")
     assert result["suggested_next_actions"][-1] == (
         "create implementation branch and start the scoped milestone"
