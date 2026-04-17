@@ -375,6 +375,30 @@ async def test_pr_readiness_classifies_policy_blocked_after_copilot_clear():
 
 
 @pytest.mark.asyncio
+async def test_pr_readiness_ignores_stale_copilot_changes_requested_after_clear():
+    c = GithubClient(token="t")
+    _install_fake_gh(c, pr=_FakePR(mergeable_state="blocked"), reviews=[
+        _FakeReview(
+            1,
+            "CHANGES_REQUESTED",
+            "please address this",
+            "2026-04-13T00:00:00Z",
+            user=_FakeUser(login="copilot-pull-request-reviewer[bot]"),
+        ),
+    ], issue_comments=[
+        _FakeIssueComment(
+            100,
+            "Re-reviewed B348B3F and I don't see additional blocking issues in this scope.",
+            user=_FakeUser(login="copilot-swe-agent"),
+        )
+    ])
+    out = await c.pr_readiness("o/n", 42)
+    assert out.state == "ready_admin_merge_policy_blocked"
+    assert out.recommended_action == "admin_merge_if_operator_approves"
+    assert out.copilot_verdict == "clear"
+
+
+@pytest.mark.asyncio
 async def test_pr_readiness_requires_copilot_rereview_when_clear_is_stale():
     c = GithubClient(token="t")
     _install_fake_gh(c, pr=_FakePR(head_sha="fffffff123"), issue_comments=[
@@ -387,6 +411,29 @@ async def test_pr_readiness_requires_copilot_rereview_when_clear_is_stale():
     out = await c.pr_readiness("o/n", 42)
     assert out.state == "needs_copilot_rereview"
     assert out.copilot_verdict == "pending"
+
+
+@pytest.mark.asyncio
+async def test_pr_readiness_keeps_human_changes_requested_even_with_copilot_clear():
+    c = GithubClient(token="t")
+    _install_fake_gh(c, reviews=[
+        _FakeReview(
+            1,
+            "CHANGES_REQUESTED",
+            "human review block",
+            "2026-04-13T00:00:00Z",
+            user=_FakeUser(login="maintainer"),
+        ),
+    ], issue_comments=[
+        _FakeIssueComment(
+            100,
+            "Re-reviewed b348b3f and I don't see additional blocking issues in this scope.",
+            user=_FakeUser(login="copilot-swe-agent"),
+        )
+    ])
+    out = await c.pr_readiness("o/n", 42)
+    assert out.state == "needs_fixes"
+    assert out.recommended_action == "address_changes_requested"
 
 
 @pytest.mark.asyncio

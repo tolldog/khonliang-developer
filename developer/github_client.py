@@ -284,13 +284,17 @@ class GithubClient:
             r for r in reviews
             if r.state.upper() == "CHANGES_REQUESTED"
         ]
+        effective_blocking_reviews = [
+            r for r in blocking_reviews
+            if not (copilot_comment and _is_copilot_login(r.reviewer))
+        ]
         actionable_comments = 0 if copilot_comment else len(review_comments)
         merge_state = str(pr.get("mergeable_state") or "unknown").lower()
 
         if pr.get("draft"):
             state = "blocked_draft"
             action = "mark_ready_for_review"
-        elif blocking_reviews:
+        elif effective_blocking_reviews:
             state = "needs_fixes"
             action = "address_changes_requested"
         elif actionable_comments and copilot_verdict != "clear":
@@ -418,20 +422,24 @@ def _latest_copilot_clear_comment(comments: list[dict], *, head_sha: str = "") -
         "don't see additional blocking",
         "do not see additional blocking",
     )
-    copilot_logins = {
-        "copilot-swe-agent",
-        "copilot-pull-request-reviewer",
-        "copilot-pull-request-reviewer[bot]",
-    }
+    head_sha_lower = head_sha.lower()
     for comment in reversed(comments):
         user = str(comment.get("user", "")).lower()
         body = str(comment.get("body", ""))
         body_lower = body.lower()
-        if user not in copilot_logins:
+        if not _is_copilot_login(user):
             continue
         if not any(marker in body_lower for marker in clear_markers):
             continue
-        if head_sha and head_sha[:7] not in body and head_sha not in body:
+        if head_sha and head_sha_lower[:7] not in body_lower and head_sha_lower not in body_lower:
             continue
         return body
     return ""
+
+
+def _is_copilot_login(login: str) -> bool:
+    return login.lower() in {
+        "copilot-swe-agent",
+        "copilot-pull-request-reviewer",
+        "copilot-pull-request-reviewer[bot]",
+    }
