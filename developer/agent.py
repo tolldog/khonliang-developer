@@ -508,7 +508,7 @@ class DeveloperAgent(BaseAgent):
             "work_unit": units[0],
             "remaining": len(units) - 1,
             "source": result.get("source", "unknown"),
-            "max_frs": result.get("max_frs"),
+            "max_frs": result.get("max_frs", 5),
         }
 
     @handler("propose_milestone_from_work_unit")

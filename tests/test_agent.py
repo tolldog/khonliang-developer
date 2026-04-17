@@ -608,10 +608,11 @@ async def test_work_units_bound_large_concept_groups(harness):
 
 
 @pytest.mark.asyncio
-async def test_work_units_reject_bad_max_frs(harness):
-    result = await harness.call("work_units", {"max_frs": 0})
+@pytest.mark.parametrize("bad_value", [0, -1])
+async def test_work_units_reject_bad_max_frs(harness, bad_value):
+    result = await harness.call("work_units", {"max_frs": bad_value})
 
-    assert result == {"error": "max_frs must be a positive integer, got 0"}
+    assert result == {"error": f"max_frs must be a positive integer, got {bad_value}"}
 
 
 @pytest.mark.asyncio
@@ -634,10 +635,11 @@ async def test_next_work_unit_honors_max_frs(harness):
 
 
 @pytest.mark.asyncio
-async def test_next_work_unit_rejects_bad_max_frs(harness):
-    result = await harness.call("next_work_unit", {"max_frs": 0})
+@pytest.mark.parametrize("bad_value", [0, -1])
+async def test_next_work_unit_rejects_bad_max_frs(harness, bad_value):
+    result = await harness.call("next_work_unit", {"max_frs": bad_value})
 
-    assert result == {"error": "max_frs must be a positive integer, got 0"}
+    assert result == {"error": f"max_frs must be a positive integer, got {bad_value}"}
 
 
 @pytest.mark.asyncio
