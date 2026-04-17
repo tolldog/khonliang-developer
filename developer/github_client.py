@@ -222,21 +222,30 @@ class GithubClient:
         avoid leaking githubkit types.
         """
         owner, name = self._split_repo(repo)
+        comments: list[dict] = []
+        page = 1
         try:
-            resp = await self._client().rest.issues.async_list_comments(
-                owner=owner, repo=name, issue_number=pr_number,
-            )
+            while True:
+                resp = await self._client().rest.issues.async_list_comments(
+                    owner=owner, repo=name, issue_number=pr_number,
+                    per_page=100, page=page,
+                )
+                batch = [
+                    {
+                        "id": c.id,
+                        "user": c.user.login if c.user else "unknown",
+                        "body": c.body or "",
+                        "created_at": str(c.created_at),
+                    }
+                    for c in resp.parsed_data
+                ]
+                comments.extend(batch)
+                if len(batch) < 100:
+                    break
+                page += 1
         except Exception as e:
             raise GithubClientError(f"list_pr_issue_comments({repo}#{pr_number}): {e}") from e
-        return [
-            {
-                "id": c.id,
-                "user": c.user.login if c.user else "unknown",
-                "body": c.body or "",
-                "created_at": str(c.created_at),
-            }
-            for c in resp.parsed_data
-        ]
+        return comments
 
     async def get_pr(self, repo: str, pr_number: int) -> dict:
         """Return normalized PR metadata: state, mergeable, title, author, head, base, draft."""
@@ -289,7 +298,7 @@ class GithubClient:
             r for r in blocking_reviews
             if not (copilot_comment and _is_copilot_login(r.reviewer))
         ]
-        actionable_comments = 0 if copilot_comment else len(review_comments)
+        actionable_comments = len(review_comments)
         merge_state = str(pr.get("mergeable_state") or "unknown").lower()
 
         if pr.get("draft"):
@@ -307,9 +316,18 @@ class GithubClient:
         elif merge_state in {"clean", "unstable", "has_hooks"}:
             state = "ready_normal_merge"
             action = "merge"
-        else:
+        elif merge_state == "blocked":
             state = "ready_admin_merge_policy_blocked"
             action = "admin_merge_if_operator_approves"
+        elif merge_state in {"dirty", "behind"}:
+            state = "blocked_update_or_conflicts"
+            action = "update_branch_or_resolve_conflicts"
+        elif merge_state == "unknown":
+            state = "blocked_unknown_merge_state"
+            action = "refresh_pr_merge_state"
+        else:
+            state = "blocked_merge_state"
+            action = f"inspect_merge_state:{merge_state}"
 
         return GithubPRReadiness(
             state=state,
