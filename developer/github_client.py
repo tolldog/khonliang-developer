@@ -19,8 +19,10 @@ consumers land — avoids guessing which shapes they want.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -57,6 +59,22 @@ class GithubReviewComment:
     line: int | None                 # target line; None for file-level comments
     body: str
     created_at: str
+
+
+@dataclass
+class GithubPRReadiness:
+    """Bounded PR merge-readiness summary for agent workflows."""
+
+    state: str
+    recommended_action: str
+    copilot_verdict: str
+    latest_copilot_comment: str
+    actionable_comments: int
+    review_decision: str
+    merge_state: str
+    head_ref: str
+    head_sha: str
+    url: str
 
 
 class GithubClientError(RuntimeError):
@@ -204,21 +222,30 @@ class GithubClient:
         avoid leaking githubkit types.
         """
         owner, name = self._split_repo(repo)
+        comments: list[dict] = []
+        page = 1
         try:
-            resp = await self._client().rest.issues.async_list_comments(
-                owner=owner, repo=name, issue_number=pr_number,
-            )
+            while True:
+                resp = await self._client().rest.issues.async_list_comments(
+                    owner=owner, repo=name, issue_number=pr_number,
+                    per_page=100, page=page,
+                )
+                batch = [
+                    {
+                        "id": c.id,
+                        "user": c.user.login if c.user else "unknown",
+                        "body": c.body or "",
+                        "created_at": str(c.created_at),
+                    }
+                    for c in resp.parsed_data
+                ]
+                comments.extend(batch)
+                if len(batch) < 100:
+                    break
+                page += 1
         except Exception as e:
             raise GithubClientError(f"list_pr_issue_comments({repo}#{pr_number}): {e}") from e
-        return [
-            {
-                "id": c.id,
-                "user": c.user.login if c.user else "unknown",
-                "body": c.body or "",
-                "created_at": str(c.created_at),
-            }
-            for c in resp.parsed_data
-        ]
+        return comments
 
     async def get_pr(self, repo: str, pr_number: int) -> dict:
         """Return normalized PR metadata: state, mergeable, title, author, head, base, draft."""
@@ -239,9 +266,81 @@ class GithubClient:
             "mergeable_state": getattr(pr, "mergeable_state", None),
             "author": pr.user.login if pr.user else "unknown",
             "head": pr.head.ref,
+            "head_sha": getattr(pr.head, "sha", ""),
             "base": pr.base.ref,
             "html_url": pr.html_url,
         }
+
+    async def pr_readiness(self, repo: str, pr_number: int) -> GithubPRReadiness:
+        """Classify whether a PR is ready for normal merge, admin merge, or fixes.
+
+        This intentionally uses the REST surface already present in this
+        client. It cannot see GraphQL review-thread resolution state, but it
+        does capture the failure mode we hit repeatedly: Copilot clears the
+        latest commit in conversation comments while branch policy still
+        reports a review block.
+        """
+        pr, reviews, review_comments, issue_comments = await asyncio.gather(
+            self.get_pr(repo, pr_number),
+            self.list_pr_reviews(repo, pr_number),
+            self.list_pr_review_comments(repo, pr_number),
+            self.list_pr_issue_comments(repo, pr_number),
+        )
+        copilot_comment = _latest_copilot_clear_comment(
+            issue_comments, head_sha=pr.get("head_sha", ""),
+        )
+        copilot_verdict = "clear" if copilot_comment else "pending"
+        blocking_reviews = [
+            r for r in reviews
+            if r.state.upper() == "CHANGES_REQUESTED"
+        ]
+        effective_blocking_reviews = [
+            r for r in blocking_reviews
+            if not (copilot_comment and _is_copilot_login(r.reviewer))
+        ]
+        actionable_comments = len(review_comments)
+        merge_state = str(pr.get("mergeable_state") or "unknown").lower()
+
+        if pr.get("draft"):
+            state = "blocked_draft"
+            action = "mark_ready_for_review"
+        elif effective_blocking_reviews:
+            state = "needs_fixes"
+            action = "address_changes_requested"
+        elif actionable_comments and copilot_verdict != "clear":
+            state = "needs_fixes"
+            action = "address_review_comments"
+        elif copilot_verdict != "clear":
+            state = "needs_copilot_rereview"
+            action = "comment_@copilot_for_review"
+        elif merge_state in {"clean", "unstable", "has_hooks"}:
+            state = "ready_normal_merge"
+            action = "merge"
+        elif merge_state == "blocked":
+            state = "ready_admin_merge_policy_blocked"
+            action = "admin_merge_if_operator_approves"
+        elif merge_state in {"dirty", "behind"}:
+            state = "blocked_update_or_conflicts"
+            action = "update_branch_or_resolve_conflicts"
+        elif merge_state == "unknown":
+            state = "blocked_unknown_merge_state"
+            action = "refresh_pr_merge_state"
+        else:
+            state = "blocked_merge_state"
+            action = f"inspect_merge_state:{merge_state}"
+
+        return GithubPRReadiness(
+            state=state,
+            recommended_action=action,
+            copilot_verdict=copilot_verdict,
+            latest_copilot_comment=copilot_comment,
+            actionable_comments=actionable_comments,
+            review_decision="unknown",
+            merge_state=merge_state,
+            head_ref=pr.get("head", ""),
+            head_sha=pr.get("head_sha", ""),
+            url=pr.get("html_url", ""),
+        )
 
     async def create_pr(
         self, repo: str, *, title: str, body: str, head: str, base: str = "main",
@@ -330,3 +429,48 @@ class GithubClient:
                 f"repo must be 'owner/name' with both halves non-empty, got {repo!r}"
             )
         return owner, name
+
+
+def _latest_copilot_clear_comment(comments: list[dict], *, head_sha: str = "") -> str:
+    """Return latest Copilot clear comment body for the current head, if any."""
+    clear_markers = (
+        "no additional blocking",
+        "no blocking issue",
+        "no further code changes needed",
+        "no additional code changes",
+        "don't see additional blocking",
+        "do not see additional blocking",
+    )
+    head_sha_lower = head_sha.lower()
+    for comment in reversed(comments):
+        user = str(comment.get("user", "")).lower()
+        body = str(comment.get("body", ""))
+        body_lower = body.lower()
+        if not _is_copilot_login(user):
+            continue
+        if not any(marker in body_lower for marker in clear_markers):
+            continue
+        if head_sha and not _contains_head_sha_reference(body_lower, head_sha_lower):
+            continue
+        return body
+    return ""
+
+
+def _is_copilot_login(login: str) -> bool:
+    return login.lower() in {
+        "copilot-swe-agent",
+        "copilot-pull-request-reviewer",
+        "copilot-pull-request-reviewer[bot]",
+    }
+
+
+def _contains_head_sha_reference(body_lower: str, head_sha_lower: str) -> bool:
+    """Return True when body contains short/full SHA as a standalone hex token.
+
+    Callers pass lowercased inputs, so boundary checks use lowercase hex.
+    """
+    short_sha = head_sha_lower[:7]
+    pattern = re.compile(
+        rf"(?<![0-9a-f])(?:{re.escape(head_sha_lower)}|{re.escape(short_sha)})(?![0-9a-f])"
+    )
+    return bool(pattern.search(body_lower))

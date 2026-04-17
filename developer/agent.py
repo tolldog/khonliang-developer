@@ -140,6 +140,11 @@ class DeveloperAgent(BaseAgent):
                    "detail": {"type": "string", "default": "brief"},
                    "timeout_s": {"type": "number", "default": 300}},
                   since="0.3.0"),
+            Skill("pr_ready", "Classify GitHub PR review and merge readiness",
+                  {"repo": {"type": "string", "required": True,
+                            "description": "GitHub repo in owner/name form"},
+                   "pr_number": {"type": "integer", "required": True}},
+                  since="0.11.0"),
             # Developer-owned FR lifecycle. Researcher is no longer an FR
             # authority; migrate old researcher FR ids into developer before
             # executing against them so external references keep working.
@@ -932,6 +937,37 @@ class DeveloperAgent(BaseAgent):
             "ahead": s.ahead,
             "behind": s.behind,
             "detached": s.detached,
+        }
+
+    @handler("pr_ready")
+    async def handle_pr_ready(self, args):
+        from developer.github_client import GithubClient, GithubClientError
+
+        repo = args.get("repo", "")
+        try:
+            pr_number = int(args.get("pr_number", 0))
+        except (TypeError, ValueError):
+            return {"error": "pr_number must be an integer"}
+        if not repo or pr_number < 1:
+            return {"error": "repo and pr_number are required"}
+
+        try:
+            readiness = await GithubClient().pr_readiness(repo, pr_number)
+        except GithubClientError as e:
+            await self._safe_report_gap("pr_ready", str(e))
+            return {"error": str(e)}
+
+        return {
+            "state": readiness.state,
+            "recommended_action": readiness.recommended_action,
+            "copilot_verdict": readiness.copilot_verdict,
+            "latest_copilot_comment": readiness.latest_copilot_comment,
+            "actionable_comments": readiness.actionable_comments,
+            "review_decision": readiness.review_decision,
+            "merge_state": readiness.merge_state,
+            "head_ref": readiness.head_ref,
+            "head_sha": readiness.head_sha,
+            "url": readiness.url,
         }
 
     @handler("git_log")

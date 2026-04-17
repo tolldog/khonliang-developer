@@ -15,8 +15,9 @@ def harness(temp_config_file):
 # -- skills --
 
 def test_skill_count(harness):
-    # 34 existing skills + 7 milestone/handoff/migration skills + concept FR candidates.
-    assert len(harness.skills) == 42
+    # 34 existing skills + 7 milestone/handoff/migration skills
+    # + concept FR candidates + PR readiness.
+    assert len(harness.skills) == 43
 
 
 def test_skills_registered(harness):
@@ -25,6 +26,7 @@ def test_skills_registered(harness):
         "health_check", "developer_guide",
         "get_fr", "list_frs", "get_paper_context",
         "fr_candidates_from_concepts",
+        "pr_ready",
         "next_work_unit", "work_units",
         "propose_milestone_from_work_unit", "get_milestone",
         "list_milestones", "draft_spec_from_milestone", "review_milestone_scope",
@@ -73,6 +75,10 @@ def test_get_paper_context_skill(harness):
 
 def test_fr_candidates_from_concepts_skill(harness):
     harness.assert_skill_exists("fr_candidates_from_concepts", description="concept bundles")
+
+
+def test_pr_ready_skill(harness):
+    harness.assert_skill_exists("pr_ready", description="merge readiness")
 
 
 def test_milestone_skills(harness):
@@ -428,7 +434,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 42
+    assert len(reg.skills) == 43
     assert len(reg.collaborations) == 1
 
 
