@@ -3,6 +3,8 @@
 Date: 2026-04-17
 FR: `fr_developer_97203f4c`
 
+Current refresh: 2026-04-18, as part of `fr_developer_c269f9d3`.
+
 ## Purpose
 
 Make repo ownership explicit across the local khonliang workspace so reusable
@@ -85,11 +87,21 @@ apps.
 - `fr_developer_9c7b1cf2`: track repo config and `CLAUDE.md` hygiene across
   domain apps.
 
+## Current State
+
+- The bus and developer documentation cleanup PRs from the original audit have
+  landed.
+- Researcher-lib graph suggestion work and researcher wiring have landed.
+- Developer is now the FR lifecycle authority; researcher should be treated as
+  the ingestion/evidence authority.
+- Developer runs primarily as a native bus agent. Direct MCP remains a
+  compatibility path, not the preferred dogfooding path.
+- The remaining cleanup should focus on stale code paths, stale docs, and local
+  config hygiene without touching unrelated user changes in domain repos.
+
 ## Recommended Next Cleanup Order
 
-1. Merge bus PR `#17` and developer PR `#23` after Copilot approval.
-2. Land researcher-lib PR `#8`, then researcher draft PR `#15`.
-3. Clean researcher duplicate primitive modules and update researcher guidance.
-4. Audit `khonliang-bus-lib` README/CLAUDE for current service/library boundary.
-5. Handle domain app config hygiene in isolated branches, avoiding active user
+1. Clean researcher duplicate primitive modules and update researcher guidance.
+2. Audit `khonliang-bus-lib` README/CLAUDE for current service/library boundary.
+3. Handle domain app config hygiene in isolated branches, avoiding active user
    changes.

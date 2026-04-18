@@ -137,8 +137,8 @@ async def test_list_specs_unknown_project(mcp):
 
 
 @pytest.mark.asyncio
-async def test_health_check_skips_ollama_in_ms01(mcp):
-    """MS-01 health_check must NOT call into Ollama or list model versions.
+async def test_health_check_reports_runtime_config_without_ollama(mcp):
+    """health_check must not call into Ollama or list model versions.
 
     We check the non-db lines (skipping the first line which contains the
     DB filesystem path — that path can contain arbitrary substrings from
@@ -150,7 +150,7 @@ async def test_health_check_skips_ollama_in_ms01(mcp):
     assert "db:" in text
     assert "workspace_root" in text
     assert "researcher:" in text
-    assert "models: parsed but unused (MS-02)" in text
+    assert "models: parsed" in text
 
     # Check the non-db lines for Ollama-style markers — skip the first
     # line because it contains the filesystem path.

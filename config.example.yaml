@@ -28,13 +28,11 @@ projects:
     specs_dir: specs
 
 # ---------------------------------------------------------------------------
-# Forward-looking blocks: validated at load time, but no clients are
-# constructed in MS-01. See milestones/MS-01/milestone.md §Config block
-# shapes for the rationale and validation rules.
+# Runtime integration blocks
 # ---------------------------------------------------------------------------
 
-# MS-02 will populate these with Ollama model names for best-of-N spec
-# evaluation. MS-01 just validates that the keys are present.
+# Model assignments used by evaluation/review workflows. Empty strings are
+# allowed for local development, but the keys must be present.
 models:
   summarizer: ""
   extractor: ""
@@ -43,15 +41,17 @@ models:
   embedder: ""
   reviewer: ""
 
-# MS-06 will flip enabled=true and connect to khonliang-bus. MS-01
-# refuses to start if enabled=true.
+# Bus endpoint used by the native developer agent and by researcher evidence
+# lookups. The native agent takes its bus URL from the launch command; this
+# flag remains false in the example so direct MCP-only compatibility launches
+# keep their historical default.
 bus:
   url: http://localhost:8787
   enabled: false
 
-# Stub for the ResearcherClient seam. MS-02 wires the real transport;
-# MS-01 just validates that the block exists with required keys.
-# Edit `command` and `args` to point at your local researcher checkout.
+# Compatibility block for direct researcher MCP paths. The primary developer
+# runtime uses bus.url for researcher evidence/context calls, but this block is
+# still validated so older direct-MCP launches fail clearly when misconfigured.
 researcher_mcp:
   transport: stdio
   command: /path/to/khonliang-researcher/.venv/bin/python

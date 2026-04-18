@@ -1,4 +1,4 @@
-"""Configuration loader for the developer MCP server.
+"""Configuration loader for the developer runtime.
 
 Mirrors khonliang-researcher's config-loading pattern (load YAML, resolve
 relative paths against the config-file directory, write resolved values
@@ -51,7 +51,7 @@ class ProjectConfig:
 
 @dataclass
 class ModelsConfig:
-    """Forward-looking model assignments. Inert in MS-01."""
+    """Model assignments used by evaluation and review workflows."""
 
     summarizer: str = ""
     extractor: str = ""
@@ -161,7 +161,7 @@ class Config:
                 specs_dir=body.get("specs_dir", "specs"),
             )
 
-        # --- forward-looking blocks (validated but inert in MS-01) ----------
+        # --- integration blocks --------------------------------------------
         models = _parse_models(data.get("models"))
         bus = _parse_bus(data.get("bus"))
         researcher_mcp = _parse_researcher_mcp(data.get("researcher_mcp"))
@@ -199,7 +199,7 @@ def _resolve_path(
 def _parse_models(block: Any) -> ModelsConfig:
     if block is None:
         raise ConfigError(
-            "missing 'models' block — MS-01 requires the block to exist "
+            "missing 'models' block — developer requires the block to exist "
             f"with keys {REQUIRED_MODEL_KEYS} (values may be empty strings)"
         )
     if not isinstance(block, dict):
