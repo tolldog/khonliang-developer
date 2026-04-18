@@ -15,6 +15,10 @@ developer.
   draft spec, and scope review for implementation.
 - `run_tests(project, target="", detail="brief")` — run pytest and return a
   distilled digest.
+- `create_session_checkpoint(fr_id, cwd, ...)` — capture durable work state
+  before idle, exit, or handoff.
+- `resume_session_checkpoint(checkpoint, cwd, ...)` — rebuild launch context
+  and detect stale git/PR state.
 - `pr_ready(repo, pr_number)` — summarize GitHub review and merge readiness.
 - `update_fr_status(fr_id, status, branch="", notes="")` — record lifecycle
   progress.
@@ -29,8 +33,9 @@ This guide is shared by two runtimes:
 
 - Bus-native agent runtime: supports the broader developer workflow skills
   described in this guide, including `next_work_unit`,
-  `prepare_development_handoff`, `run_tests`, `pr_ready`, `update_fr_status`,
-  and the FR/milestone lifecycle operations below.
+  `prepare_development_handoff`, `run_tests`, `create_session_checkpoint`,
+  `resume_session_checkpoint`, `pr_ready`, `update_fr_status`, and the
+  FR/milestone lifecycle operations below.
 - Direct MCP compatibility server: supports only the compatibility tool subset:
   `read_spec`, `traverse_milestone`, `list_specs`, `health_check`, and
   `developer_guide`.
@@ -111,6 +116,19 @@ Prefer `run_tests` over raw pytest output in long LLM sessions. Raw logs should
 be stored as artifacts or files; the prompt should receive a compact failure
 summary and a reference.
 
+## Session Checkpoints
+
+Use checkpoints to make external LLM sessions disposable.
+
+- `create_session_checkpoint` captures FR/work-unit metadata, branch/head,
+  changed files, optional PR readiness, token/cache hygiene findings, agent
+  state, and next actions.
+- `resume_session_checkpoint` compares that checkpoint with current git/PR
+  state and returns a compact launch briefing plus stale-state reasons.
+
+Checkpoint before a long idle break, handoff, or context clear. Resume from the
+checkpoint instead of rebuilding from raw conversation history.
+
 PR review policy for this workspace:
 
 - Always tag `@copilot` in a PR comment when requesting review.
@@ -147,6 +165,8 @@ Developer should reduce context pressure, not add to it.
 - Return compact structured summaries by default.
 - Put large command output, test logs, specs, diffs, and handoffs in artifacts
   or durable files.
+- Checkpoint long-running sessions before idle breaks and resume from the
+  checkpoint in a fresh external LLM process.
 - Return artifact IDs, file paths, or short digests to the LLM session.
 - Keep external LLM sessions disposable: they should start, request the current
   bundle/state, work, publish progress, and exit.

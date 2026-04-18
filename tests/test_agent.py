@@ -16,8 +16,8 @@ def harness(temp_config_file):
 
 def test_skill_count(harness):
     # 34 existing skills + 7 milestone/handoff/migration skills
-    # + concept FR candidates + PR readiness.
-    assert len(harness.skills) == 43
+    # + concept FR candidates + PR readiness + session checkpoint/resume.
+    assert len(harness.skills) == 45
 
 
 def test_skills_registered(harness):
@@ -32,6 +32,7 @@ def test_skills_registered(harness):
         "list_milestones", "draft_spec_from_milestone", "review_milestone_scope",
         "prepare_development_handoff",
         "migrate_frs_from_researcher",
+        "create_session_checkpoint", "resume_session_checkpoint",
         "run_tests",
         # developer-owned FR lifecycle (PR #10)
         "promote_fr", "update_fr_status", "set_fr_dependency",
@@ -89,6 +90,11 @@ def test_milestone_skills(harness):
     harness.assert_skill_exists("review_milestone_scope", description="duplicate")
     harness.assert_skill_exists("prepare_development_handoff", description="handoff")
     harness.assert_skill_exists("migrate_frs_from_researcher", description="migration")
+
+
+def test_session_checkpoint_skills(harness):
+    harness.assert_skill_exists("create_session_checkpoint", description="checkpoint")
+    harness.assert_skill_exists("resume_session_checkpoint", description="launch briefing")
 
 
 # -- collaborations --
@@ -434,7 +440,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 43
+    assert len(reg.skills) == 45
     assert len(reg.collaborations) == 1
 
 
@@ -871,3 +877,67 @@ async def test_prepare_development_handoff_flags_review_terms(harness):
     assert result["suggested_next_actions"][-1] == (
         "refine or split the milestone before implementation"
     )
+
+
+@pytest.mark.asyncio
+async def test_create_session_checkpoint_handler(harness, git_repo):
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Checkpoint workflow",
+        description="Checkpoint workflow",
+        priority="medium",
+        concept="context economics",
+    )
+    (git_repo / "scratch.txt").write_text("work\n")
+
+    result = await harness.call("create_session_checkpoint", {
+        "fr_id": fr.id,
+        "cwd": str(git_repo),
+        "context_tokens": 900_000,
+        "context_limit": 1_000_000,
+        "idle_minutes": 20,
+        "tests": {"passed": 12, "failed": 0, "errors": 0, "digest": "12 passed"},
+        "next_actions": "finish implementation,request review",
+    })
+
+    checkpoint = result["checkpoint"]
+    assert checkpoint["schema"] == "session-checkpoint/v1"
+    assert checkpoint["fr"]["id"] == fr.id
+    assert checkpoint["repo"]["branch"] == "main"
+    assert checkpoint["repo"]["dirty"] is True
+    assert "scratch.txt" in checkpoint["repo"]["changed_files"]
+    assert checkpoint["tests"]["passed"] == 12
+    assert checkpoint["agent_state"]["agent_id"]
+    assert {f["kind"] for f in checkpoint["token_hygiene"]} == {
+        "context_window_pressure",
+        "idle_cache_risk",
+    }
+    assert checkpoint["next_actions"][0] == "finish implementation"
+
+
+@pytest.mark.asyncio
+async def test_resume_session_checkpoint_handler_detects_git_drift(harness, git_repo):
+    initial = await harness.call("create_session_checkpoint", {"cwd": str(git_repo)})
+    checkpoint = initial["checkpoint"]
+    (git_repo / "later.txt").write_text("later\n")
+
+    result = await harness.call("resume_session_checkpoint", {
+        "cwd": str(git_repo),
+        "checkpoint": checkpoint,
+    })
+
+    resume = result["resume"]
+    assert resume["schema"] == "session-resume/v1"
+    assert resume["stale"] is True
+    assert "changed file set differs from checkpoint" in resume["stale_reasons"]
+    assert "resume checkpoint:" in resume["briefing"]
+
+
+@pytest.mark.asyncio
+async def test_create_session_checkpoint_rejects_unknown_fr(harness, git_repo):
+    result = await harness.call("create_session_checkpoint", {
+        "fr_id": "fr_developer_ffffffff",
+        "cwd": str(git_repo),
+    })
+
+    assert result == {"error": "unknown FR id: fr_developer_ffffffff"}
