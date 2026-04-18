@@ -38,6 +38,7 @@ loading large sibling-agent context into the LLM session.
 - Retrieve evidence/context from researcher through the bus.
 - Run tests and return compact digests.
 - Provide Git and GitHub workflow skills.
+- Audit repos for docs drift, stale paths, config hygiene, and test plans.
 - Track progress from `open` through `completed`.
 
 Developer should return concise, executable state. Large logs, diffs, specs,
@@ -68,6 +69,18 @@ artifact or durable note before leaving a large LLM session idle.
 `resume_session_checkpoint` compares the checkpoint with current git and PR
 state, reports stale reasons, and returns a launch briefing for a fresh session.
 Use it when relaunching after a cache TTL cliff, branch update, or review loop.
+
+## Repo Hygiene
+
+`audit_repo_hygiene` inspects a repository and returns compact sections for
+repo inventory, stale/deprecated paths, docs drift, cleanup plan, and test plan.
+Use it before broad cleanup so the session does not need to keep raw file reads
+in context.
+
+`apply_repo_hygiene_plan` is conservative: it writes the generated audit
+markdown artifact into the target repo, usually `docs/repo-hygiene-audit.md`.
+It does not delete code or rewrite README content automatically; those edits
+should happen in scoped follow-up commits with tests and review.
 
 ## Configuration
 

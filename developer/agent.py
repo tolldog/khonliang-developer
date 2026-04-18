@@ -155,6 +155,20 @@ class DeveloperAgent(BaseAgent):
                    "repo": {"type": "string", "default": ""},
                    "pr_number": {"type": "integer", "default": 0}},
                   since="0.12.0"),
+            Skill("audit_repo_hygiene",
+                  "Audit a repo for stale paths, docs drift, config hygiene, and test plan",
+                  {"repo_path": {"type": "string", "required": True},
+                   "include_text_scan": {"type": "boolean", "default": True},
+                   "max_text_files": {"type": "integer", "default": 120}},
+                  since="0.13.0"),
+            Skill("apply_repo_hygiene_plan",
+                  "Write the generated repo hygiene audit artifact into the target repo",
+                  {"repo_path": {"type": "string", "required": True},
+                   "audit_path": {"type": "string", "default": "docs/repo-hygiene-audit.md"},
+                   "overwrite": {"type": "boolean", "default": True},
+                   "include_text_scan": {"type": "boolean", "default": True},
+                   "max_text_files": {"type": "integer", "default": 120}},
+                  since="0.13.0"),
             # Test run + distill (token-arbitrage: pay local pytest cost once,
             # serve cheap digest to Claude instead of raw pytest output)
             Skill("run_tests", "Run project pytest suite and return a distilled digest",
@@ -798,6 +812,55 @@ class DeveloperAgent(BaseAgent):
                 current_pr_ready=pr_ready,
             )
         }
+
+    @handler("audit_repo_hygiene")
+    async def handle_audit_repo_hygiene(self, args):
+        """Return compact repo hygiene sections without writing files."""
+        from developer.repo_hygiene import audit_repo_hygiene
+
+        repo_path = args.get("repo_path", "")
+        if not repo_path:
+            return {"error": "repo_path is required"}
+        try:
+            audit = audit_repo_hygiene(
+                repo_path,
+                include_text_scan=_bool_arg(args, "include_text_scan", True),
+                max_text_files=_int_arg(args, "max_text_files", 120),
+            )
+        except Exception as e:
+            await self._safe_report_gap("audit_repo_hygiene", str(e))
+            return {"error": str(e)}
+        return {"audit": audit.to_dict()}
+
+    @handler("apply_repo_hygiene_plan")
+    async def handle_apply_repo_hygiene_plan(self, args):
+        """Write the generated repo hygiene audit artifact into a repo."""
+        from developer.repo_hygiene import (
+            apply_repo_hygiene_plan,
+            audit_repo_hygiene,
+        )
+
+        repo_path = args.get("repo_path", "")
+        if not repo_path:
+            return {"error": "repo_path is required"}
+        try:
+            audit = audit_repo_hygiene(
+                repo_path,
+                include_text_scan=_bool_arg(args, "include_text_scan", True),
+                max_text_files=_int_arg(args, "max_text_files", 120),
+            )
+            applied = apply_repo_hygiene_plan(
+                audit,
+                audit_path=args.get("audit_path") or "docs/repo-hygiene-audit.md",
+                overwrite=_bool_arg(args, "overwrite", True),
+            )
+        except Exception as e:
+            await self._safe_report_gap("apply_repo_hygiene_plan", str(e))
+            return {"error": str(e)}
+        result = audit.to_dict()
+        result["applied_changes"] = applied.get("applied_changes", [])
+        result["skipped"] = applied.get("skipped", "")
+        return {"audit": result}
 
     # -- developer-owned FR lifecycle --
 
@@ -1462,6 +1525,15 @@ def _float_arg(args: dict, name: str, default: float = 0.0) -> float:
         return float(args.get(name, default) or default)
     except (TypeError, ValueError):
         return default
+
+
+def _bool_arg(args: dict, name: str, default: bool = False) -> bool:
+    raw = args.get(name, default)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+    return bool(raw)
 
 
 def _work_units_from_local_frs(frs, *, max_size: int = 5) -> list[dict]:
