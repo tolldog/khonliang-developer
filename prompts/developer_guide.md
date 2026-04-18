@@ -19,6 +19,9 @@ developer.
   before idle, exit, or handoff.
 - `resume_session_checkpoint(checkpoint, cwd, ...)` — rebuild launch context
   and detect stale git/PR state.
+- `audit_repo_hygiene(repo_path)` — inspect docs drift, stale paths, config
+  hygiene, and test commands.
+- `apply_repo_hygiene_plan(repo_path)` — write the generated audit artifact.
 - `pr_ready(repo, pr_number)` — summarize GitHub review and merge readiness.
 - `update_fr_status(fr_id, status, branch="", notes="")` — record lifecycle
   progress.
@@ -34,7 +37,8 @@ This guide is shared by two runtimes:
 - Bus-native agent runtime: supports the broader developer workflow skills
   described in this guide, including `next_work_unit`,
   `prepare_development_handoff`, `run_tests`, `create_session_checkpoint`,
-  `resume_session_checkpoint`, `pr_ready`, `update_fr_status`, and the
+  `resume_session_checkpoint`, `audit_repo_hygiene`,
+  `apply_repo_hygiene_plan`, `pr_ready`, `update_fr_status`, and the
   FR/milestone lifecycle operations below.
 - Direct MCP compatibility server: supports only the compatibility tool subset:
   `read_spec`, `traverse_milestone`, `list_specs`, `health_check`, and
@@ -128,6 +132,20 @@ Use checkpoints to make external LLM sessions disposable.
 
 Checkpoint before a long idle break, handoff, or context clear. Resume from the
 checkpoint instead of rebuilding from raw conversation history.
+
+## Repo Hygiene
+
+Use repo hygiene skills before broad cleanup or documentation refresh work.
+
+- `audit_repo_hygiene` returns compact sections: `repo_inventory`,
+  `deprecated_paths`, `docs_drift`, `cleanup_plan`, `test_plan`, and
+  `artifact_hints`.
+- `apply_repo_hygiene_plan` writes a durable markdown audit artifact into the
+  target repo. It intentionally does not delete files or rewrite README/code by
+  itself.
+
+Treat the generated audit as the implementation plan. Apply code deletion,
+README edits, or config changes in focused commits with tests and review.
 
 PR review policy for this workspace:
 

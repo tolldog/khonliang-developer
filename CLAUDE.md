@@ -88,6 +88,8 @@ When in doubt: if it's about producing artifacts (specs, code, FRs, worktrees), 
 - Publish developer lifecycle events.
 - Request on-demand evidence from researcher when evaluating specs or work
   units.
+- Audit repositories for docs drift, stale/deprecated paths, config hygiene,
+  cleanup plans, and test plans.
 
 ## Current Hygiene Direction
 
@@ -97,6 +99,8 @@ When in doubt: if it's about producing artifacts (specs, code, FRs, worktrees), 
 - Store large command/test/git outputs as artifacts and return compact refs.
 - Use `create_session_checkpoint` before long idle breaks or handoff, then
   `resume_session_checkpoint` to relaunch from durable state.
+- Use `audit_repo_hygiene` before cleanup work and `apply_repo_hygiene_plan`
+  to persist the audit artifact before editing code/docs.
 - Build repo-directed cleanup/documentation workflows so developer can audit a
   repo, propose cleanup, apply scoped edits, and leave distilled artifacts.
 

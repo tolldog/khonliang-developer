@@ -16,8 +16,9 @@ def harness(temp_config_file):
 
 def test_skill_count(harness):
     # 34 existing skills + 7 milestone/handoff/migration skills
-    # + concept FR candidates + PR readiness + session checkpoint/resume.
-    assert len(harness.skills) == 45
+    # + concept FR candidates + PR readiness + session checkpoint/resume
+    # + repo hygiene audit/apply.
+    assert len(harness.skills) == 47
 
 
 def test_skills_registered(harness):
@@ -33,6 +34,7 @@ def test_skills_registered(harness):
         "prepare_development_handoff",
         "migrate_frs_from_researcher",
         "create_session_checkpoint", "resume_session_checkpoint",
+        "audit_repo_hygiene", "apply_repo_hygiene_plan",
         "run_tests",
         # developer-owned FR lifecycle (PR #10)
         "promote_fr", "update_fr_status", "set_fr_dependency",
@@ -95,6 +97,11 @@ def test_milestone_skills(harness):
 def test_session_checkpoint_skills(harness):
     harness.assert_skill_exists("create_session_checkpoint", description="checkpoint")
     harness.assert_skill_exists("resume_session_checkpoint", description="launch briefing")
+
+
+def test_repo_hygiene_skills(harness):
+    harness.assert_skill_exists("audit_repo_hygiene", description="hygiene")
+    harness.assert_skill_exists("apply_repo_hygiene_plan", description="hygiene")
 
 
 # -- collaborations --
@@ -440,7 +447,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 45
+    assert len(reg.skills) == 47
     assert len(reg.collaborations) == 1
 
 
@@ -941,3 +948,33 @@ async def test_create_session_checkpoint_rejects_unknown_fr(harness, git_repo):
     })
 
     assert result == {"error": "unknown FR id: fr_developer_ffffffff"}
+
+
+@pytest.mark.asyncio
+async def test_audit_repo_hygiene_handler(harness, git_repo):
+    (git_repo / "README.md").write_text("# Demo\n\nNo config docs.\n")
+    (git_repo / "legacy.md").write_text("MS-01 stubbed reference\n")
+
+    result = await harness.call("audit_repo_hygiene", {
+        "repo_path": str(git_repo),
+        "include_text_scan": True,
+    })
+
+    audit = result["audit"]
+    assert audit["schema"] == "repo-hygiene/v1"
+    assert audit["repo_inventory"]["has_readme"] is True
+    assert audit["git_status"]["is_git_repo"] is True
+    assert any(f["path"] == "legacy.md" for f in audit["deprecated_paths"])
+    assert any(a["id"] == "write-hygiene-artifact" for a in audit["cleanup_plan"])
+
+
+@pytest.mark.asyncio
+async def test_apply_repo_hygiene_plan_handler_writes_artifact(harness, git_repo):
+    result = await harness.call("apply_repo_hygiene_plan", {
+        "repo_path": str(git_repo),
+        "audit_path": "docs/hygiene.md",
+    })
+
+    audit = result["audit"]
+    assert audit["applied_changes"][0]["path"] == "docs/hygiene.md"
+    assert (git_repo / "docs" / "hygiene.md").exists()
