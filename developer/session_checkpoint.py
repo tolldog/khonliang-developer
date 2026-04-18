@@ -114,6 +114,7 @@ def build_resume_briefing(
     actions = list(checkpoint.get("next_actions") or [])
     if stale_reasons:
         actions.insert(0, "refresh checkpoint before relying on stale state")
+        actions = _dedupe(actions)
 
     lines = [
         f"resume checkpoint: {checkpoint.get('checkpoint_id', '?')}",

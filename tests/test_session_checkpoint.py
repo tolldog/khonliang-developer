@@ -82,6 +82,29 @@ def test_resume_briefing_marks_stale_checkpoint():
     assert "stale:" in resume["briefing"]
 
 
+def test_resume_briefing_dedupes_stale_next_action():
+    checkpoint = build_session_checkpoint(
+        fr=None,
+        work_unit=None,
+        repo_path="/repo",
+        git_status=RepoStatus(branch="old", is_dirty=False),
+        head_sha="oldsha",
+        next_actions=["refresh checkpoint before relying on stale state"],
+        now=1000,
+    )
+
+    resume = build_resume_briefing(
+        checkpoint,
+        current_git_status=RepoStatus(branch="new", is_dirty=False),
+        current_head_sha="oldsha",
+        now=2000,
+    )
+
+    assert resume["next_actions"].count(
+        "refresh checkpoint before relying on stale state"
+    ) == 1
+
+
 def test_stale_checkpoint_allows_matching_state():
     checkpoint = {
         "resume_basis": {

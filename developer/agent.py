@@ -740,7 +740,10 @@ class DeveloperAgent(BaseAgent):
             except Exception as e:
                 await self._safe_report_gap("create_session_checkpoint", str(e))
                 evidence_result = {"error": str(e)}
-            evidence.append({"query": evidence_query, "result": evidence_result})
+            evidence.append({
+                "query": evidence_query,
+                "summary": _compact_jsonish(evidence_result, limit=1200),
+            })
         checkpoint = build_session_checkpoint(
             fr=fr,
             work_unit=work_unit,
@@ -1555,16 +1558,20 @@ def _handoff_next_actions(
 
 def _parse_work_unit_arg(value) -> dict:
     """Parse an optional work_unit arg from bus JSON/string input."""
-    if value in (None, ""):
-        return {}
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        parsed = json.loads(value)
-        if not isinstance(parsed, dict):
-            raise ValueError("work_unit JSON must decode to an object")
-        return parsed
-    raise ValueError("work_unit must be a JSON object or JSON string")
+    parsed = _parse_json_dict(value)
+    if "error" in parsed:
+        raise ValueError(parsed["error"])
+    return parsed
+
+
+def _compact_jsonish(value, *, limit: int = 1200) -> str:
+    """Bound a JSON-ish value for inline checkpoint evidence."""
+    try:
+        text = json.dumps(value, sort_keys=True)
+    except TypeError:
+        text = str(value)
+    text = text.replace("\r", " ").replace("\n", " ").strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def _parse_concept_bundles(text: str) -> list[dict]:
