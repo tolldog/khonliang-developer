@@ -49,12 +49,25 @@ or handoffs should live as artifacts or durable files with compact references.
 2. Turn the bundle into implementation context with `prepare_development_handoff`.
 3. Create or switch to a branch, then implement the scoped change.
 4. Use `run_tests` for a distilled pytest result instead of pasting raw logs.
-5. Use Git/GitHub skills for status, commit, PR readiness, and review checks.
-6. Tag `@copilot` for PR review before merge.
-7. Mark the FR or milestone complete after the PR is merged.
+5. Use `create_session_checkpoint` before idle breaks or handoff.
+6. Use `resume_session_checkpoint` to relaunch from durable state.
+7. Use Git/GitHub skills for status, commit, PR readiness, and review checks.
+8. Tag `@copilot` for PR review before merge.
+9. Mark the FR or milestone complete after the PR is merged.
 
 This keeps Claude focused on code and review while developer preserves the
 long-lived planning state.
+
+## Session Checkpoints
+
+`create_session_checkpoint` captures the current FR, optional work unit,
+branch/head, changed files, PR readiness, token/cache hygiene signals, agent
+state, and next actions in a compact JSON payload. Store that payload as a bus
+artifact or durable note before leaving a large LLM session idle.
+
+`resume_session_checkpoint` compares the checkpoint with current git and PR
+state, reports stale reasons, and returns a launch briefing for a fresh session.
+Use it when relaunching after a cache TTL cliff, branch update, or review loop.
 
 ## Configuration
 

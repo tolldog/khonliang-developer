@@ -132,6 +132,29 @@ class DeveloperAgent(BaseAgent):
                                  "description": "optional JSON work unit; omitted uses next_work_unit"},
                    "review_terms": {"type": "string", "default": "AutoGen,GRA"}},
                   since="0.10.0"),
+            Skill("create_session_checkpoint",
+                  "Create a compact checkpoint for disposable external LLM sessions",
+                  {"fr_id": {"type": "string", "default": ""},
+                   "cwd": {"type": "string", "required": True},
+                   "repo": {"type": "string", "default": ""},
+                   "pr_number": {"type": "integer", "default": 0},
+                   "work_unit": {"type": "string", "default": "",
+                                 "description": "optional JSON work unit"},
+                   "context_tokens": {"type": "integer", "default": 0},
+                   "context_limit": {"type": "integer", "default": 0},
+                   "idle_minutes": {"type": "number", "default": 0},
+                   "tests": {"type": "string", "default": "",
+                             "description": "optional JSON test digest"},
+                   "evidence_query": {"type": "string", "default": ""},
+                   "next_actions": {"type": "string", "default": ""}},
+                  since="0.12.0"),
+            Skill("resume_session_checkpoint",
+                  "Build a launch briefing from a checkpoint and detect stale git/PR state",
+                  {"checkpoint": {"type": "string", "required": True},
+                   "cwd": {"type": "string", "required": True},
+                   "repo": {"type": "string", "default": ""},
+                   "pr_number": {"type": "integer", "default": 0}},
+                  since="0.12.0"),
             # Test run + distill (token-arbitrage: pay local pytest cost once,
             # serve cheap digest to Claude instead of raw pytest output)
             Skill("run_tests", "Run project pytest suite and return a distilled digest",
@@ -677,6 +700,102 @@ class DeveloperAgent(BaseAgent):
             response["remaining_work_units"] = remaining
         return response
 
+    @handler("create_session_checkpoint")
+    async def handle_create_session_checkpoint(self, args):
+        """Create a compact checkpoint for cache-aware session exit/resume."""
+        from developer.git_client import GitClient, GitClientError
+        from developer.session_checkpoint import build_session_checkpoint
+
+        cwd = args.get("cwd", "")
+        if not cwd:
+            return {"error": "cwd is required"}
+        fr_id = args.get("fr_id", "")
+        fr = None
+        if fr_id:
+            fr = self.pipeline.frs.get(fr_id)
+            if fr is None:
+                return {"error": f"unknown FR id: {fr_id}"}
+        try:
+            git = GitClient(cwd)
+            status = git.status()
+            head_sha = git.rev_parse("HEAD")
+        except GitClientError as e:
+            await self._safe_report_gap("create_session_checkpoint", str(e))
+            return {"error": str(e)}
+
+        work_unit = _parse_json_dict(args.get("work_unit"))
+        if isinstance(work_unit, dict) and "error" in work_unit:
+            return work_unit
+        pr_ready = await self._optional_pr_ready(args)
+        if isinstance(pr_ready, dict) and "error" in pr_ready:
+            return pr_ready
+        tests = _parse_json_dict(args.get("tests"))
+        if isinstance(tests, dict) and "error" in tests:
+            return tests
+        evidence = []
+        evidence_query = str(args.get("evidence_query") or "").strip()
+        if evidence_query:
+            try:
+                evidence_result = await self.handle_get_paper_context({"query": evidence_query})
+            except Exception as e:
+                await self._safe_report_gap("create_session_checkpoint", str(e))
+                evidence_result = {"error": str(e)}
+            evidence.append({"query": evidence_query, "result": evidence_result})
+        checkpoint = build_session_checkpoint(
+            fr=fr,
+            work_unit=work_unit,
+            repo_path=str(cwd),
+            git_status=status,
+            head_sha=head_sha,
+            pr_ready=pr_ready,
+            tests=tests or None,
+            evidence=evidence,
+            agent_state={
+                "agent_id": self.agent_id,
+                "bus_url": self.bus_url,
+                "developer_db": str(self.pipeline.config.db_path),
+            },
+            next_actions=_parse_paths(args.get("next_actions", "")),
+            context_tokens=_int_arg(args, "context_tokens", 0),
+            context_limit=_int_arg(args, "context_limit", 0),
+            idle_minutes=_float_arg(args, "idle_minutes", 0.0),
+        )
+        return {"checkpoint": checkpoint}
+
+    @handler("resume_session_checkpoint")
+    async def handle_resume_session_checkpoint(self, args):
+        """Build a compact launch briefing from a prior checkpoint."""
+        from developer.git_client import GitClient, GitClientError
+        from developer.session_checkpoint import build_resume_briefing
+
+        cwd = args.get("cwd", "")
+        if not cwd:
+            return {"error": "cwd is required"}
+        checkpoint = _parse_json_dict(args.get("checkpoint"))
+        if not checkpoint:
+            return {"error": "checkpoint is required"}
+        if "error" in checkpoint:
+            return checkpoint
+        try:
+            git = GitClient(cwd)
+            status = git.status()
+            head_sha = git.rev_parse("HEAD")
+        except GitClientError as e:
+            await self._safe_report_gap("resume_session_checkpoint", str(e))
+            return {"error": str(e)}
+
+        pr_ready = await self._optional_pr_ready(args)
+        if isinstance(pr_ready, dict) and "error" in pr_ready:
+            return pr_ready
+        return {
+            "resume": build_resume_briefing(
+                checkpoint,
+                current_git_status=status,
+                current_head_sha=head_sha,
+                current_pr_ready=pr_ready,
+            )
+        }
+
     # -- developer-owned FR lifecycle --
 
     @handler("promote_fr")
@@ -969,6 +1088,16 @@ class DeveloperAgent(BaseAgent):
             "head_sha": readiness.head_sha,
             "url": readiness.url,
         }
+
+    async def _optional_pr_ready(self, args):
+        repo = args.get("repo", "")
+        try:
+            pr_number = int(args.get("pr_number", 0) or 0)
+        except (TypeError, ValueError):
+            return {"error": "pr_number must be an integer"}
+        if not repo or pr_number < 1:
+            return None
+        return await self.handle_pr_ready({"repo": repo, "pr_number": pr_number})
 
     @handler("git_log")
     async def handle_git_log(self, args):
@@ -1299,6 +1428,37 @@ def _parse_paths(value) -> list[str]:
     if isinstance(value, list):
         return [str(p).strip() for p in value if str(p).strip()]
     return [p.strip() for p in str(value).split(",") if p.strip()]
+
+
+def _parse_json_dict(value) -> dict:
+    """Parse an optional JSON object arg from bus args."""
+    if value in (None, ""):
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as e:
+            return {"error": f"JSON object parse failed: {e}"}
+        if not isinstance(parsed, dict):
+            return {"error": "value must decode to a JSON object"}
+        return parsed
+    return {"error": "value must be a JSON object or JSON string"}
+
+
+def _int_arg(args: dict, name: str, default: int = 0) -> int:
+    try:
+        return int(args.get(name, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_arg(args: dict, name: str, default: float = 0.0) -> float:
+    try:
+        return float(args.get(name, default) or default)
+    except (TypeError, ValueError):
+        return default
 
 
 def _work_units_from_local_frs(frs, *, max_size: int = 5) -> list[dict]:

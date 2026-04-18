@@ -95,6 +95,8 @@ When in doubt: if it's about producing artifacts (specs, code, FRs, worktrees), 
   active FR ownership paths.
 - Prefer bus-mediated agent skills over direct sibling MCP calls.
 - Store large command/test/git outputs as artifacts and return compact refs.
+- Use `create_session_checkpoint` before long idle breaks or handoff, then
+  `resume_session_checkpoint` to relaunch from durable state.
 - Build repo-directed cleanup/documentation workflows so developer can audit a
   repo, propose cleanup, apply scoped edits, and leave distilled artifacts.
 
