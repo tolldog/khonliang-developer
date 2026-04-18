@@ -5,9 +5,9 @@ build a :class:`KhonliangMCPServer` against the pipeline's stores, register
 the developer guide, then attach the developer-specific @mcp.tool()
 functions.
 
-MS-01 surface: ``read_spec``, ``traverse_milestone``, ``list_specs``,
-``health_check``, ``developer_guide``, plus the inherited ``catalog`` /
-``knowledge_search`` / ``triple_query`` from the base class.
+This direct MCP server is the compatibility path for direct Claude
+connections. The primary dogfooding runtime is ``developer.agent`` on the
+khonliang bus.
 
 Usage::
 
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 def create_developer_server(pipeline: Pipeline):
-    """Create the developer MCP server with all MS-01 tools registered.
+    """Create the developer MCP server with compatibility tools registered.
 
     Mirrors :func:`researcher.server.create_research_server` exactly for
     structure: same ``KhonliangMCPServer`` base, same two-step guide
@@ -166,11 +166,7 @@ def create_developer_server(pipeline: Pipeline):
 
     @mcp.tool()
     async def health_check() -> str:
-        """Verify DB path/size, workspace presence, ResearcherClient config.
-
-        MS-01 deliberately omits Ollama/model checks — no LLM calls land
-        until MS-02 (per spec rev 2 §Acceptance #8).
-        """
+        """Verify DB path/size, workspace presence, and bus researcher config."""
         db_path = Path(pipeline.config.db_path)
         db_size = db_path.stat().st_size if db_path.exists() else 0
         workspace = pipeline.config.workspace_root
@@ -182,7 +178,7 @@ def create_developer_server(pipeline: Pipeline):
             f"projects: {len(pipeline.config.projects)} configured",
             f"researcher: bus_url={pipeline.researcher.bus_url}",
             f"bus: url={pipeline.config.bus.url}",
-            "models: parsed but unused (MS-02)",
+            "models: parsed",
         ]
         return "\n".join(lines)
 
@@ -319,7 +315,7 @@ def main():
         "--transport",
         default="stdio",
         choices=["stdio"],
-        help="MCP transport (only stdio in MS-01)",
+        help="MCP transport (stdio)",
     )
     args = parser.parse_args()
 

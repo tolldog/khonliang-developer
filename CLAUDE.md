@@ -18,15 +18,15 @@ connections.
 
 - Python, async throughout
 - Local LLMs via Ollama (best-of-N evaluation, same models as researcher)
-- SQLite-backed stores: KnowledgeStore, TripleStore, DigestStore (from khonliang) — shared with researcher
-- MCP server extending khonliang's KhonliangMCPServer
+- SQLite-backed stores: KnowledgeStore, TripleStore, DigestStore (from khonliang) pointed at developer's own database
+- Native khonliang-bus agent, plus direct MCP server compatibility
 - Cross-app communication via khonliang-bus client (HTTP + WebSocket)
 
 ## Ecosystem position
 
 ```
 INFRASTRUCTURE (services)
-├─ khonliang-scheduler  — LLM inference scheduling (Go)
+├─ khonliang-scheduler  — LLM inference scheduling
 └─ khonliang-bus        — agent bus service, service registry, artifacts, MCP adapter
 
 LIBRARIES (Python)
@@ -110,10 +110,18 @@ Pure code + code review. Developer hands Claude pre-evaluated work packages with
 
 ## Running
 
+Preferred bus-native agent:
+
 ```bash
-.venv/bin/python -m developer.server --config /mnt/dev/ttoll/dev/khonliang-developer/config.yaml
+.venv/bin/python -m developer.agent --id developer-primary --bus http://localhost:8787 --config /abs/path/config.yaml
 ```
 
-For dogfooding, prefer starting developer through khonliang-bus lifecycle tools
-when the bus is running. Config paths must be absolute for cross-session
+Direct MCP compatibility path:
+
+```bash
+.venv/bin/python -m developer.server --config /abs/path/config.yaml
+```
+
+For dogfooding, start and restart developer through khonliang-bus lifecycle
+tools when the bus is running. Config paths must be absolute for cross-session
 launches.

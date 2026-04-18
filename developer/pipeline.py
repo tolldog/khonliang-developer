@@ -153,10 +153,9 @@ def _assert_stores_isolated(
 def _load_developer_guide(prompts_dir: Path) -> str:
     """Load ``developer_guide.md`` if it exists; return placeholder otherwise.
 
-    During early MS-01 development the prompts dir may not yet contain
-    the guide; the server should still boot. The smoke test in Task 10
-    catches a missing guide via the ``developer_guide`` MCP tool returning
-    the placeholder text.
+    The server should still boot if a local checkout is missing prompt files.
+    The ``developer_guide`` tool returns this placeholder so the failure is
+    visible without blocking unrelated health checks.
     """
     guide_path = prompts_dir / "developer_guide.md"
     if guide_path.exists():
