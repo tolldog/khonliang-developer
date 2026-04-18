@@ -15,7 +15,7 @@ The primary runtime is the bus-native developer agent:
 .venv/bin/python -m developer.agent \
   --id developer-primary \
   --bus http://localhost:8787 \
-  --config /mnt/dev/ttoll/dev/khonliang-developer/config.yaml
+  --config /abs/path/config.yaml
 ```
 
 The direct MCP server remains available for compatibility with direct Claude
@@ -23,7 +23,7 @@ connections:
 
 ```bash
 .venv/bin/python -m developer.server \
-  --config /mnt/dev/ttoll/dev/khonliang-developer/config.yaml
+  --config /abs/path/config.yaml
 ```
 
 Prefer the bus-native agent for day-to-day development. It lets the bus route

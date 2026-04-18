@@ -23,6 +23,21 @@ developer.
 Use `detail="compact"` for tight agent loops, `detail="brief"` for normal
 work, and `detail="full"` only when the caller explicitly needs body content.
 
+### Runtime Availability
+
+This guide is shared by two runtimes:
+
+- Bus-native agent runtime: supports the broader developer workflow skills
+  described in this guide, including `next_work_unit`,
+  `prepare_development_handoff`, `run_tests`, `pr_ready`, `update_fr_status`,
+  and the FR/milestone lifecycle operations below.
+- Direct MCP compatibility server: supports only the compatibility tool subset:
+  `read_spec`, `traverse_milestone`, `list_specs`, `health_check`, and
+  `developer_guide`.
+
+If you are connected through the direct MCP compatibility server, do not call
+bus-native workflow skills unless that server explicitly registers them.
+
 ## FR Lifecycle
 
 Developer owns FR storage and dependency state.

@@ -113,13 +113,13 @@ Pure code + code review. Developer hands Claude pre-evaluated work packages with
 Preferred bus-native agent:
 
 ```bash
-.venv/bin/python -m developer.agent --id developer-primary --bus http://localhost:8787 --config /mnt/dev/ttoll/dev/khonliang-developer/config.yaml
+.venv/bin/python -m developer.agent --id developer-primary --bus http://localhost:8787 --config /abs/path/config.yaml
 ```
 
 Direct MCP compatibility path:
 
 ```bash
-.venv/bin/python -m developer.server --config /mnt/dev/ttoll/dev/khonliang-developer/config.yaml
+.venv/bin/python -m developer.server --config /abs/path/config.yaml
 ```
 
 For dogfooding, start and restart developer through khonliang-bus lifecycle
