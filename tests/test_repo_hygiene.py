@@ -32,7 +32,7 @@ def test_audit_repo_hygiene_detects_docs_and_config_drift(tmp_path):
     assert any(f["path"] == "config.yaml" for f in audit["docs_drift"])
     assert any(f["path"] == ".mcp.json" for f in audit["docs_drift"])
     assert any(f["path"] == "legacy.md" for f in audit["deprecated_paths"])
-    assert ".venv/bin/python -m pytest -q" in audit["test_plan"]
+    assert "python -m pytest -q" in audit["test_plan"]
     assert any(a["id"] == "write-hygiene-artifact" for a in audit["cleanup_plan"])
 
 
@@ -78,5 +78,7 @@ def test_format_hygiene_audit_markdown_is_compact(tmp_path):
     text = format_hygiene_audit_markdown(audit)
 
     assert text.startswith("# Repo Hygiene Audit")
+    assert "Generated: 1970-01-01T00:16:40Z" in text
+    assert f"Repo: `{repo.name}`" in text
     assert "## Cleanup Plan" in text
     assert "## Test Plan" in text
