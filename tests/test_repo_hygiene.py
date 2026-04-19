@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from developer.repo_hygiene import (
+    _repo_identifier,
     audit_repo_hygiene,
     apply_repo_hygiene_plan,
     format_hygiene_audit_markdown,
@@ -82,3 +83,33 @@ def test_format_hygiene_audit_markdown_is_compact(tmp_path):
     assert f"Repo: `{repo.name}`" in text
     assert "## Cleanup Plan" in text
     assert "## Test Plan" in text
+
+
+def test_repo_identifier_parses_origin_urls(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    remotes = [
+        "git@github.com:owner/repo.git",
+        "https://github.com/owner/repo.git",
+        "https://github.com/owner/repo",
+        "ssh://git@github.com/owner/repo.git",
+    ]
+
+    for remote in remotes:
+        monkeypatch.setattr(
+            "developer.repo_hygiene.GitClient.origin_url",
+            lambda self, remote=remote: remote,
+        )
+        assert _repo_identifier(repo) == "owner/repo"
+
+
+def test_repo_identifier_falls_back_to_basename_without_origin(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(
+        "developer.repo_hygiene.GitClient.origin_url",
+        lambda self: None,
+    )
+
+    assert _repo_identifier(repo) == "repo"

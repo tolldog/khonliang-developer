@@ -9,7 +9,6 @@ only, leaving code deletion or broad docs rewrites to explicit follow-up work.
 from __future__ import annotations
 
 import re
-import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -19,6 +18,7 @@ from typing import Any
 from developer.git_client import GitClient, GitClientError, RepoStatus
 
 
+# Additive fields are allowed within v1; removals or renames require a bump.
 SCHEMA_VERSION = "repo-hygiene/v1"
 DEFAULT_AUDIT_PATH = "docs/repo-hygiene-audit.md"
 TEXT_SUFFIXES = {
@@ -417,20 +417,12 @@ def _repo_label(repo_path: Any) -> str:
 def _repo_identifier(root: Path) -> str:
     """Infer owner/name from origin when available, otherwise repo basename."""
     try:
-        result = subprocess.run(
-            ["git", "config", "--get", "remote.origin.url"],
-            cwd=root,
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-    except OSError:
+        remote = GitClient(root).origin_url()
+    except GitClientError:
         return root.name
-    remote = result.stdout.strip()
     if not remote:
         return root.name
-    match = re.search(r"[:/]([^/:]+)/([^/]+?)(?:\.git)?$", remote)
+    match = re.search(r"[:/]([^/:]+)/([^/]+?)(?:\.git)?$", remote.strip())
     if not match:
         return root.name
     return f"{match.group(1)}/{match.group(2)}"
@@ -500,7 +492,8 @@ def _summary(
     action_count: int,
     applied_count: int,
 ) -> str:
+    action_label = "proposed action" if action_count == 1 else "proposed actions"
     return (
         f"{docs_drift_count} docs drift findings, {deprecated_count} stale/deprecated "
-        f"findings, {action_count} proposed actions, {applied_count} applied changes"
+        f"findings, {action_count} {action_label}, {applied_count} applied changes"
     )

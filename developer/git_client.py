@@ -237,6 +237,19 @@ class GitClient:
             return "HEAD"
         return repo.active_branch.name
 
+    def origin_url(self) -> str | None:
+        """Return the configured origin URL, or None when origin is absent."""
+        repo = self._get_repo()
+        try:
+            remote = repo.remotes.origin
+        except (AttributeError, IndexError):
+            return None
+        try:
+            urls = list(remote.urls)
+        except Exception as e:
+            raise GitClientError(f"failed to read origin URL: {e}") from e
+        return urls[0] if urls else None
+
     def list_branches(self, *, local: bool = True, remote: bool = False) -> list[GitBranch]:
         """List branches. Pass local=True, remote=True, or both."""
         repo = self._get_repo()
