@@ -146,6 +146,16 @@ def test_current_branch_detached(client, repo_path):
     assert client.status().detached
 
 
+def test_origin_url_returns_configured_origin(client, repo_path):
+    _run("remote", "add", "origin", "git@github.com:owner/repo.git", cwd=repo_path)
+
+    assert client.origin_url() == "git@github.com:owner/repo.git"
+
+
+def test_origin_url_returns_none_without_origin(client):
+    assert client.origin_url() is None
+
+
 # ---------------------------------------------------------------------------
 # list_branches + log + show + rev_parse + diff
 # ---------------------------------------------------------------------------

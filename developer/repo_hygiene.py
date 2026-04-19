@@ -8,14 +8,17 @@ only, leaving code deletion or broad docs rewrites to explicit follow-up work.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from developer.git_client import GitClient, GitClientError, RepoStatus
 
 
+# Additive fields are allowed within v1; removals or renames require a bump.
 SCHEMA_VERSION = "repo-hygiene/v1"
 DEFAULT_AUDIT_PATH = "docs/repo-hygiene-audit.md"
 TEXT_SUFFIXES = {
@@ -91,6 +94,7 @@ class CleanupAction:
 class RepoHygieneAudit:
     repo_path: str
     generated_at: float
+    repo_id: str
     git_status: dict[str, Any]
     repo_inventory: dict[str, Any]
     deprecated_paths: list[dict[str, Any]] = field(default_factory=list)
@@ -104,6 +108,7 @@ class RepoHygieneAudit:
         return {
             "schema": SCHEMA_VERSION,
             "repo_path": self.repo_path,
+            "repo_id": self.repo_id,
             "generated_at": self.generated_at,
             "git_status": dict(self.git_status),
             "repo_inventory": dict(self.repo_inventory),
@@ -141,6 +146,7 @@ def audit_repo_hygiene(
     return RepoHygieneAudit(
         repo_path=str(root),
         generated_at=float(time.time() if now is None else now),
+        repo_id=_repo_identifier(root),
         git_status=status,
         repo_inventory=inventory,
         deprecated_paths=[f.to_dict() for f in deprecated],
@@ -201,8 +207,8 @@ def format_hygiene_audit_markdown(audit: dict[str, Any]) -> str:
     lines = [
         "# Repo Hygiene Audit",
         "",
-        f"Generated: {audit.get('generated_at', '')}",
-        f"Repo: `{audit.get('repo_path', '')}`",
+        f"Generated: {_format_generated_at(audit.get('generated_at'))}",
+        f"Repo: `{audit.get('repo_id') or _repo_label(audit.get('repo_path', ''))}`",
         "",
         "## Summary",
         "",
@@ -383,12 +389,43 @@ def _cleanup_plan(
 def _test_plan(root: Path, inventory: dict[str, Any]) -> list[str]:
     plan: list[str] = []
     if inventory.get("has_pyproject") and inventory.get("has_tests"):
-        plan.append(".venv/bin/python -m pytest -q")
+        plan.append("python -m pytest -q")
     if inventory.get("python_files"):
-        plan.append(".venv/bin/python -m compileall .")
+        plan.append("python -m compileall .")
     if (root / "package.json").exists():
         plan.append("npm test")
     return plan
+
+
+def _format_generated_at(value: Any) -> str:
+    """Return stable UTC ISO-8601 text for audit markdown."""
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+    text = str(value or "").strip()
+    return text
+
+
+def _repo_label(repo_path: Any) -> str:
+    """Return a stable fallback repo label without host-local parent paths."""
+    if not repo_path:
+        return ""
+    return Path(str(repo_path)).name
+
+
+def _repo_identifier(root: Path) -> str:
+    """Infer owner/name from origin when available, otherwise repo basename."""
+    try:
+        remote = GitClient(root).origin_url()
+    except GitClientError:
+        return root.name
+    if not remote:
+        return root.name
+    match = re.search(r"[:/]([^/:]+)/([^/]+?)(?:\.git)?$", remote.strip())
+    if not match:
+        return root.name
+    return f"{match.group(1)}/{match.group(2)}"
 
 
 def _git_status(root: Path) -> dict[str, Any]:
@@ -455,7 +492,8 @@ def _summary(
     action_count: int,
     applied_count: int,
 ) -> str:
+    action_label = "proposed action" if action_count == 1 else "proposed actions"
     return (
         f"{docs_drift_count} docs drift findings, {deprecated_count} stale/deprecated "
-        f"findings, {action_count} proposed actions, {applied_count} applied changes"
+        f"findings, {action_count} {action_label}, {applied_count} applied changes"
     )
