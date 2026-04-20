@@ -61,10 +61,11 @@ Examples:
 
 ## Import And Dependency Rules
 
-All cross-repo imports must resolve from Python packages or GitHub-pinned
-dependencies. Local editable installs are allowed for development, but imports
-must still use package names and dependencies must be declared in package
-metadata.
+All cross-repo imports must resolve from installed Python packages or
+GitHub-pinned dependencies. Local editable installs are allowed for
+development, but code must still import through the installed Python module
+path, not through sibling-directory imports or `sys.path` hacks. The
+dependency must be declared in project metadata using its distribution name.
 
 Allowed:
 
@@ -117,8 +118,9 @@ They are not the primary architecture. New active workflows must be bus-native.
 
 ## Skill Registration Rules
 
-All active agents register skills through the bus-native contract. Each active
-skill must declare:
+All active agents register skills through the bus-native contract. During the
+boundary reset, the bus-lib skill contract should grow to make the following
+target metadata available for every active skill:
 
 - stable skill id
 - owning agent id
