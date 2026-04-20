@@ -99,6 +99,12 @@ developer's configured database.
 
 ## Repo Boundary
 
+The functional boundary model for the whole khonliang ecosystem lives in
+`docs/ecosystem-functional-boundaries.md`. It defines functional splits before
+repository names, the `X`/`X-lib` rule, import/dependency rules, bus-native
+skill registration requirements, version reset policy, and removal-last cleanup
+order.
+
 - `khonliang-bus-lib` provides the agent SDK and skill contracts.
 - `khonliang-bus` provides the long-running bus service and artifact routing.
 - `khonliang-researcher-lib` provides reusable research primitives.
