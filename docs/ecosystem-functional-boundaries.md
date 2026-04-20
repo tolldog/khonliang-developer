@@ -204,6 +204,22 @@ Removal is last.
 7. Run cross-ecosystem validation through the bus.
 8. Remove old code only after replacements are proven and clients are updated.
 
+Cross-ecosystem validation passes only when all of these checks are true:
+
+- `khonliang-bus` starts with the expected local config.
+- Active agents start through bus lifecycle controls.
+- Each active agent registers its expected service metadata and skills.
+- Every active skill has input and output schema metadata.
+- `bus_skills` or equivalent registry inspection shows no stale duplicate skills.
+- A representative skill invocation succeeds for developer and researcher.
+- Large outputs return compact responses with artifact references where expected.
+- Artifact head, tail, excerpt, and distill operations work on produced artifacts.
+- Agent stop/unload removes or disables its skills.
+- Agent restart refreshes changed skill definitions without duplicate registrations.
+- MCP adapter refresh exposes the current bus skill set.
+- Owned clients (`genealogy`, `autostock`, and khonliang tools) smoke-test through packaged imports or bus skills.
+- Boundary audit reports no unresolved high-priority migration, import, or registration violations.
+
 Code is removed only when:
 
 - a bus-native or packaged replacement exists,
