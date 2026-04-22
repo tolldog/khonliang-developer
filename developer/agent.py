@@ -33,6 +33,11 @@ class DeveloperAgent(BaseAgent):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._pipeline = None  # lazy init
+        # Lazy-initialized PR watcher registry (see pr_watcher.py). Kept
+        # lazy so agents that never call watch_pr_fleet don't pay the
+        # SQLite-schema-init cost, and so tests that replace the
+        # registry factory can do so before the first skill call.
+        self._pr_watcher_registry = None
         # Version is set by BaseAgent.__init__ via khonliang_bus.resolve_version
         # (pyproject walk → importlib.metadata → default). We used to duplicate
         # the metadata lookup here with a hardcoded "0.1.0" fallback, but that
@@ -47,6 +52,51 @@ class DeveloperAgent(BaseAgent):
             config = Config.load(self.config_path)
             self._pipeline = Pipeline.from_config(config)
         return self._pipeline
+
+    @property
+    def pr_watcher_registry(self):
+        """Lazily construct the PR watcher registry.
+
+        Tied to the pipeline's ``db_path`` so the watcher tables live
+        alongside FRs / milestones in developer.db. Publish is bound to
+        :meth:`BaseAgent.publish`; when the agent isn't bus-connected
+        (tests, dry runs) publish raises ``RuntimeError`` and the
+        watcher swallows it via its internal try/except — a real run
+        with a real bus is where events actually flow.
+        """
+        if self._pr_watcher_registry is None:
+            from developer.pr_watcher import PRWatcherRegistry, PRWatcherStore
+            store = PRWatcherStore(str(self.pipeline.config.db_path))
+            self._pr_watcher_registry = PRWatcherRegistry(
+                store=store, publish=self.publish,
+            )
+        return self._pr_watcher_registry
+
+    async def shutdown(self):
+        """Cancel live PR watchers before disconnecting from the bus.
+
+        Overrides :meth:`BaseAgent.shutdown` so watchers get a clean
+        stop path on SIGTERM/SIGINT. Persistent state (registry + dedupe
+        rows) is left intact, so a restart inherits the watchers via
+        the DB rather than losing state on every signal.
+        """
+        if self._pr_watcher_registry is not None:
+            try:
+                # Use a dedicated in-memory cancel so we don't DELETE the
+                # DB rows — we want the watchers to come back after
+                # restart. Iterate a snapshot of live handles and cancel
+                # their tasks without removing from the store.
+                live_handles = list(self._pr_watcher_registry._watchers.values())
+                for live in live_handles:
+                    live.stop_event.set()
+                for live in live_handles:
+                    try:
+                        await asyncio.wait_for(live.task, timeout=3.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                        live.task.cancel()
+            except Exception as e:
+                logger.warning("developer agent: pr watcher shutdown failed: %s", e)
+        await super().shutdown()
 
     def register_skills(self):
         return [
@@ -320,6 +370,26 @@ class DeveloperAgent(BaseAgent):
                   {"cwd": {"type": "string", "required": True},
                    "ref": {"type": "string", "required": True}},
                   since="0.7.0"),
+            # Long-running PR fleet watcher (fr_developer_6c8ec260). Spawns
+            # a background poll loop and returns the watcher id immediately;
+            # pr.* bus events fire on every transition.
+            Skill("watch_pr_fleet",
+                  "Start a long-running PR watcher; publishes pr.* bus events on transitions",
+                  {"repos": {"type": "string", "required": True,
+                             "description": "comma-separated owner/name list"},
+                   "pr_numbers": {"type": "string", "default": "",
+                                  "description": "optional comma-separated PR numbers; "
+                                  "omitted watches all open PRs in each repo"},
+                   "interval_s": {"type": "integer", "default": 60}},
+                  since="0.14.0"),
+            Skill("list_pr_watchers",
+                  "List active PR watchers with their poll metadata",
+                  {},
+                  since="0.14.0"),
+            Skill("stop_pr_watcher",
+                  "Stop a PR watcher by id and clean its persistent state",
+                  {"watcher_id": {"type": "string", "required": True}},
+                  since="0.14.0"),
         ]
 
     def register_collaborations(self):
@@ -1154,6 +1224,77 @@ class DeveloperAgent(BaseAgent):
             "head_sha": readiness.head_sha,
             "url": readiness.url,
         }
+
+    # -- long-running PR fleet watcher --
+
+    @handler("watch_pr_fleet")
+    async def handle_watch_pr_fleet(self, args):
+        """Start a background PR watcher and return its id immediately.
+
+        The watcher continues polling after this skill returns — subsequent
+        ``list_pr_watchers`` / ``stop_pr_watcher`` / ``bus_wait_for_event``
+        calls interact with the already-running loop.
+        """
+        from developer.pr_watcher import parse_pr_numbers_arg, parse_repos_arg
+
+        repos = parse_repos_arg(args.get("repos"))
+        if not repos:
+            return {"error": "repos is required (comma-separated owner/name list)"}
+        try:
+            pr_numbers = parse_pr_numbers_arg(args.get("pr_numbers"))
+        except ValueError as e:
+            return {"error": str(e)}
+        raw_interval = args.get("interval_s", 60)
+        # Distinguish "caller omitted" from "caller passed 0/negative".
+        # Empty-string and None default to 60; anything else must parse
+        # cleanly and be strictly positive.
+        if raw_interval in (None, ""):
+            interval_s = 60
+        else:
+            try:
+                interval_s = int(raw_interval)
+            except (TypeError, ValueError):
+                return {"error": "interval_s must be a positive integer"}
+            if interval_s <= 0:
+                return {"error": "interval_s must be a positive integer"}
+        try:
+            watcher_id = await self.pr_watcher_registry.start(
+                repos=repos, pr_numbers=pr_numbers, interval_s=interval_s,
+            )
+        except ValueError as e:
+            return {"error": str(e)}
+        except Exception as e:
+            # Registry construction itself can fail when the DB path is
+            # unavailable (e.g. a broken config) — surface cleanly.
+            await self._safe_report_gap("watch_pr_fleet", f"watcher start failed: {e}")
+            return {"error": str(e)}
+        return {
+            "watcher_id": watcher_id,
+            "repos": repos,
+            "pr_numbers": pr_numbers,
+            "interval_s": interval_s,
+        }
+
+    @handler("list_pr_watchers")
+    async def handle_list_pr_watchers(self, args):
+        try:
+            watchers = self.pr_watcher_registry.list_watchers()
+        except Exception as e:
+            await self._safe_report_gap("list_pr_watchers", str(e))
+            return {"error": str(e)}
+        return {"count": len(watchers), "watchers": watchers}
+
+    @handler("stop_pr_watcher")
+    async def handle_stop_pr_watcher(self, args):
+        watcher_id = args.get("watcher_id", "")
+        if not watcher_id:
+            return {"error": "watcher_id is required"}
+        try:
+            stopped = await self.pr_watcher_registry.stop(watcher_id)
+        except Exception as e:
+            await self._safe_report_gap("stop_pr_watcher", str(e))
+            return {"error": str(e)}
+        return {"watcher_id": watcher_id, "stopped": stopped}
 
     async def _optional_pr_ready(self, args):
         repo = args.get("repo", "")

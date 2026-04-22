@@ -1,0 +1,856 @@
+"""Long-running PR fleet watcher.
+
+Polls GitHub for PR state across a set of repos/PRs and publishes
+``pr.*`` bus events on transitions. Subscribers consume these via
+``bus_wait_for_event`` instead of each session re-polling GitHub
+directly — one canonical watcher replaces N per-session pollers.
+
+Architecture:
+
+- :class:`PRWatcherStore` owns two SQLite tables in developer.db:
+
+  - ``pr_watcher_registry`` — one row per live watcher (id, repos,
+    explicit PR list, interval, started_at, last_poll_at).
+  - ``pr_watcher_dedupe`` — one row per emitted transition, keyed by
+    ``(watcher_id, repo, pr_number, transition_kind, dedupe_id)``.
+    Ensures a given transition fires at most once per watcher lifetime,
+    across agent restarts.
+
+- :class:`PRFleetWatcher` is the per-watcher async task. On each tick
+  it polls the configured PR set, diffs current state against prior
+  state, and calls the injected ``publish`` callable for each new
+  transition. ``publish`` is normally ``BaseAgent.publish`` wired by
+  the agent; unit tests inject a list-appending fake.
+
+- :class:`PRWatcherRegistry` is the process-level coordinator — tracks
+  live tasks, starts/stops them, serializes list queries, and owns the
+  shared :class:`PRWatcherStore`. The agent keeps a single registry
+  instance across its lifetime.
+
+Failure mode is contained: a single failing PR poll emits
+``pr.poll_error`` and the loop keeps going. Only a watcher explicitly
+stopped (or a fatal infrastructure failure) ends the task.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sqlite3
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Iterable, Optional
+
+from developer.github_client import GithubClient, GithubClientError
+
+logger = logging.getLogger(__name__)
+
+
+# Publish signature: ``async def publish(topic: str, payload: dict) -> None``.
+# Matches BaseAgent.publish; tests substitute a list-append fake.
+PublishFn = Callable[[str, dict], Awaitable[None]]
+
+
+# Bus topics this watcher publishes. Centralized as constants so
+# subscribers (and tests) can reference them without string-typos.
+TOPIC_REVIEW_LANDED = "pr.review_landed"
+TOPIC_NEW_COMMIT = "pr.new_commit"
+TOPIC_MERGED = "pr.merged"
+TOPIC_MERGE_READY = "pr.merge_ready"
+TOPIC_CLOSED_WITHOUT_MERGE = "pr.closed_without_merge"
+TOPIC_POLL_ERROR = "pr.poll_error"
+
+ALL_PR_TOPICS = (
+    TOPIC_REVIEW_LANDED,
+    TOPIC_NEW_COMMIT,
+    TOPIC_MERGED,
+    TOPIC_MERGE_READY,
+    TOPIC_CLOSED_WITHOUT_MERGE,
+    TOPIC_POLL_ERROR,
+)
+
+
+# ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pr_watcher_registry (
+    watcher_id TEXT PRIMARY KEY,
+    repos TEXT NOT NULL,
+    pr_numbers TEXT NOT NULL,
+    interval_s INTEGER NOT NULL,
+    started_at REAL NOT NULL,
+    last_poll_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS pr_watcher_dedupe (
+    watcher_id TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    transition_kind TEXT NOT NULL,
+    dedupe_id TEXT NOT NULL,
+    emitted_at REAL NOT NULL,
+    PRIMARY KEY (watcher_id, repo, pr_number, transition_kind, dedupe_id)
+);
+"""
+
+
+class PRWatcherStore:
+    """SQLite-backed persistence for watcher registry + dedupe state.
+
+    Uses the same ``developer.db`` file as the rest of developer's
+    stores (via pipeline config), but keeps its tables isolated from
+    the KnowledgeStore / TripleStore schemas. A separate connection per
+    method call matches the KnowledgeStore pattern — cheap enough for
+    per-poll writes and avoids cross-thread connection issues.
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init_schema()
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_schema(self) -> None:
+        with self._conn() as conn:
+            conn.executescript(_SCHEMA)
+
+    # -- registry --
+
+    def register_watcher(
+        self,
+        watcher_id: str,
+        repos: list[str],
+        pr_numbers: list[int],
+        interval_s: int,
+        started_at: float,
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO pr_watcher_registry
+                    (watcher_id, repos, pr_numbers, interval_s, started_at, last_poll_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    watcher_id,
+                    ",".join(repos),
+                    ",".join(str(n) for n in pr_numbers),
+                    int(interval_s),
+                    float(started_at),
+                    0.0,
+                ),
+            )
+
+    def touch_last_poll(self, watcher_id: str, at: float) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE pr_watcher_registry SET last_poll_at = ? WHERE watcher_id = ?",
+                (float(at), watcher_id),
+            )
+
+    def remove_watcher(self, watcher_id: str) -> None:
+        """Remove a watcher + all its dedupe entries.
+
+        Called on ``stop_pr_watcher``. Keeps the table from growing
+        unboundedly when callers cycle watchers.
+        """
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM pr_watcher_registry WHERE watcher_id = ?",
+                (watcher_id,),
+            )
+            conn.execute(
+                "DELETE FROM pr_watcher_dedupe WHERE watcher_id = ?",
+                (watcher_id,),
+            )
+
+    def list_watchers(self) -> list[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pr_watcher_registry ORDER BY started_at ASC"
+            ).fetchall()
+        return [
+            {
+                "watcher_id": r["watcher_id"],
+                "repos": _split_csv(r["repos"]),
+                "pr_numbers": [int(n) for n in _split_csv(r["pr_numbers"]) if n],
+                "interval_s": int(r["interval_s"]),
+                "started_at": float(r["started_at"]),
+                "last_poll_at": float(r["last_poll_at"]),
+            }
+            for r in rows
+        ]
+
+    # -- dedupe --
+
+    def has_emitted(
+        self,
+        watcher_id: str,
+        repo: str,
+        pr_number: int,
+        transition_kind: str,
+        dedupe_id: str,
+    ) -> bool:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM pr_watcher_dedupe
+                WHERE watcher_id = ? AND repo = ? AND pr_number = ?
+                  AND transition_kind = ? AND dedupe_id = ?
+                LIMIT 1
+                """,
+                (watcher_id, repo, int(pr_number), transition_kind, str(dedupe_id)),
+            ).fetchone()
+        return row is not None
+
+    def mark_emitted(
+        self,
+        watcher_id: str,
+        repo: str,
+        pr_number: int,
+        transition_kind: str,
+        dedupe_id: str,
+        at: float,
+    ) -> bool:
+        """Record a dedupe key; returns True if this was a new entry.
+
+        Uses ``INSERT OR IGNORE`` so concurrent watchers (unlikely given
+        the registry, but cheap insurance) or race-induced double-calls
+        can't double-emit. Returns False when the row already existed.
+        """
+        with self._conn() as conn:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO pr_watcher_dedupe
+                    (watcher_id, repo, pr_number, transition_kind, dedupe_id, emitted_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    watcher_id,
+                    repo,
+                    int(pr_number),
+                    transition_kind,
+                    str(dedupe_id),
+                    float(at),
+                ),
+            )
+            return cur.rowcount > 0
+
+
+def _split_csv(value: str) -> list[str]:
+    if not value:
+        return []
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+
+# ---------------------------------------------------------------------------
+# Transition detection
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PRSnapshot:
+    """Bounded view of a PR's state used for transition detection."""
+
+    repo: str
+    pr_number: int
+    head_sha: str
+    head_updated_at: str = ""
+    state: str = "open"           # open | closed
+    merged: bool = False
+    merged_at: str = ""
+    mergeable: Optional[bool] = None
+    merge_state: str = ""          # clean | blocked | dirty | ...
+    reviews: list[dict] = field(default_factory=list)
+    review_decision: str = ""      # APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED | ""
+
+    def merge_ready(self) -> bool:
+        """Strictly conservative merge-ready check.
+
+        Requires mergeable == True, a clean-ish merge state, and no
+        outstanding CHANGES_REQUESTED reviews from non-bot reviewers.
+        Intentionally doesn't try to re-derive GitHub's
+        ``review_decision`` — we only emit ``merge_ready`` once the
+        simple signals all line up.
+        """
+        if self.merged or self.state != "open":
+            return False
+        if self.mergeable is not True:
+            return False
+        if self.merge_state not in ("clean", "unstable", "has_hooks"):
+            return False
+        blocking = [
+            r for r in self.reviews
+            if str(r.get("state", "")).upper() == "CHANGES_REQUESTED"
+        ]
+        return not blocking
+
+
+# ---------------------------------------------------------------------------
+# Watcher
+# ---------------------------------------------------------------------------
+
+
+# Abstraction over GithubClient so unit tests can swap in a fake
+# without monkey-patching the module-level async calls.
+FetchSnapshotFn = Callable[[str, int], Awaitable[PRSnapshot]]
+ListOpenPRsFn = Callable[[str], Awaitable[list[int]]]
+
+
+@dataclass
+class PRWatcherConfig:
+    """Resolved inputs for a single watcher."""
+
+    watcher_id: str
+    repos: list[str]
+    pr_numbers: list[int]          # explicit list (possibly empty)
+    interval_s: int
+    started_at: float
+
+    def public_dict(self) -> dict:
+        return {
+            "id": self.watcher_id,
+            "repos": list(self.repos),
+            "pr_numbers": list(self.pr_numbers),
+            "interval_s": self.interval_s,
+            "started_at": self.started_at,
+        }
+
+
+class PRFleetWatcher:
+    """One long-running watcher instance.
+
+    Composes the persistence layer, the GH fetch surface, and the
+    bus publish callback. Owns the poll loop but not the task lifetime —
+    :class:`PRWatcherRegistry` wraps this in an asyncio Task.
+    """
+
+    def __init__(
+        self,
+        config: PRWatcherConfig,
+        store: PRWatcherStore,
+        publish: PublishFn,
+        fetch_snapshot: FetchSnapshotFn,
+        list_open_prs: ListOpenPRsFn,
+        now_fn: Callable[[], float] = time.time,
+    ):
+        self.config = config
+        self.store = store
+        self._publish = publish
+        self._fetch_snapshot = fetch_snapshot
+        self._list_open_prs = list_open_prs
+        self._now = now_fn
+        self._pr_count: int = 0
+
+    @property
+    def pr_count(self) -> int:
+        """Number of PRs observed on the most recent poll."""
+        return self._pr_count
+
+    async def _resolve_pr_set(self) -> list[tuple[str, int]]:
+        """Return ``(repo, pr_number)`` pairs to poll this cycle.
+
+        Explicit ``pr_numbers`` win when provided. They apply to every
+        listed repo (mirroring the caller's existing model of
+        "these PR numbers in these repos"). If no explicit numbers are
+        configured, we enumerate open PRs per repo via the injected
+        ``list_open_prs`` callable.
+        """
+        pairs: list[tuple[str, int]] = []
+        if self.config.pr_numbers:
+            for repo in self.config.repos:
+                for pr_number in self.config.pr_numbers:
+                    pairs.append((repo, pr_number))
+            return pairs
+        for repo in self.config.repos:
+            try:
+                open_numbers = await self._list_open_prs(repo)
+            except Exception as e:
+                await self._emit_poll_error(repo, pr_number=0, reason=str(e))
+                continue
+            for n in open_numbers:
+                pairs.append((repo, n))
+        return pairs
+
+    async def poll_once(self) -> int:
+        """Run a single poll cycle and return count of transitions emitted.
+
+        Called from the async loop; also invoked directly by tests to
+        step the watcher without sleeping.
+        """
+        pairs = await self._resolve_pr_set()
+        self._pr_count = len(pairs)
+        emitted = 0
+        for repo, pr_number in pairs:
+            try:
+                snapshot = await self._fetch_snapshot(repo, pr_number)
+            except GithubClientError as e:
+                await self._emit_poll_error(repo, pr_number, reason=str(e))
+                continue
+            except Exception as e:
+                # Keep the watcher alive through unexpected non-client
+                # errors too (e.g. transient network glitches that
+                # bubble up as raw httpx exceptions). Log and move on.
+                logger.warning(
+                    "PR watcher %s: unexpected error polling %s#%d: %s",
+                    self.config.watcher_id, repo, pr_number, e,
+                )
+                await self._emit_poll_error(repo, pr_number, reason=str(e))
+                continue
+            emitted += await self._emit_transitions(snapshot)
+        self.store.touch_last_poll(self.config.watcher_id, self._now())
+        return emitted
+
+    async def run(self, stop_event: asyncio.Event) -> None:
+        """Loop until ``stop_event`` is set.
+
+        The wait-with-timeout pattern lets stop() interrupt an in-flight
+        sleep without waiting for a full ``interval_s``.
+        """
+        while not stop_event.is_set():
+            try:
+                await self.poll_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Catastrophic: poll_once itself shouldn't raise because
+                # it handles per-PR failures, but defense in depth.
+                logger.error(
+                    "PR watcher %s: poll_once failed: %s",
+                    self.config.watcher_id, e,
+                )
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=self.config.interval_s)
+            except asyncio.TimeoutError:
+                pass
+
+    # -- emit helpers --
+
+    async def _emit_transitions(self, snapshot: PRSnapshot) -> int:
+        """Diff snapshot against stored dedupe state and publish new events."""
+        emitted = 0
+
+        # 1. New commits. dedupe_id = head_sha.
+        if snapshot.head_sha:
+            if await self._emit(
+                TOPIC_NEW_COMMIT,
+                repo=snapshot.repo,
+                pr_number=snapshot.pr_number,
+                transition_kind="new_commit",
+                dedupe_id=snapshot.head_sha,
+                payload={
+                    "repo": snapshot.repo,
+                    "pr_number": snapshot.pr_number,
+                    "head_sha": snapshot.head_sha,
+                    "pushed_at": snapshot.head_updated_at,
+                },
+            ):
+                emitted += 1
+
+        # 2. Reviews landed. dedupe_id = review_id.
+        for review in snapshot.reviews:
+            review_id = review.get("id")
+            if review_id is None:
+                continue
+            if await self._emit(
+                TOPIC_REVIEW_LANDED,
+                repo=snapshot.repo,
+                pr_number=snapshot.pr_number,
+                transition_kind="review_landed",
+                dedupe_id=str(review_id),
+                payload={
+                    "repo": snapshot.repo,
+                    "pr_number": snapshot.pr_number,
+                    "reviewer": review.get("reviewer", ""),
+                    "state": review.get("state", ""),
+                    "submitted_at": review.get("submitted_at", ""),
+                    "review_id": review_id,
+                },
+            ):
+                emitted += 1
+
+        # 3. Merged. dedupe_id = merged_at timestamp (stable once set).
+        if snapshot.merged and snapshot.merged_at:
+            if await self._emit(
+                TOPIC_MERGED,
+                repo=snapshot.repo,
+                pr_number=snapshot.pr_number,
+                transition_kind="merged",
+                dedupe_id=snapshot.merged_at,
+                payload={
+                    "repo": snapshot.repo,
+                    "pr_number": snapshot.pr_number,
+                    "merged_at": snapshot.merged_at,
+                },
+            ):
+                emitted += 1
+            # A merged PR is also terminal; don't emit merge_ready after
+            # the fact and don't emit closed_without_merge.
+            return emitted
+
+        # 4. Closed without merge. dedupe_id = literal "closed" (fires once).
+        if snapshot.state == "closed" and not snapshot.merged:
+            if await self._emit(
+                TOPIC_CLOSED_WITHOUT_MERGE,
+                repo=snapshot.repo,
+                pr_number=snapshot.pr_number,
+                transition_kind="closed_without_merge",
+                dedupe_id="closed",
+                payload={
+                    "repo": snapshot.repo,
+                    "pr_number": snapshot.pr_number,
+                },
+            ):
+                emitted += 1
+            return emitted
+
+        # 5. Merge-ready. dedupe_id = head_sha so a fresh commit can
+        #    retrigger the merge-ready signal after new review.
+        if snapshot.merge_ready() and snapshot.head_sha:
+            if await self._emit(
+                TOPIC_MERGE_READY,
+                repo=snapshot.repo,
+                pr_number=snapshot.pr_number,
+                transition_kind="merge_ready",
+                dedupe_id=snapshot.head_sha,
+                payload={
+                    "repo": snapshot.repo,
+                    "pr_number": snapshot.pr_number,
+                },
+            ):
+                emitted += 1
+
+        return emitted
+
+    async def _emit(
+        self,
+        topic: str,
+        *,
+        repo: str,
+        pr_number: int,
+        transition_kind: str,
+        dedupe_id: str,
+        payload: dict,
+    ) -> bool:
+        """Persist dedupe key then publish; skip if already emitted.
+
+        The persist-before-publish ordering means a publish failure still
+        leaves a dedupe record (we won't retry the same key). That's
+        preferable to the alternative — re-emitting on every restart
+        until publish succeeds would flood subscribers with duplicates.
+        Operators see the publish failure in logs.
+        """
+        is_new = self.store.mark_emitted(
+            watcher_id=self.config.watcher_id,
+            repo=repo,
+            pr_number=pr_number,
+            transition_kind=transition_kind,
+            dedupe_id=dedupe_id,
+            at=self._now(),
+        )
+        if not is_new:
+            return False
+        try:
+            await self._publish(topic, payload)
+        except Exception as e:
+            logger.warning(
+                "PR watcher %s: publish %s failed: %s",
+                self.config.watcher_id, topic, e,
+            )
+        return True
+
+    async def _emit_poll_error(self, repo: str, pr_number: int, reason: str) -> None:
+        """Low-severity error signal — never deduped (reset per poll).
+
+        Intentionally not persisted: poll errors are per-tick and
+        callers typically only care about the current failure mode.
+        Deduping across a restart would mask persistent breakage.
+        """
+        try:
+            await self._publish(
+                TOPIC_POLL_ERROR,
+                {
+                    "repo": repo,
+                    "pr_number": pr_number,
+                    "watcher_id": self.config.watcher_id,
+                    "reason": reason,
+                    "at": self._now(),
+                },
+            )
+        except Exception as e:
+            logger.warning(
+                "PR watcher %s: publish pr.poll_error failed: %s",
+                self.config.watcher_id, e,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Registry (process-level)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _LiveWatcher:
+    """In-memory handle wrapping the watcher + its stop event + task."""
+
+    watcher: PRFleetWatcher
+    stop_event: asyncio.Event
+    task: asyncio.Task
+
+
+class PRWatcherRegistry:
+    """Owns the set of active watchers on a single agent process.
+
+    The agent constructs one of these at first use (lazily) and reuses
+    it across ``watch_pr_fleet`` / ``list_pr_watchers`` /
+    ``stop_pr_watcher`` calls. ``factory`` is how the registry builds a
+    watcher from its config — normally ``_default_factory`` wiring to
+    :class:`GithubClient`, but tests inject a fake factory.
+    """
+
+    def __init__(
+        self,
+        store: PRWatcherStore,
+        publish: PublishFn,
+        factory: Optional[Callable[[PRWatcherConfig], PRFleetWatcher]] = None,
+    ):
+        self.store = store
+        self._publish = publish
+        self._factory = factory or self._default_factory
+        self._watchers: dict[str, _LiveWatcher] = {}
+        # Guard against concurrent start/stop calls mutating the dict
+        # while the agent is processing multiple bus requests.
+        self._lock = asyncio.Lock()
+
+    async def start(
+        self,
+        *,
+        repos: list[str],
+        pr_numbers: list[int],
+        interval_s: int,
+    ) -> str:
+        """Create + schedule a watcher. Returns its id."""
+        if not repos:
+            raise ValueError("repos must be non-empty")
+        if interval_s <= 0:
+            raise ValueError("interval_s must be positive")
+        watcher_id = _new_watcher_id()
+        config = PRWatcherConfig(
+            watcher_id=watcher_id,
+            repos=list(repos),
+            pr_numbers=list(pr_numbers),
+            interval_s=interval_s,
+            started_at=time.time(),
+        )
+        watcher = self._factory(config)
+        self.store.register_watcher(
+            watcher_id=config.watcher_id,
+            repos=config.repos,
+            pr_numbers=config.pr_numbers,
+            interval_s=config.interval_s,
+            started_at=config.started_at,
+        )
+        stop_event = asyncio.Event()
+        task = asyncio.create_task(
+            watcher.run(stop_event), name=f"pr_watcher_{watcher_id}"
+        )
+        async with self._lock:
+            self._watchers[watcher_id] = _LiveWatcher(
+                watcher=watcher, stop_event=stop_event, task=task,
+            )
+        return watcher_id
+
+    async def stop(self, watcher_id: str) -> bool:
+        """Cancel the watcher task and remove persistent state.
+
+        Returns True if a matching watcher was stopped, False if unknown.
+        """
+        async with self._lock:
+            live = self._watchers.pop(watcher_id, None)
+        if live is None:
+            # Still remove DB state in case a previous restart left it
+            # dangling — stop should be idempotent and cleaning.
+            self.store.remove_watcher(watcher_id)
+            return False
+        live.stop_event.set()
+        try:
+            await asyncio.wait_for(live.task, timeout=5.0)
+        except asyncio.TimeoutError:
+            live.task.cancel()
+            try:
+                await live.task
+            except (asyncio.CancelledError, Exception):
+                pass
+        except Exception:
+            pass
+        self.store.remove_watcher(watcher_id)
+        return True
+
+    def list_watchers(self) -> list[dict]:
+        """List live watchers with their poll metadata.
+
+        Reads from the persistent store so registry membership matches
+        the DB even under replica/restore scenarios. Adds ``pr_count``
+        from the live in-memory watcher when available; defaults to 0
+        otherwise.
+        """
+        rows = self.store.list_watchers()
+        for row in rows:
+            live = self._watchers.get(row["watcher_id"])
+            row["pr_count"] = live.watcher.pr_count if live else 0
+        return rows
+
+    async def shutdown(self) -> None:
+        """Cancel every live watcher (called on agent shutdown)."""
+        ids = list(self._watchers.keys())
+        for watcher_id in ids:
+            try:
+                await self.stop(watcher_id)
+            except Exception as e:
+                logger.warning("registry shutdown: stop %s failed: %s", watcher_id, e)
+
+    def _default_factory(self, config: PRWatcherConfig) -> PRFleetWatcher:
+        """Wire a watcher against the real :class:`GithubClient`."""
+        gh = GithubClient()
+
+        async def fetch_snapshot(repo: str, pr_number: int) -> PRSnapshot:
+            return await _snapshot_from_github(gh, repo, pr_number)
+
+        async def list_open_prs(repo: str) -> list[int]:
+            return await _list_open_pr_numbers(gh, repo)
+
+        return PRFleetWatcher(
+            config=config,
+            store=self.store,
+            publish=self._publish,
+            fetch_snapshot=fetch_snapshot,
+            list_open_prs=list_open_prs,
+        )
+
+
+def _new_watcher_id() -> str:
+    return f"prw_{uuid.uuid4().hex[:12]}"
+
+
+# ---------------------------------------------------------------------------
+# GitHub fetch helpers
+# ---------------------------------------------------------------------------
+
+
+async def _snapshot_from_github(
+    gh: GithubClient, repo: str, pr_number: int,
+) -> PRSnapshot:
+    """Fetch PR metadata + reviews and compose a :class:`PRSnapshot`.
+
+    Uses :meth:`GithubClient.get_pr` for PR state and
+    :meth:`GithubClient.list_pr_reviews` for reviews. Both share the
+    same async client and the same auth discovery path (``GITHUB_TOKEN``
+    → ``GH_TOKEN`` → unauthenticated) — no separate credential surface.
+    """
+    pr = await gh.get_pr(repo, pr_number)
+    reviews_raw = await gh.list_pr_reviews(repo, pr_number)
+    reviews = [
+        {
+            "id": r.id,
+            "reviewer": r.reviewer,
+            "state": r.state,
+            "submitted_at": r.submitted_at or "",
+        }
+        for r in reviews_raw
+    ]
+    merged = bool(pr.get("state") == "closed" and _pr_was_merged(pr))
+    merged_at = _extract_merged_at(pr)
+    return PRSnapshot(
+        repo=repo,
+        pr_number=pr_number,
+        head_sha=str(pr.get("head_sha") or ""),
+        state=str(pr.get("state") or "open"),
+        merged=merged,
+        merged_at=merged_at,
+        mergeable=pr.get("mergeable"),
+        merge_state=str(pr.get("mergeable_state") or ""),
+        reviews=reviews,
+    )
+
+
+def _pr_was_merged(pr: dict) -> bool:
+    """Best-effort "was this PR merged" derivation from get_pr output.
+
+    ``GithubClient.get_pr`` returns a bounded dict that doesn't currently
+    surface ``merged`` or ``merged_at``. Since adding those fields would
+    widen the reusable public API, we treat a closed PR as merged only
+    when it has an explicit ``merged_at`` in the raw dict. Callers that
+    need stricter semantics can extend get_pr in a follow-up.
+    """
+    return bool(pr.get("merged") or pr.get("merged_at"))
+
+
+def _extract_merged_at(pr: dict) -> str:
+    raw = pr.get("merged_at")
+    if raw is None:
+        return ""
+    return str(raw)
+
+
+async def _list_open_pr_numbers(gh: GithubClient, repo: str) -> list[int]:
+    """Enumerate open PRs in ``repo``.
+
+    Uses githubkit's REST pulls.list with ``state=open``. No author
+    filter: the FR's "authored by configured GH identity" variant is
+    deferred — callers who need author filtering pass ``pr_numbers``
+    explicitly today. The shape stays compatible so a future
+    enhancement can slot in without breaking the current skill.
+    """
+    client = gh._client()
+    owner, name = GithubClient._split_repo(repo)
+    try:
+        resp = await client.rest.pulls.async_list(
+            owner=owner, repo=name, state="open", per_page=100,
+        )
+    except Exception as e:
+        raise GithubClientError(f"list_open_prs({repo}): {e}") from e
+    return [pr.number for pr in resp.parsed_data]
+
+
+# ---------------------------------------------------------------------------
+# Utilities used by the skill layer (argument parsing)
+# ---------------------------------------------------------------------------
+
+
+def parse_repos_arg(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [v.strip() for v in str(value).split(",") if v.strip()]
+
+
+def parse_pr_numbers_arg(value: Any) -> list[int]:
+    """Parse ``pr_numbers`` from bus args (list or comma-separated).
+
+    Rejects non-integer entries with :class:`ValueError` so the caller
+    learns about the typo instead of silently ignoring it.
+    """
+    if value is None or value == "":
+        return []
+    if isinstance(value, list):
+        parts: Iterable[Any] = value
+    else:
+        parts = str(value).split(",")
+    result: list[int] = []
+    for part in parts:
+        s = str(part).strip()
+        if not s:
+            continue
+        try:
+            result.append(int(s))
+        except ValueError as e:
+            raise ValueError(f"pr_numbers contains non-integer {part!r}") from e
+    return result
