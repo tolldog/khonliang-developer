@@ -1754,7 +1754,13 @@ def _match_tokens(text: str) -> set[str]:
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="khonliang-developer bus agent")
+    from khonliang_bus import add_version_flag
+
+    parser = argparse.ArgumentParser(
+        prog="developer.agent",
+        description="khonliang-developer bus agent",
+    )
+    add_version_flag(parser)
     parser.add_argument("command", nargs="?", choices=["install", "uninstall"])
     parser.add_argument("--id", default="developer-primary")
     parser.add_argument("--bus", default="http://localhost:8787")

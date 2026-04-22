@@ -1,6 +1,6 @@
 [project]
 name = "khonliang-developer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Development lifecycle MCP server — consumes the khonliang corpus to produce specs, milestones, FRs, worktrees, and dispatched work units"
 requires-python = ">=3.11"
 # Dependency pinning convention (MS-01):
