@@ -33,11 +33,11 @@ class DeveloperAgent(BaseAgent):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._pipeline = None  # lazy init
-        try:
-            from importlib.metadata import version
-            self.version = version("khonliang-developer")
-        except Exception:
-            self.version = "0.1.0"
+        # Version is set by BaseAgent.__init__ via khonliang_bus.resolve_version
+        # (pyproject walk → importlib.metadata → default). We used to duplicate
+        # the metadata lookup here with a hardcoded "0.1.0" fallback, but that
+        # both shadowed BaseAgent's fresher on-disk read AND drifted silently
+        # when pyproject was bumped without touching this string.
 
     @property
     def pipeline(self):

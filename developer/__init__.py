@@ -7,4 +7,6 @@ external knowledge into it.
 See CLAUDE.md for the architecture boundary and ecosystem position.
 """
 
-__version__ = "0.1.0"
+from khonliang_bus import resolve_version as _resolve_version
+
+__version__ = _resolve_version(__name__) or "0.0.0"
