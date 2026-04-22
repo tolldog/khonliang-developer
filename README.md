@@ -105,6 +105,10 @@ repository names, the `X`/`X-lib` rule, import/dependency rules, bus-native
 skill registration requirements, version reset policy, and removal-last cleanup
 order.
 
+The first repo-level execution checklist for that model lives in
+`docs/ecosystem-audit-matrix.md`. It records the current repo inventory,
+integration modes, config-hygiene state, and ordered migration targets.
+
 - `khonliang-bus-lib` provides the agent SDK and skill contracts.
 - `khonliang-bus` provides the long-running bus service and artifact routing.
 - `khonliang-researcher-lib` provides reusable research primitives.
