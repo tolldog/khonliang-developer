@@ -262,6 +262,77 @@ async def test_merged_fires_once_and_suppresses_merge_ready(store):
     assert TOPIC_MERGE_READY not in topics
 
 
+async def test_merged_transition_driven_by_real_github_client_shape(store):
+    """End-to-end: drive ``pr.merged`` through ``_snapshot_from_github``
+    with a real :class:`GithubClient` wrapping a fake githubkit surface.
+
+    Regression guard for ``fr_developer_207ff0fb``: before that FR,
+    :meth:`GithubClient.get_pr` dropped ``merged``/``merged_at`` from
+    its projection, so even if the upstream GitHub response said the
+    PR was merged, the watcher could never fire ``pr.merged``. This
+    test builds the dict through the real client code path and
+    confirms the transition lands with a non-empty ``merged_at`` in
+    the payload — i.e. the projection now carries the fields and the
+    helpers in :mod:`developer.pr_watcher` read them correctly.
+    """
+    from developer.github_client import GithubClient
+    from developer.pr_watcher import _snapshot_from_github
+
+    from tests.test_github_client import _FakePR, _install_fake_gh
+
+    client = GithubClient(token="t")
+    _install_fake_gh(client, pr=_FakePR(
+        number=36,
+        state="closed",
+        head_sha="final_sha",
+        mergeable=True,
+        mergeable_state="clean",
+        merged=True,
+        merged_at="2026-04-21T12:00:00Z",
+    ))
+
+    published: list[tuple[str, dict]] = []
+
+    async def fetch_snapshot(repo: str, pr_number: int):
+        return await _snapshot_from_github(client, repo, pr_number)
+
+    async def list_open_prs(repo: str) -> list[int]:
+        return []
+
+    async def publish(topic: str, payload: dict) -> None:
+        published.append((topic, dict(payload)))
+
+    config = PRWatcherConfig(
+        watcher_id="prw_merged_e2e",
+        repos=["owner/repo"],
+        pr_numbers=[36],
+        interval_s=60,
+        started_at=0.0,
+    )
+    store.register_watcher(
+        watcher_id=config.watcher_id,
+        repos=config.repos,
+        pr_numbers=config.pr_numbers,
+        interval_s=config.interval_s,
+        started_at=config.started_at,
+    )
+    watcher = PRFleetWatcher(
+        config=config,
+        store=store,
+        publish=publish,
+        fetch_snapshot=fetch_snapshot,
+        list_open_prs=list_open_prs,
+        now_fn=lambda: 0.0,
+    )
+
+    await watcher.poll_once()
+
+    merged_events = [p for t, p in published if t == TOPIC_MERGED]
+    assert len(merged_events) == 1
+    assert merged_events[0]["merged_at"] == "2026-04-21T12:00:00Z"
+    assert merged_events[0]["pr_number"] == 36
+
+
 async def test_merge_ready_fires_when_conditions_align(store):
     gh = _FakeGithub()
     published: list[tuple[str, dict]] = []

@@ -881,13 +881,13 @@ async def _snapshot_from_github(
 
 
 def _pr_was_merged(pr: dict) -> bool:
-    """Best-effort "was this PR merged" derivation from get_pr output.
+    """Was this PR merged? Derivation from get_pr output.
 
-    ``GithubClient.get_pr`` returns a bounded dict that doesn't currently
-    surface ``merged`` or ``merged_at``. Since adding those fields would
-    widen the reusable public API, we treat a closed PR as merged only
-    when it has an explicit ``merged_at`` in the raw dict. Callers that
-    need stricter semantics can extend get_pr in a follow-up.
+    As of ``fr_developer_207ff0fb``, :meth:`GithubClient.get_pr`
+    surfaces both ``merged`` (bool) and ``merged_at`` (ISO8601 str or
+    ``None``). We accept either signal — ``merged=True`` alone, or a
+    non-null ``merged_at`` — so the helper stays tolerant of older
+    dict shapes still produced in tests or other call paths.
     """
     return bool(pr.get("merged") or pr.get("merged_at"))
 
