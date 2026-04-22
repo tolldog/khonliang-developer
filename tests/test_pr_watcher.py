@@ -305,6 +305,74 @@ async def test_merge_ready_suppressed_when_changes_requested(store):
     assert TOPIC_MERGE_READY not in _topics(published)
 
 
+def test_merge_ready_ignores_bot_changes_requested():
+    """FR semantics: bot CHANGES_REQUESTED shouldn't block merge_ready.
+
+    Matches the docstring promise — filter is by user.type=="Bot" OR
+    login endswith [bot] OR reviewer-string endswith [bot]. A human
+    CHANGES_REQUESTED still blocks; only bot ones are advisory.
+    """
+    # Raw GH shape with user dict + type=Bot.
+    snap = _make_snapshot(
+        head_sha="s",
+        mergeable=True,
+        merge_state="clean",
+        reviews=[{
+            "id": 1,
+            "reviewer": "copilot-pull-request-reviewer[bot]",
+            "user": {"type": "Bot", "login": "copilot-pull-request-reviewer[bot]"},
+            "state": "CHANGES_REQUESTED",
+            "submitted_at": "now",
+        }],
+    )
+    assert snap.merge_ready() is True
+
+    # Normalized flat shape (as emitted by _snapshot_from_github):
+    # reviewer string endswith [bot].
+    snap_flat = _make_snapshot(
+        head_sha="s",
+        mergeable=True,
+        merge_state="clean",
+        reviews=[{
+            "id": 1,
+            "reviewer": "copilot-pull-request-reviewer[bot]",
+            "state": "CHANGES_REQUESTED",
+            "submitted_at": "now",
+        }],
+    )
+    assert snap_flat.merge_ready() is True
+
+    # Human CHANGES_REQUESTED still blocks.
+    snap_human = _make_snapshot(
+        head_sha="s",
+        mergeable=True,
+        merge_state="clean",
+        reviews=[{
+            "id": 2,
+            "reviewer": "tolldog",
+            "state": "CHANGES_REQUESTED",
+            "submitted_at": "now",
+        }],
+    )
+    assert snap_human.merge_ready() is False
+
+
+async def test_new_commit_payload_has_no_pushed_at_field(store):
+    """Regression guard: earlier versions emitted a ``pushed_at`` field
+    that was always empty because GithubClient.get_pr() doesn't return
+    a push timestamp. Subscribers should not find a blank dead field.
+    """
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published, watcher_id="prw_nopush")
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(head_sha="abc")
+    await watcher.poll_once()
+    new_commit_payloads = [p for t, p in published if t == TOPIC_NEW_COMMIT]
+    assert len(new_commit_payloads) == 1
+    assert "pushed_at" not in new_commit_payloads[0]
+    assert new_commit_payloads[0]["head_sha"] == "abc"
+
+
 # ---------------------------------------------------------------------------
 # Failure-mode isolation and poll-error emission.
 # ---------------------------------------------------------------------------
@@ -372,6 +440,141 @@ async def test_dedupe_survives_restart(tmp_path):
     watcher_b = _make_watcher(store_b, gh, pub_b, watcher_id="prw_persist")
     await watcher_b.poll_once()
     assert pub_b == [], "restarted watcher re-emitted a previously-emitted transition"
+
+
+async def test_registry_rehydrate_respawns_without_reemitting(tmp_path):
+    """FR fr_developer_6c8ec260 guarantee: on agent restart, the
+    registry's persisted rows are rehydrated as live tasks that reuse
+    the same ``watcher_id`` so the dedupe table applies and events
+    observed before the restart do NOT fire again.
+    """
+    db = str(tmp_path / "pr_watcher.db")
+    gh = _FakeGithub()
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(head_sha="stable_sha")
+
+    published_a: list[tuple[str, dict]] = []
+
+    async def publish_a(topic: str, payload: dict) -> None:
+        published_a.append((topic, dict(payload)))
+
+    # First incarnation: start a watcher, let it poll once, stop the
+    # task (but DO NOT call registry.stop — that would delete the row;
+    # we want to simulate a crash/clean shutdown that keeps persisted
+    # state like DeveloperAgent.shutdown does).
+    store_a = PRWatcherStore(db)
+
+    def factory_a(config: PRWatcherConfig) -> PRFleetWatcher:
+        return PRFleetWatcher(
+            config=config,
+            store=store_a,
+            publish=publish_a,
+            fetch_snapshot=gh.fetch_snapshot,
+            list_open_prs=gh.list_open_prs,
+        )
+
+    registry_a = PRWatcherRegistry(
+        store=store_a, publish=publish_a, factory=factory_a,
+    )
+    watcher_id = await registry_a.start(
+        repos=["owner/repo"], pr_numbers=[1], interval_s=60,
+    )
+    # Drive a poll so events land + dedupe rows are persisted.
+    live_a = registry_a._watchers[watcher_id]
+    await live_a.watcher.poll_once()
+    assert _topics(published_a) == [TOPIC_NEW_COMMIT]
+
+    # Simulate "agent shutdown preserves DB": cancel the task but leave
+    # the registry row intact.
+    live_a.stop_event.set()
+    live_a.task.cancel()
+    try:
+        await live_a.task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    # Second incarnation: fresh registry against the same DB. rehydrate
+    # should discover the persisted row and respawn the watcher with
+    # the same id — and the dedupe table should suppress the previously
+    # emitted pr.new_commit event.
+    store_b = PRWatcherStore(db)
+    published_b: list[tuple[str, dict]] = []
+
+    async def publish_b(topic: str, payload: dict) -> None:
+        published_b.append((topic, dict(payload)))
+
+    def factory_b(config: PRWatcherConfig) -> PRFleetWatcher:
+        # Assert the rehydrated watcher reuses the persisted id.
+        assert config.watcher_id == watcher_id
+        return PRFleetWatcher(
+            config=config,
+            store=store_b,
+            publish=publish_b,
+            fetch_snapshot=gh.fetch_snapshot,
+            list_open_prs=gh.list_open_prs,
+        )
+
+    registry_b = PRWatcherRegistry(
+        store=store_b, publish=publish_b, factory=factory_b,
+    )
+    spawned = await registry_b.rehydrate()
+    assert spawned == [watcher_id]
+
+    # Drive one poll on the rehydrated watcher; no event should fire.
+    live_b = registry_b._watchers[watcher_id]
+    await live_b.watcher.poll_once()
+    assert published_b == [], (
+        "rehydrated watcher re-emitted transition already observed pre-restart"
+    )
+
+    # A genuinely new transition (force-push to new head_sha) must
+    # still fire exactly once — rehydration must not stop new work.
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(head_sha="fresh_sha")
+    await live_b.watcher.poll_once()
+    assert _topics(published_b) == [TOPIC_NEW_COMMIT]
+    assert published_b[0][1]["head_sha"] == "fresh_sha"
+
+    # Clean up the live task (stop without touching state semantics).
+    await registry_b.stop(watcher_id)
+
+
+async def test_registry_rehydrate_is_idempotent(tmp_path):
+    """rehydrate() twice in a row must not double-spawn a live task."""
+    db = str(tmp_path / "pr_watcher.db")
+    store = PRWatcherStore(db)
+    store.register_watcher(
+        watcher_id="prw_persisted",
+        repos=["owner/repo"],
+        pr_numbers=[1],
+        interval_s=60,
+        started_at=0.0,
+    )
+
+    published: list[tuple[str, dict]] = []
+
+    async def publish(topic: str, payload: dict) -> None:
+        published.append((topic, dict(payload)))
+
+    gh = _FakeGithub()
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(head_sha="x")
+
+    def factory(config: PRWatcherConfig) -> PRFleetWatcher:
+        return PRFleetWatcher(
+            config=config,
+            store=store,
+            publish=publish,
+            fetch_snapshot=gh.fetch_snapshot,
+            list_open_prs=gh.list_open_prs,
+        )
+
+    registry = PRWatcherRegistry(store=store, publish=publish, factory=factory)
+    first = await registry.rehydrate()
+    second = await registry.rehydrate()
+    try:
+        assert first == ["prw_persisted"]
+        assert second == [], "second rehydrate double-spawned an already-live watcher"
+        assert len(registry._watchers) == 1
+    finally:
+        await registry.stop("prw_persisted")
 
 
 # ---------------------------------------------------------------------------
@@ -571,3 +774,122 @@ async def test_watch_pr_fleet_skill_starts_watcher(harness, monkeypatch):
             "stop_pr_watcher", {"watcher_id": result["watcher_id"]},
         )
         assert stop_result["stopped"] is True
+
+
+async def test_agent_restart_rehydrates_and_does_not_reemit(temp_config_file):
+    """End-to-end FR guarantee (fr_developer_6c8ec260):
+
+    (a) start a watcher via the skill,
+    (b) let it emit some events,
+    (c) "restart" the agent (new DeveloperAgent against the same DB),
+    (d) verify the watcher is back running and does NOT re-emit
+        transitions observed before the restart.
+
+    This test exercises PRWatcherRegistry.rehydrate() through the agent
+    path (rather than in isolation) so a future refactor that skips the
+    rehydrate call still fails here.
+    """
+    # Shared config + DB path across both agent incarnations.
+    cfg_path = temp_config_file()
+
+    gh = _FakeGithub()
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(head_sha="pre_restart_sha")
+
+    # -- incarnation A --------------------------------------------------
+    harness_a = AgentTestHarness(DeveloperAgent, config_path=str(cfg_path))
+    published_a: list[tuple[str, dict]] = []
+
+    async def publish_a(topic: str, payload: dict) -> None:
+        published_a.append((topic, dict(payload)))
+
+    harness_a.agent.publish = publish_a  # type: ignore[method-assign]
+    registry_a = harness_a.agent.pr_watcher_registry
+
+    def factory_a(config: PRWatcherConfig) -> PRFleetWatcher:
+        return PRFleetWatcher(
+            config=config,
+            store=registry_a.store,
+            publish=publish_a,
+            fetch_snapshot=gh.fetch_snapshot,
+            list_open_prs=gh.list_open_prs,
+        )
+
+    registry_a._factory = factory_a
+
+    result = await harness_a.call(
+        "watch_pr_fleet",
+        {"repos": "owner/repo", "pr_numbers": "1", "interval_s": 60},
+    )
+    watcher_id = result["watcher_id"]
+
+    # Wait for at least one poll to land so we actually have something
+    # to dedupe against on the next incarnation.
+    for _ in range(50):
+        if published_a:
+            break
+        await asyncio.sleep(0.01)
+    assert _topics(published_a) == [TOPIC_NEW_COMMIT]
+
+    # "Shutdown preserving DB": cancel the live task but keep the
+    # registry row (mirrors DeveloperAgent.shutdown). We can't call
+    # real shutdown through the harness because it'd also try to
+    # close a connector we never opened.
+    live = registry_a._watchers.pop(watcher_id)
+    live.stop_event.set()
+    live.task.cancel()
+    try:
+        await live.task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    # -- incarnation B --------------------------------------------------
+    harness_b = AgentTestHarness(DeveloperAgent, config_path=str(cfg_path))
+    published_b: list[tuple[str, dict]] = []
+
+    async def publish_b(topic: str, payload: dict) -> None:
+        published_b.append((topic, dict(payload)))
+
+    harness_b.agent.publish = publish_b  # type: ignore[method-assign]
+    registry_b = harness_b.agent.pr_watcher_registry
+
+    def factory_b(config: PRWatcherConfig) -> PRFleetWatcher:
+        # Sanity: the rehydrated watcher reuses the persisted id.
+        assert config.watcher_id == watcher_id
+        return PRFleetWatcher(
+            config=config,
+            store=registry_b.store,
+            publish=publish_b,
+            fetch_snapshot=gh.fetch_snapshot,
+            list_open_prs=gh.list_open_prs,
+        )
+
+    registry_b._factory = factory_b
+
+    # Trigger rehydration. The agent.start() override drives this on a
+    # real run; call directly here so we don't spin up a full bus.
+    spawned = await registry_b.rehydrate()
+    assert spawned == [watcher_id], (
+        "rehydrate did not respawn the persisted watcher"
+    )
+
+    try:
+        # Watcher is back up. Poll it once; no event should re-emit.
+        live_b = registry_b._watchers[watcher_id]
+        await live_b.watcher.poll_once()
+        assert published_b == [], (
+            "post-restart watcher re-emitted a pre-restart transition; "
+            "dedupe key reuse is broken"
+        )
+
+        # A genuinely new transition (force-push) still fires.
+        gh.snapshots[("owner/repo", 1)] = _make_snapshot(head_sha="post_restart_sha")
+        await live_b.watcher.poll_once()
+        assert _topics(published_b) == [TOPIC_NEW_COMMIT]
+        assert published_b[0][1]["head_sha"] == "post_restart_sha"
+
+        # list_pr_watchers sees the rehydrated row.
+        listed = await harness_b.call("list_pr_watchers", {})
+        assert listed["count"] == 1
+        assert listed["watchers"][0]["watcher_id"] == watcher_id
+    finally:
+        await harness_b.call("stop_pr_watcher", {"watcher_id": watcher_id})

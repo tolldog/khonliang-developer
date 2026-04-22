@@ -255,6 +255,29 @@ def _split_csv(value: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _review_is_from_bot(review: dict) -> bool:
+    """Detect whether a review row originates from a bot reviewer.
+
+    Two signals, either sufficient: GitHub's user ``type`` equals
+    ``"Bot"``, or the login ends in ``"[bot]"`` (matches both the raw
+    GH representation and the resolved format seen in some surfaces).
+    The reviewer metadata may be stored either as a nested ``user``
+    sub-dict (raw GH shape) or as a flat ``reviewer`` string (our
+    snapshot normalization in :func:`_snapshot_from_github`); we
+    check both so ``merge_ready`` stays robust to either shape.
+    """
+    user = review.get("user")
+    if isinstance(user, dict):
+        if str(user.get("type", "")).upper() == "BOT":
+            return True
+        if str(user.get("login", "")).lower().endswith("[bot]"):
+            return True
+    reviewer = str(review.get("reviewer", "")).lower()
+    if reviewer.endswith("[bot]"):
+        return True
+    return False
+
+
 @dataclass
 class PRSnapshot:
     """Bounded view of a PR's state used for transition detection."""
@@ -262,7 +285,6 @@ class PRSnapshot:
     repo: str
     pr_number: int
     head_sha: str
-    head_updated_at: str = ""
     state: str = "open"           # open | closed
     merged: bool = False
     merged_at: str = ""
@@ -279,6 +301,13 @@ class PRSnapshot:
         Intentionally doesn't try to re-derive GitHub's
         ``review_decision`` — we only emit ``merge_ready`` once the
         simple signals all line up.
+
+        Bot CHANGES_REQUESTED (e.g. a Copilot re-review block) is
+        filtered out here because GitHub-style review gates treat bot
+        reviews as advisory; a human approval with a bot block still
+        represents a merge-ready state under the FR's intended
+        semantics. Bot identity is detected by the review's ``user``
+        sub-dict: ``type == "Bot"`` OR a login ending in ``[bot]``.
         """
         if self.merged or self.state != "open":
             return False
@@ -289,6 +318,7 @@ class PRSnapshot:
         blocking = [
             r for r in self.reviews
             if str(r.get("state", "")).upper() == "CHANGES_REQUESTED"
+            and not _review_is_from_bot(r)
         ]
         return not blocking
 
@@ -438,6 +468,13 @@ class PRFleetWatcher:
         emitted = 0
 
         # 1. New commits. dedupe_id = head_sha.
+        # NOTE: we intentionally don't include a ``pushed_at`` timestamp.
+        # :meth:`GithubClient.get_pr` doesn't currently surface a commit
+        # push time (would need a follow-up call to the commits endpoint),
+        # and an always-empty field would invite subscribers to build on
+        # a guarantee we can't keep. If a consumer ever needs the push
+        # time, extend GithubClient + :class:`PRSnapshot` together and
+        # re-introduce the field with a real value.
         if snapshot.head_sha:
             if await self._emit(
                 TOPIC_NEW_COMMIT,
@@ -449,7 +486,6 @@ class PRFleetWatcher:
                     "repo": snapshot.repo,
                     "pr_number": snapshot.pr_number,
                     "head_sha": snapshot.head_sha,
-                    "pushed_at": snapshot.head_updated_at,
                 },
             ):
                 emitted += 1
@@ -641,31 +677,95 @@ class PRWatcherRegistry:
             raise ValueError("repos must be non-empty")
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
-        watcher_id = _new_watcher_id()
         config = PRWatcherConfig(
-            watcher_id=watcher_id,
+            watcher_id=_new_watcher_id(),
             repos=list(repos),
             pr_numbers=list(pr_numbers),
             interval_s=interval_s,
             started_at=time.time(),
         )
+        await self._spawn(config, persist=True)
+        return config.watcher_id
+
+    async def rehydrate(self) -> list[str]:
+        """Resume every persisted watcher as a live task.
+
+        Called on agent startup so that an agent restart picks up
+        watchers the user previously started without them re-emitting
+        already-seen transitions — the dedupe table is keyed by
+        ``watcher_id`` and we reuse the same id here. Returns the list
+        of watcher ids that were spawned (may be empty if nothing was
+        persisted or if every row was already live).
+
+        Idempotent: calling ``rehydrate()`` twice won't double-spawn a
+        live watcher (the in-memory ``_watchers`` map is the source of
+        truth for "already running"). This matters for the odd case
+        where the caller ran ``start`` before ``rehydrate`` — we don't
+        want to clobber a freshly-spawned task.
+        """
+        spawned: list[str] = []
+        rows = self.store.list_watchers()
+        for row in rows:
+            watcher_id = row["watcher_id"]
+            # Skip anything we've already got a live task for — re-spawn
+            # of an already-running watcher would leak the prior task
+            # and risk duplicate publishes even with dedupe.
+            async with self._lock:
+                if watcher_id in self._watchers:
+                    continue
+            config = PRWatcherConfig(
+                watcher_id=watcher_id,
+                repos=list(row["repos"]),
+                pr_numbers=list(row["pr_numbers"]),
+                interval_s=int(row["interval_s"]),
+                started_at=float(row["started_at"]),
+            )
+            # persist=False: the registry row already exists, and
+            # rewriting it would reset last_poll_at and started_at.
+            await self._spawn(config, persist=False)
+            spawned.append(watcher_id)
+        return spawned
+
+    async def _spawn(self, config: PRWatcherConfig, *, persist: bool) -> None:
+        """Build a live watcher task for ``config``.
+
+        Shared by :meth:`start` (new watcher → persist registry row)
+        and :meth:`rehydrate` (existing row → reuse). A no-op if a live
+        watcher with the same id is already tracked; that makes the
+        "already exists" case (e.g. rehydrate races with a caller that
+        happened to start() by the same id) fall through silently
+        instead of raising.
+        """
+        async with self._lock:
+            if config.watcher_id in self._watchers:
+                return
         watcher = self._factory(config)
-        self.store.register_watcher(
-            watcher_id=config.watcher_id,
-            repos=config.repos,
-            pr_numbers=config.pr_numbers,
-            interval_s=config.interval_s,
-            started_at=config.started_at,
-        )
+        if persist:
+            self.store.register_watcher(
+                watcher_id=config.watcher_id,
+                repos=config.repos,
+                pr_numbers=config.pr_numbers,
+                interval_s=config.interval_s,
+                started_at=config.started_at,
+            )
         stop_event = asyncio.Event()
         task = asyncio.create_task(
-            watcher.run(stop_event), name=f"pr_watcher_{watcher_id}"
+            watcher.run(stop_event), name=f"pr_watcher_{config.watcher_id}"
         )
         async with self._lock:
-            self._watchers[watcher_id] = _LiveWatcher(
+            # Re-check under the lock — if a concurrent caller beat us,
+            # tear down our task rather than stomping theirs.
+            if config.watcher_id in self._watchers:
+                stop_event.set()
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                return
+            self._watchers[config.watcher_id] = _LiveWatcher(
                 watcher=watcher, stop_event=stop_event, task=task,
             )
-        return watcher_id
 
     async def stop(self, watcher_id: str) -> bool:
         """Cancel the watcher task and remove persistent state.

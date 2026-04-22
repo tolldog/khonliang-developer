@@ -72,6 +72,82 @@ class DeveloperAgent(BaseAgent):
             )
         return self._pr_watcher_registry
 
+    async def start(self):
+        """Rehydrate persisted PR watchers, then run the normal agent loop.
+
+        :meth:`BaseAgent.start` connects to the bus and blocks on the
+        message loop, so rehydration runs as a background task that
+        waits for the connector to register before spawning watchers —
+        ``publish`` needs a live connector or the watcher's first
+        event fails. If rehydration itself raises we log and continue;
+        a failed rehydrate must not prevent the agent from starting.
+        """
+        if self._pr_watcher_registry is None:
+            # Touch the property so the registry exists in memory before
+            # the background task tries to use it. Safe to do here:
+            # pipeline (and DB path) is already resolvable by this point
+            # in the normal launch path.
+            try:
+                _ = self.pr_watcher_registry
+            except Exception as e:
+                logger.warning(
+                    "developer agent: pr watcher registry init failed; "
+                    "rehydration skipped: %s", e,
+                )
+                return await super().start()
+        rehydrate_task = asyncio.create_task(
+            self._rehydrate_pr_watchers_when_ready(),
+            name="pr_watcher_rehydrate",
+        )
+        try:
+            await super().start()
+        finally:
+            # Ensure the rehydrate task never outlives the agent.
+            if not rehydrate_task.done():
+                rehydrate_task.cancel()
+                try:
+                    await rehydrate_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+    async def _rehydrate_pr_watchers_when_ready(self) -> None:
+        """Wait until the bus connector is registered, then rehydrate.
+
+        Split out so :meth:`start` stays a thin wrapper. The poll-until-
+        connected loop avoids racing registration — a watcher that
+        publishes before ``_connector.connected`` would hit the
+        ``RuntimeError("Cannot publish ...")`` branch in BaseAgent.
+        Backoff is bounded: 15s of waiting is plenty for a healthy
+        bus; past that we assume a broken bus and skip rehydration
+        (the agent's heartbeat/reconnect path will surface the
+        breakage separately).
+        """
+        deadline = 15.0
+        waited = 0.0
+        step = 0.1
+        while waited < deadline:
+            connector = getattr(self, "_connector", None)
+            if connector is not None and getattr(connector, "connected", False):
+                break
+            await asyncio.sleep(step)
+            waited += step
+        else:
+            logger.warning(
+                "developer agent: connector not ready within %.1fs; "
+                "skipping pr watcher rehydration", deadline,
+            )
+            return
+        try:
+            spawned = await self._pr_watcher_registry.rehydrate()
+        except Exception as e:
+            logger.warning("developer agent: pr watcher rehydrate failed: %s", e)
+            return
+        if spawned:
+            logger.info(
+                "developer agent: rehydrated %d pr watcher(s): %s",
+                len(spawned), ", ".join(spawned),
+            )
+
     async def shutdown(self):
         """Cancel live PR watchers before disconnecting from the bus.
 
@@ -89,11 +165,27 @@ class DeveloperAgent(BaseAgent):
                 live_handles = list(self._pr_watcher_registry._watchers.values())
                 for live in live_handles:
                     live.stop_event.set()
+                # Collect any tasks we end up cancelling so we can await
+                # them together at the end — missing the await was the
+                # previous bug (tasks logged "Task was destroyed but it
+                # is pending" during shutdown).
+                cancelled: list[asyncio.Task] = []
                 for live in live_handles:
                     try:
                         await asyncio.wait_for(live.task, timeout=3.0)
-                    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    except asyncio.TimeoutError:
                         live.task.cancel()
+                        cancelled.append(live.task)
+                    except asyncio.CancelledError:
+                        # Task already cancelled elsewhere — nothing to
+                        # do; it's already done.
+                        pass
+                    except Exception:
+                        # Task raised a non-cancellation exception while
+                        # running; it's finished, no await needed.
+                        pass
+                if cancelled:
+                    await asyncio.gather(*cancelled, return_exceptions=True)
             except Exception as e:
                 logger.warning("developer agent: pr watcher shutdown failed: %s", e)
         await super().shutdown()
