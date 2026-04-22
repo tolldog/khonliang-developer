@@ -978,3 +978,35 @@ async def test_apply_repo_hygiene_plan_handler_writes_artifact(harness, git_repo
     audit = result["audit"]
     assert audit["applied_changes"][0]["path"] == "docs/hygiene.md"
     assert (git_repo / "docs" / "hygiene.md").exists()
+
+
+# -- CLI --version flag (FR-A2 adoption) --
+
+
+def test_main_version_flag_prints_and_exits(capsys):
+    """`python -m developer.agent --version` prints resolved version + exits 0.
+
+    Regression guard for the CLI wiring. Runs ``main()`` in-process with
+    monkeypatched sys.argv so we don't need a subprocess; argparse's
+    version action still raises SystemExit(0) with the formatted
+    message on stdout.
+    """
+    import sys
+    from developer import agent as agent_module
+
+    saved_argv = sys.argv
+    sys.argv = ["developer.agent", "--version"]
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            agent_module.main()
+        assert excinfo.value.code == 0
+    finally:
+        sys.argv = saved_argv
+
+    out = capsys.readouterr().out
+    assert out.startswith("developer.agent "), f"unexpected prog name in {out!r}"
+    # Version itself is resolved from pyproject at call time; only assert
+    # it's a non-empty dotted version string so bumps don't break the test.
+    version_part = out.strip().split(" ", 1)[1]
+    assert version_part, "version suffix empty"
+    assert version_part != "<unknown>", "resolve_version failed unexpectedly"
