@@ -398,6 +398,33 @@ async def test_get_pr_surfaces_merged_fields_for_merged_pr():
 
 
 @pytest.mark.asyncio
+async def test_get_pr_normalizes_datetime_merged_at_to_iso8601():
+    """githubkit can surface ``merged_at`` as a ``datetime`` instance.
+
+    Python's default ``str(datetime)`` uses a space separator
+    (``YYYY-MM-DD HH:MM:SS+00:00``), which is not ISO8601 and would
+    destabilize downstream dedupe keys (pr_watcher's merged-event
+    dedupe_id per fr_developer_6c8ec260). Assert we normalize to
+    ISO8601 (``T`` separator) regardless of whether githubkit returned
+    a string or a datetime.
+    """
+    from datetime import datetime, timezone
+    c = GithubClient(token="t")
+    dt = datetime(2026, 4, 21, 12, 0, 0, tzinfo=timezone.utc)
+    _install_fake_gh(c, pr=_FakePR(
+        number=36, state="closed", merged=True, merged_at=dt,
+    ))
+    out = await c.get_pr("o/n", 36)
+    assert out["merged"] is True
+    assert isinstance(out["merged_at"], str)
+    # ISO8601 uses a ``T`` separator, not a space.
+    assert "T" in out["merged_at"]
+    assert " " not in out["merged_at"]
+    # Round-trips through datetime.fromisoformat without error.
+    assert datetime.fromisoformat(out["merged_at"]) == dt
+
+
+@pytest.mark.asyncio
 async def test_get_pr_closed_without_merge_has_none_merged_at():
     """Closed-but-never-merged PRs: merged=False, merged_at=None.
 

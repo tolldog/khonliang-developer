@@ -881,7 +881,7 @@ async def _snapshot_from_github(
 
 
 def _pr_was_merged(pr: dict) -> bool:
-    """"Was this PR merged?" derivation from get_pr output.
+    """Was this PR merged? Derivation from get_pr output.
 
     As of ``fr_developer_207ff0fb``, :meth:`GithubClient.get_pr`
     surfaces both ``merged`` (bool) and ``merged_at`` (ISO8601 str or

@@ -24,6 +24,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -271,6 +272,17 @@ class GithubClient:
             raise GithubClientError(f"get_pr({repo}#{pr_number}): {e}") from e
         pr = resp.parsed_data
         merged_at_raw = getattr(pr, "merged_at", None)
+        # githubkit may return merged_at as a ``datetime`` instance; Python's
+        # default ``str(datetime)`` uses a space separator ("YYYY-MM-DD HH:MM:SS+00:00")
+        # rather than ISO8601 ("YYYY-MM-DDTHH:MM:SS+00:00"). Downstream consumers
+        # (including the pr_watcher dedupe key per fr_developer_6c8ec260) rely on
+        # a stable ISO8601 shape, so normalize here.
+        if merged_at_raw is None:
+            merged_at = None
+        elif isinstance(merged_at_raw, datetime):
+            merged_at = merged_at_raw.isoformat()
+        else:
+            merged_at = str(merged_at_raw)
         return {
             "number": pr.number,
             "title": pr.title,
@@ -284,7 +296,7 @@ class GithubClient:
             "base": pr.base.ref,
             "html_url": pr.html_url,
             "merged": bool(getattr(pr, "merged", False)),
-            "merged_at": str(merged_at_raw) if merged_at_raw is not None else None,
+            "merged_at": merged_at,
         }
 
     async def pr_readiness(self, repo: str, pr_number: int) -> GithubPRReadiness:
