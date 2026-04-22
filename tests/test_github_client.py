@@ -217,13 +217,16 @@ class _FakeIssueComment:
 class _FakePR:
     def __init__(self, number=42, title="t", state="open", draft=False,
                  mergeable=True, author="tolldog", head="feat/x", base="main",
-                 head_sha="b348b3f1234567890", mergeable_state="blocked"):
+                 head_sha="b348b3f1234567890", mergeable_state="blocked",
+                 merged=False, merged_at=None):
         self.number = number
         self.title = title
         self.state = state
         self.draft = draft
         self.mergeable = mergeable
         self.mergeable_state = mergeable_state
+        self.merged = merged
+        self.merged_at = merged_at
         self.user = _FakeUser(login=author)
 
         class _Ref:
@@ -373,6 +376,40 @@ async def test_get_pr_returns_normalized_metadata():
     assert out["head_sha"].startswith("b348b3f")
     assert out["base"] == "main"
     assert out["html_url"].endswith("/pull/42")
+    # Open PR: merged is False, merged_at is None.
+    assert out["merged"] is False
+    assert out["merged_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_pr_surfaces_merged_fields_for_merged_pr():
+    """FR fr_developer_207ff0fb: projection widening so watch_pr_fleet
+    can observe the ``pr.merged`` transition without a second API call.
+    """
+    c = GithubClient(token="t")
+    _install_fake_gh(c, pr=_FakePR(
+        number=36, state="closed",
+        merged=True, merged_at="2026-04-21T12:00:00Z",
+    ))
+    out = await c.get_pr("o/n", 36)
+    assert out["state"] == "closed"
+    assert out["merged"] is True
+    assert out["merged_at"] == "2026-04-21T12:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_get_pr_closed_without_merge_has_none_merged_at():
+    """Closed-but-never-merged PRs: merged=False, merged_at=None.
+
+    Matches the REST contract; guards against a regression where we
+    might stringify ``None`` into ``"None"``.
+    """
+    c = GithubClient(token="t")
+    _install_fake_gh(c, pr=_FakePR(number=7, state="closed", merged=False, merged_at=None))
+    out = await c.get_pr("o/n", 7)
+    assert out["state"] == "closed"
+    assert out["merged"] is False
+    assert out["merged_at"] is None
 
 
 @pytest.mark.asyncio

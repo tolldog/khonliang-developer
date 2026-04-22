@@ -248,7 +248,20 @@ class GithubClient:
         return comments
 
     async def get_pr(self, repo: str, pr_number: int) -> dict:
-        """Return normalized PR metadata: state, mergeable, title, author, head, base, draft."""
+        """Return normalized PR metadata.
+
+        Surfaced fields: ``number``, ``title``, ``state``, ``draft``,
+        ``mergeable``, ``mergeable_state``, ``author``, ``head``,
+        ``head_sha``, ``base``, ``html_url``, ``merged``, ``merged_at``.
+
+        The ``merged`` / ``merged_at`` pair lets downstream consumers
+        (notably :func:`developer.pr_watcher._snapshot_from_github`)
+        detect the merged-terminal transition without a second API call
+        — GitHub's REST response already carries both fields, so this
+        is projection widening rather than a new lookup. ``merged_at``
+        is an ISO8601 string when the PR is merged and ``None`` when
+        the PR is open or closed-unmerged.
+        """
         owner, name = self._split_repo(repo)
         try:
             resp = await self._client().rest.pulls.async_get(
@@ -257,6 +270,7 @@ class GithubClient:
         except Exception as e:
             raise GithubClientError(f"get_pr({repo}#{pr_number}): {e}") from e
         pr = resp.parsed_data
+        merged_at_raw = getattr(pr, "merged_at", None)
         return {
             "number": pr.number,
             "title": pr.title,
@@ -269,6 +283,8 @@ class GithubClient:
             "head_sha": getattr(pr.head, "sha", ""),
             "base": pr.base.ref,
             "html_url": pr.html_url,
+            "merged": bool(getattr(pr, "merged", False)),
+            "merged_at": str(merged_at_raw) if merged_at_raw is not None else None,
         }
 
     async def pr_readiness(self, repo: str, pr_number: int) -> GithubPRReadiness:
