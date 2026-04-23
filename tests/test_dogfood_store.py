@@ -822,6 +822,91 @@ def test_triage_dogfood_unknown_id(pipeline):
     assert "error" in result
 
 
+def test_triage_dogfood_rejects_promote_to_bug_on_terminal_dogfood(pipeline):
+    """promote_to_bug on dismissed / duplicate / broken-promoted dogfood is refused.
+
+    Without the up-front guard, file_bug would create the bug first and
+    record_promotion would then refuse the terminal status — stranding
+    an orphan bug. Verify the rejection keeps bugs table unchanged for
+    dismissed and duplicate states. The ``promoted`` state has its own
+    idempotent reuse path for the matching downstream kind, so test
+    the corrupted sub-case (promoted but no bug_* entry) too.
+    """
+    agent = _make_agent(pipeline)
+
+    # Case 1: dismissed dogfood rejects promote_to_bug.
+    dismissed = pipeline.dogfood.log_dogfood(
+        "dismissed friction", kind=DOGFOOD_KIND_FRICTION, observed_at=1.0,
+    )
+    pipeline.dogfood.mark_dismissed(dismissed.id)
+    bugs_before = len(pipeline.bugs.list_bugs(status="all"))
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dismissed.id,
+        "action": "promote_to_bug",
+    }))
+    assert "error" in result
+    assert "terminal" in result["error"].lower()
+    assert len(pipeline.bugs.list_bugs(status="all")) == bugs_before
+
+    # Case 2: duplicate dogfood rejects promote_to_bug.
+    original = pipeline.dogfood.log_dogfood(
+        "orig", kind=DOGFOOD_KIND_FRICTION, observed_at=2.0,
+    )
+    dup = pipeline.dogfood.log_dogfood(
+        "dup", kind=DOGFOOD_KIND_FRICTION, observed_at=3.0,
+    )
+    pipeline.dogfood.mark_duplicate(dup.id, original.id)
+    bugs_before = len(pipeline.bugs.list_bugs(status="all"))
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dup.id,
+        "action": "promote_to_bug",
+    }))
+    assert "error" in result
+    assert "terminal" in result["error"].lower()
+    assert len(pipeline.bugs.list_bugs(status="all")) == bugs_before
+
+
+def test_triage_dogfood_rejects_promote_to_fr_on_terminal_dogfood(pipeline):
+    """Symmetric fix — promote_to_fr on terminal dogfood refused up-front.
+
+    Without the guard, promote() would create the FR and then
+    record_promotion would refuse the terminal status, stranding an
+    orphan FR. Verify the rejection keeps FR count unchanged.
+    """
+    agent = _make_agent(pipeline)
+
+    # Case 1: dismissed dogfood rejects promote_to_fr.
+    dismissed = pipeline.dogfood.log_dogfood(
+        "dismissed UX", kind=DOGFOOD_KIND_UX, observed_at=1.0,
+    )
+    pipeline.dogfood.mark_dismissed(dismissed.id)
+    frs_before = len(pipeline.frs.list(include_all=True))
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dismissed.id,
+        "action": "promote_to_fr",
+    }))
+    assert "error" in result
+    assert "terminal" in result["error"].lower()
+    assert len(pipeline.frs.list(include_all=True)) == frs_before
+
+    # Case 2: duplicate dogfood rejects promote_to_fr.
+    original = pipeline.dogfood.log_dogfood(
+        "o", kind=DOGFOOD_KIND_UX, observed_at=2.0,
+    )
+    dup = pipeline.dogfood.log_dogfood(
+        "d", kind=DOGFOOD_KIND_UX, observed_at=3.0,
+    )
+    pipeline.dogfood.mark_duplicate(dup.id, original.id)
+    frs_before = len(pipeline.frs.list(include_all=True))
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dup.id,
+        "action": "promote_to_fr",
+    }))
+    assert "error" in result
+    assert "terminal" in result["error"].lower()
+    assert len(pipeline.frs.list(include_all=True)) == frs_before
+
+
 # -- dogfood_triage_queue handler --
 
 

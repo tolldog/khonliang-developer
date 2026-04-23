@@ -2124,6 +2124,25 @@ class DeveloperAgent(BaseAgent):
             await self._safe_report_gap("triage_bug", msg)
             return {"error": msg, "bug_id": bug_id}
 
+        # Symmetric guard: bug is ALREADY terminal and caller wants to
+        # escalate. Without this, promote() creates the FR and then
+        # BugStore.escalate_to_fr() refuses the terminal bug — same
+        # orphan-FR failure mode as the explicit-terminal-status case
+        # above, just triggered by an empty status arg on an
+        # already-closed bug. Only applies when no status change was
+        # requested (with status set, re-opening into a non-terminal
+        # state before escalating is a legitimate path we don't want
+        # to block here; update_bug_status handles the transition
+        # legality).
+        if escalate and not status and not bug.linked_frs and bug.status in TERMINAL_STATUSES:
+            msg = (
+                f"cannot escalate_to_fr on bug in terminal status {bug.status!r} "
+                "(would strand the created FR); re-open the bug first, or "
+                "link an existing FR via link_bug_fr instead"
+            )
+            await self._safe_report_gap("triage_bug", msg)
+            return {"error": msg, "bug_id": bug_id}
+
         try:
             if severity:
                 bug = self.pipeline.bugs.update_severity(bug_id, severity, notes=notes)
@@ -2219,7 +2238,12 @@ class DeveloperAgent(BaseAgent):
         straight through to the Phase-1 terminal methods.
         """
         from developer.bug_store import BugError
-        from developer.dogfood_store import DogfoodError
+        from developer.dogfood_store import (
+            DOGFOOD_STATUS_DISMISSED,
+            DOGFOOD_STATUS_DUPLICATE,
+            DOGFOOD_STATUS_PROMOTED,
+            DogfoodError,
+        )
         from developer.fr_store import FRError
 
         dog_id = args.get("dog_id", "")
@@ -2230,6 +2254,44 @@ class DeveloperAgent(BaseAgent):
         dog = self.pipeline.dogfood.get_dogfood(dog_id)
         if dog is None:
             return {"error": f"unknown dog id: {dog_id}", "dog_id": dog_id}
+
+        # Up-front guard for promote_to_{bug,fr} on an already-terminal
+        # dogfood. Without this, file_bug / promote runs first, then
+        # record_promotion refuses the terminal status, leaving an
+        # orphan bug / FR. The two terminal statuses that refuse
+        # promotion outright are dismissed and duplicate; the
+        # promoted status is handled separately by the idempotent
+        # re-promotion path (see below) which reuses the existing
+        # downstream id — point the caller at that flow explicitly so
+        # they don't confuse a terminal refusal with a missing guard.
+        if action in ("promote_to_bug", "promote_to_fr"):
+            if dog.status in (DOGFOOD_STATUS_DISMISSED, DOGFOOD_STATUS_DUPLICATE):
+                msg = (
+                    f"cannot {action} on dogfood in terminal status "
+                    f"{dog.status!r} (would strand the created downstream "
+                    "record); re-open is not supported for dismissed/"
+                    "duplicate observations"
+                )
+                await self._safe_report_gap("triage_dogfood", msg)
+                return {"error": msg, "dog_id": dog_id}
+            # status=promoted + no matching promoted_to entry is a
+            # corrupted state that shouldn't normally occur, but guard
+            # anyway: refuse rather than create an orphan. The
+            # idempotent reuse path below handles the common case
+            # where the matching entry is present.
+            if dog.status == DOGFOOD_STATUS_PROMOTED:
+                kind_prefix = "bug_" if action == "promote_to_bug" else "fr_"
+                has_matching = any(
+                    tid.startswith(kind_prefix) for tid in dog.promoted_to
+                )
+                if not has_matching:
+                    msg = (
+                        f"dogfood {dog_id} is in status promoted but has no "
+                        f"{kind_prefix}* entry in promoted_to — refusing "
+                        f"{action} to avoid orphan downstream record"
+                    )
+                    await self._safe_report_gap("triage_dogfood", msg)
+                    return {"error": msg, "dog_id": dog_id}
 
         if action == "dismiss":
             try:
@@ -2479,6 +2541,11 @@ class DeveloperAgent(BaseAgent):
                 severity=severity,
                 reporter=self.agent_id or self.agent_type,
             )
+        except asyncio.CancelledError:
+            # Never swallow task cancellation — let it propagate so the
+            # enclosing async task terminates cleanly. Same pattern as
+            # PR #39 R4 for pr_watcher.
+            raise
         except Exception as e:
             # Filing the bug is best-effort; surface the failure in the
             # ack but don't raise — report_gap callers use this from

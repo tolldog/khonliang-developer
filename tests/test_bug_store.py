@@ -771,6 +771,45 @@ def test_triage_bug_rejects_terminal_status_with_escalate(pipeline):
     assert pipeline.bugs.get_bug(filed["bug_id"]).status == status_before
 
 
+def test_triage_bug_rejects_escalate_when_bug_already_terminal(pipeline):
+    """escalate_to_fr=True on an already-terminal bug must be refused up-front.
+
+    Covers the gap left by the R1 fix: when status="" (no status change
+    requested) and the bug is ALREADY in a terminal status with no
+    linked_frs, promote() would create the FR but
+    BugStore.escalate_to_fr() refuses terminal bugs — leaving an orphan
+    FR. Up-front rejection keeps the FR count unchanged.
+    """
+    agent = _make_agent(pipeline)
+    filed = _run(agent.handle_file_bug({
+        "target": "developer",
+        "title": "already closed",
+        "description": "this bug was closed before escalation was tried",
+    }))
+    # Close the bug first (two-step legit flow).
+    _run(agent.handle_update_bug_status({
+        "bug_id": filed["bug_id"],
+        "status": BUG_STATUS_FIXED,
+    }))
+    frs_before = len(pipeline.frs.list(include_all=True))
+
+    result = _run(agent.handle_triage_bug({
+        "bug_id": filed["bug_id"],
+        "escalate_to_fr": True,
+        # status intentionally omitted — the R1 guard only trips when
+        # status is set to a terminal value. This path must ALSO be
+        # rejected when the bug is already terminal.
+    }))
+    assert "error" in result
+    assert "terminal" in result["error"].lower()
+    # No orphan FR created — count unchanged.
+    assert len(pipeline.frs.list(include_all=True)) == frs_before
+    # Bug still terminal (unchanged by the rejected call).
+    assert pipeline.bugs.get_bug(filed["bug_id"]).status == BUG_STATUS_FIXED
+    # linked_frs still empty — no stray attachment.
+    assert pipeline.bugs.get_bug(filed["bug_id"]).linked_frs == []
+
+
 def test_triage_bug_without_escalation_updates_severity_and_status(pipeline):
     agent = _make_agent(pipeline)
     filed = _run(agent.handle_file_bug({
@@ -893,5 +932,39 @@ def test_report_gap_requires_operation_and_reason(pipeline):
     agent = _make_agent(pipeline)
     result = _run(agent.handle_report_gap({"operation": "", "reason": ""}))
     assert "error" in result
+
+
+def test_report_gap_bug_propagates_cancellation(pipeline):
+    """asyncio.CancelledError must NOT be swallowed by the bug-filing except.
+
+    Same async-cancellation pattern as PR #39 R4 for pr_watcher:
+    the broad ``except Exception`` around BugStore.file_bug must
+    re-raise CancelledError so the enclosing async task can terminate.
+    If the bug path catches CancelledError (because it's a subclass of
+    BaseException in 3.8+ but of Exception in earlier versions, OR
+    because someone accidentally re-orders the clauses), cancellation
+    propagation breaks.
+    """
+    import asyncio
+
+    agent = _make_agent(pipeline)
+
+    # Monkeypatch BugStore.file_bug to raise CancelledError — this
+    # simulates what happens if the caller's enclosing task is
+    # cancelled while file_bug is awaiting (e.g. on a DB lock via
+    # future work). The report_gap handler must propagate, not
+    # swallow into bug_error.
+    def _raise_cancelled(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    pipeline.bugs.file_bug = _raise_cancelled  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.CancelledError):
+        _run(agent.report_gap(
+            operation="cancel_probe",
+            reason="task was cancelled mid-file_bug",
+            bug=True,
+            severity="high",
+        ))
 
 
