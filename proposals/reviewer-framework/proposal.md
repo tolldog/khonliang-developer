@@ -3,8 +3,8 @@
 **Status:** Ready for FR authoring (v1→15 findings, v2→8 findings, v3→addresses v2)
 **Scope:** Cross-repo initiative, split into **four independent milestones**
 **Author:** Claude (reviewer-dogfood session, 2026-04-21)
-**Supersedes:** `/tmp/reviewer-framework-proposal-v2.md` (v2), `/tmp/reviewer-framework-proposal.md` (v1)
-**Related PRs:** #12 (`khonliang-bus-lib`) — subset of Milestone A; see §Milestone-A disposition
+**Supersedes:** earlier v1 and v2 drafts (not tracked in-repo; session transcript only)
+**Related PRs:** `tolldog/khonliang-bus-lib#12` — subset of Milestone A; see §Milestone-A disposition
 
 ## v2 → v3 delta
 
@@ -34,7 +34,7 @@ Reviewer-primary review of v1 (claude-sonnet-4-6, 15 findings) is addressed belo
 | [5] `resolve_version` walk needs sentinel | Walk stops at **first ancestor containing `.git/`**. Documented; prevents traversing past repo root |
 | [6] Base `pyproject.toml` fetch unspecified | Added `DiffContext.base_file(path)` interface using `git show <base_sha>:<path>`. Failure modes enumerated |
 | [7] Label bypass has no access control | Dropped label escape hatch. Replaced with **repo-level opt-out** in `.reviewer/config.yaml` (committed to base branch, changes require a code review) |
-| [8] PR #12 disposition implicit | Milestone A explicit: **merge #12 first**, then Milestone-A work builds on it (pyproject-walk branch + `--version` flag are additive) |
+| [8] `tolldog/khonliang-bus-lib#12` disposition implicit | Milestone A explicit: **merge `tolldog/khonliang-bus-lib#12` first**, then Milestone-A work builds on it (pyproject-walk branch + `--version` flag are additive) |
 | [9] Items 2–3 have no AC | Added AC for each milestone; Milestones B and C now have explicit acceptance |
 | [10] Benchmark ground-truth corpus unscoped | Seed corpus is a **Milestone D deliverable** with stated floor: N≥20 fixtures across `version_bump` TP/FP/TN/FN quadrants |
 | [11] False positive on GH Action path | Retained `tolldog/.github/.github/workflows/...` — this IS the correct org-level reusable-workflow form |
@@ -48,14 +48,14 @@ Reviewer-primary review of v1 (claude-sonnet-4-6, 15 findings) is addressed belo
 ## Milestone A: Versioning primitives in `khonliang-bus-lib`
 
 **Ships:** immediately — standalone, no dependencies on later milestones.
-**Supersedes:** PR #12 (same resolver surface, extended with pyproject walk).
+**Supersedes:** `tolldog/khonliang-bus-lib#12` (same resolver surface, extended with pyproject walk).
 
 ### Scope
 - New `khonliang_bus.versioning` module:
   - `resolve_version(module_name=None) -> str | None` — resolution chain:
-    1. If `module_name == "__main__"`, consult `sys.modules["__main__"].__spec__.name` (PR #12 logic).
+    1. If `module_name == "__main__"`, consult `sys.modules["__main__"].__spec__.name` (`tolldog/khonliang-bus-lib#12` logic).
     2. Walk up from the module's file, stopping at **first directory containing `.git/`**. Try `pyproject.toml` at each level; on hit, parse `project.version` via `tomllib`.
-    3. Fall back to `importlib.metadata.version(...)` via `packages_distributions()` (today's PR #11 logic).
+    3. Fall back to `importlib.metadata.version(...)` via `packages_distributions()` (today's `tolldog/khonliang-bus-lib#11` logic).
     4. Return `None` on total miss.
   - `add_version_flag(parser, module_name=None) -> None` — argparse helper wiring `--version`/`-V`. Prints resolved version + exits.
 - `BaseAgent.__init__` uses `resolve_version` internally.
@@ -69,7 +69,7 @@ Reviewer-primary review of v1 (claude-sonnet-4-6, 15 findings) is addressed belo
 - `add_version_flag` in a script: `python my_script.py --version` prints and exits 0.
 
 ### Interface note
-Explicit override chain still applies from PR #11: subclass `version` class attribute or pre-`super()` instance assignment wins over auto-resolution. `resolve_version` is called *only* when `_has_explicit_version(self)` is False.
+Explicit override chain still applies from `tolldog/khonliang-bus-lib#11`: subclass `version` class attribute or pre-`super()` instance assignment wins over auto-resolution. `resolve_version` is called *only* when `_has_explicit_version(self)` is False.
 
 ---
 

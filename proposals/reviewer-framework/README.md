@@ -2,7 +2,7 @@
 
 A design proposal that split into **four milestones**:
 
-- **Milestone A** — Versioning primitives in `khonliang-bus-lib` (supersedes PR #12). Ship immediately.
+- **Milestone A** — Versioning primitives in `khonliang-bus-lib` (supersedes `tolldog/khonliang-bus-lib#12`). Ship immediately.
 - **Milestone B** — `.reviewer/` directory + deterministic check framework in `khonliang-reviewer`.
 - **Milestone C** — Reusable GH Action for CI hard-gate on version bumps.
 - **Milestone D** — Benchmark harness with cross-source scoring (ground truth / local / external).
@@ -25,8 +25,8 @@ seed corpus candidates for Milestone D's benchmark suite.
 
 **Milestone A** (versioning primitives):
 
-- `fr_khonliang_4e60ffaa` — `khonliang_bus.versioning` module: `resolve_version()` with pyproject-walk + BaseAgent integration. Priority: high. **Status: COMPLETED** (PR #13 merged).
-- `fr_khonliang_31b750d7` — `add_version_flag()` CLI helper + adoption across agent `main()` entry points. Priority: medium. Depends on: `fr_khonliang_4e60ffaa`. **Part 1 merged via PR #14**; part 2 (per-agent-repo adoption) pending.
+- `fr_khonliang_4e60ffaa` — `khonliang_bus.versioning` module: `resolve_version()` with pyproject-walk + BaseAgent integration. Priority: high. **Status: COMPLETED** (`tolldog/khonliang-bus-lib#13` merged).
+- `fr_khonliang_31b750d7` — `add_version_flag()` CLI helper + adoption across agent `main()` entry points. Priority: medium. Depends on: `fr_khonliang_4e60ffaa`. **Part 1 merged via `tolldog/khonliang-bus-lib#14`**; part 2 (per-agent-repo adoption) pending.
 
 **Milestone B** (reviewer output quality — derived from external-research distillation; see below):
 
@@ -48,8 +48,8 @@ Distilled subset (sufficient for the FRs above): "Two Reviewers", "Sandboxing ag
 
 ## Status as of 2026-04-23
 
-Milestone A has **landed**: PR #13 merged `fr_khonliang_4e60ffaa`
-(versioning primitives) and PR #14 merged part 1 of
+Milestone A has **landed**: `tolldog/khonliang-bus-lib#13` merged `fr_khonliang_4e60ffaa`
+(versioning primitives) and `tolldog/khonliang-bus-lib#14` merged part 1 of
 `fr_khonliang_31b750d7` (`add_version_flag()` CLI helper). Per-agent
 adoption of `add_version_flag()` (part 2 of `fr_khonliang_31b750d7`)
 is still pending.
