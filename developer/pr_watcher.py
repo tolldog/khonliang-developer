@@ -462,6 +462,21 @@ class PRFleetWatcher:
         self._list_open_prs = list_open_prs
         self._now = now_fn
         self._pr_count: int = 0
+        # In-memory per-(repo, pr_number) caches of already-observed
+        # comment ids, one per channel. Used to skip the ``_emit`` call
+        # (and its ``INSERT OR IGNORE`` into ``pr_watcher_dedupe``) when
+        # the snapshot hasn't changed between polls. Long PR threads
+        # would otherwise churn the dedupe table on every tick even
+        # though nothing new has arrived.
+        #
+        # Cross-restart correctness still comes from the SQLite dedupe
+        # table: on a fresh process these caches are empty, so the first
+        # poll re-observes every id via ``_emit`` and ``mark_emitted``
+        # returns False for rows that were persisted before the restart
+        # (no re-emission). After that first pass the cache is primed
+        # and subsequent unchanged polls touch zero rows.
+        self._seen_issue_comment_ids: dict[tuple[str, int], set[str]] = {}
+        self._seen_inline_finding_ids: dict[tuple[str, int], set[str]] = {}
 
     @property
     def pr_count(self) -> int:
@@ -599,16 +614,27 @@ class PRFleetWatcher:
         # 2a. Issue comments (fr_developer_e2bdd869).
         # Each external (non-self) comment fires exactly one
         # pr.comment_posted, deduped by comment_id.
+        #
+        # Long PR threads keep accumulating comments; without in-memory
+        # diffing against the prior snapshot we'd call ``_emit`` (and
+        # its ``INSERT OR IGNORE`` into ``pr_watcher_dedupe``) for every
+        # stored comment on every poll. Instead we track seen ids per
+        # (repo, pr_number) and only hit ``_emit`` for the delta.
+        key = (snapshot.repo, snapshot.pr_number)
+        seen_issue = self._seen_issue_comment_ids.setdefault(key, set())
         for comment in snapshot.external_issue_comments:
             comment_id = comment.get("id")
             if comment_id is None:
+                continue
+            id_str = str(comment_id)
+            if id_str in seen_issue:
                 continue
             if await self._emit(
                 TOPIC_COMMENT_POSTED,
                 repo=snapshot.repo,
                 pr_number=snapshot.pr_number,
                 transition_kind="comment_posted",
-                dedupe_id=str(comment_id),
+                dedupe_id=id_str,
                 payload={
                     "repo": snapshot.repo,
                     "pr_number": snapshot.pr_number,
@@ -619,22 +645,31 @@ class PRFleetWatcher:
                 },
             ):
                 emitted += 1
+            # Mark seen regardless of whether ``_emit`` actually
+            # published — if the SQLite dedupe table already had the
+            # row (cross-restart case), ``_emit`` returns False, but
+            # we still don't want to revisit it next poll.
+            seen_issue.add(id_str)
 
         # 2b. Inline review-thread comments (fr_developer_e2bdd869).
         # Each external (non-self) inline finding fires exactly one
         # pr.inline_finding, deduped by comment_id. review_id correlates
         # with the containing pr.review_landed when the comment is part
         # of a formal review; None when it's a standalone thread reply.
+        seen_inline = self._seen_inline_finding_ids.setdefault(key, set())
         for finding in snapshot.inline_findings:
             comment_id = finding.get("id")
             if comment_id is None:
+                continue
+            id_str = str(comment_id)
+            if id_str in seen_inline:
                 continue
             if await self._emit(
                 TOPIC_INLINE_FINDING,
                 repo=snapshot.repo,
                 pr_number=snapshot.pr_number,
                 transition_kind="inline_finding",
-                dedupe_id=str(comment_id),
+                dedupe_id=id_str,
                 payload={
                     "repo": snapshot.repo,
                     "pr_number": snapshot.pr_number,
@@ -648,6 +683,7 @@ class PRFleetWatcher:
                 },
             ):
                 emitted += 1
+            seen_inline.add(id_str)
 
         # 3. Merged. dedupe_id = merged_at timestamp (stable once set).
         if snapshot.merged and snapshot.merged_at:
@@ -1048,6 +1084,14 @@ async def _snapshot_from_github(
     # other fetch error instead of silently hiding missed events.
     issue_comments_raw = await gh.list_pr_issue_comments(repo, pr_number)
     inline_comments_raw = await gh.list_pr_review_comments(repo, pr_number)
+    # GitHub logins are case-insensitive. Normalize once and compare
+    # via ``.casefold()`` (proper Unicode-aware case folding, not
+    # ``.lower()``). Empty ``self_login`` disables filtering entirely.
+    self_login_cf = self_login.casefold() if self_login else ""
+
+    def _is_self(login: str) -> bool:
+        return bool(self_login_cf) and (login or "").casefold() == self_login_cf
+
     external_issue_comments = [
         {
             "id": c.get("id"),
@@ -1056,7 +1100,7 @@ async def _snapshot_from_github(
             "posted_at": c.get("created_at", "") or "",
         }
         for c in issue_comments_raw
-        if self_login == "" or c.get("user") != self_login
+        if not _is_self(c.get("user", ""))
     ]
     inline_findings = [
         {
@@ -1069,7 +1113,7 @@ async def _snapshot_from_github(
             "review_id": c.pull_request_review_id,
         }
         for c in inline_comments_raw
-        if self_login == "" or c.reviewer != self_login
+        if not _is_self(c.reviewer or "")
     ]
 
     merged = bool(pr.get("state") == "closed" and _pr_was_merged(pr))

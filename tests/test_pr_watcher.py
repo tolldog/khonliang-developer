@@ -1372,3 +1372,219 @@ def test_comment_topics_included_in_all_pr_topics():
     on the ``pr.*`` namespace see them via ``bus_wait_for_event``."""
     assert TOPIC_COMMENT_POSTED in ALL_PR_TOPICS
     assert TOPIC_INLINE_FINDING in ALL_PR_TOPICS
+
+
+# ---------------------------------------------------------------------------
+# Unchanged-snapshot diffing (Copilot PR #39 perf finding).
+# Long PR threads shouldn't churn the dedupe table on every poll. The
+# watcher tracks seen comment ids in-memory and only calls ``_emit``
+# (and its ``INSERT OR IGNORE``) for the delta.
+# ---------------------------------------------------------------------------
+
+
+async def test_unchanged_comment_snapshot_causes_zero_dedupe_inserts_on_second_poll(
+    store, monkeypatch,
+):
+    """Key correctness claim: polling twice with an unchanged snapshot
+    of N comments should hit ``mark_emitted`` (the ``INSERT OR IGNORE``
+    path) exactly N times on poll 1, and exactly 0 times on poll 2.
+
+    The assertion is a spy on ``PRWatcherStore.mark_emitted`` call
+    count rather than reading sqlite stats — it's the direct path that
+    executes the ``INSERT OR IGNORE`` and has no other callers, so a
+    zero count proves zero DB writes.
+    """
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published)
+
+    # A 20-comment snapshot — 10 issue comments + 10 inline findings.
+    # Matches the finding's spec (20 total comments, 20 INSERT calls on
+    # poll 1, zero on poll 2).
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot_with_comments(
+        head_sha="sha-unchanged",
+        external_issue_comments=[
+            {
+                "id": 1000 + i,
+                "author": "copilot-pull-request-reviewer[bot]",
+                "body": f"issue comment {i}",
+                "posted_at": f"2026-04-22T10:{i:02d}:00Z",
+            }
+            for i in range(10)
+        ],
+        inline_findings=[
+            {
+                "id": 2000 + i,
+                "author": "copilot-pull-request-reviewer[bot]",
+                "body": f"inline finding {i}",
+                "posted_at": f"2026-04-22T11:{i:02d}:00Z",
+                "path": f"m{i}.py",
+                "line": i,
+                "review_id": 7777,
+            }
+            for i in range(10)
+        ],
+    )
+
+    # Spy on mark_emitted and count calls per transition_kind.
+    call_log: list[str] = []
+    real_mark_emitted = store.mark_emitted
+
+    def spy_mark_emitted(**kwargs):
+        call_log.append(kwargs["transition_kind"])
+        return real_mark_emitted(**kwargs)
+
+    monkeypatch.setattr(store, "mark_emitted", spy_mark_emitted)
+
+    # Poll 1: every comment id is novel → each goes through _emit →
+    # mark_emitted / INSERT OR IGNORE. Plus 1 for new_commit.
+    await watcher.poll_once()
+    poll1_comment_calls = sum(
+        1 for k in call_log if k in ("comment_posted", "inline_finding")
+    )
+    assert poll1_comment_calls == 20, (
+        f"poll 1 should INSERT 20 rows (10 + 10) for comment channels, "
+        f"got {poll1_comment_calls}: {call_log}"
+    )
+    assert sum(1 for p in call_log if p == "comment_posted") == 10
+    assert sum(1 for p in call_log if p == "inline_finding") == 10
+
+    call_log.clear()
+
+    # Poll 2: same snapshot. No comment id is novel → in-memory cache
+    # short-circuits before ``_emit``, so mark_emitted is never called
+    # for the comment transitions. This is the load-bearing assertion:
+    # zero INSERT OR IGNORE calls against the dedupe table for either
+    # comment channel when the snapshot is unchanged.
+    await watcher.poll_once()
+    poll2_comment_calls = sum(
+        1 for k in call_log if k in ("comment_posted", "inline_finding")
+    )
+    assert poll2_comment_calls == 0, (
+        f"poll 2 should cause ZERO comment-channel INSERT OR IGNORE "
+        f"calls when the snapshot is unchanged; got {poll2_comment_calls}: "
+        f"{call_log}"
+    )
+
+    # And of course no duplicate events were published either.
+    comment_events = [t for t, _ in published if t == TOPIC_COMMENT_POSTED]
+    inline_events = [t for t, _ in published if t == TOPIC_INLINE_FINDING]
+    assert len(comment_events) == 10
+    assert len(inline_events) == 10
+
+
+async def test_new_comment_after_unchanged_poll_still_emits_and_inserts(
+    store, monkeypatch,
+):
+    """Sanity companion: the perf fix must not break the happy path.
+    After a no-op poll, a genuinely new comment id on poll 3 must go
+    through _emit / mark_emitted exactly once."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published)
+
+    baseline = [
+        {
+            "id": 5001,
+            "author": "copilot[bot]",
+            "body": "first",
+            "posted_at": "2026-04-22T10:00:00Z",
+        },
+    ]
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot_with_comments(
+        external_issue_comments=list(baseline),
+    )
+    await watcher.poll_once()
+    await watcher.poll_once()
+
+    # Now inject a genuinely new comment.
+    call_log: list[str] = []
+    real_mark_emitted = store.mark_emitted
+
+    def spy_mark_emitted(**kwargs):
+        call_log.append(kwargs["transition_kind"])
+        return real_mark_emitted(**kwargs)
+
+    monkeypatch.setattr(store, "mark_emitted", spy_mark_emitted)
+
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot_with_comments(
+        external_issue_comments=baseline + [
+            {
+                "id": 5002,
+                "author": "copilot[bot]",
+                "body": "second",
+                "posted_at": "2026-04-22T11:00:00Z",
+            },
+        ],
+    )
+    await watcher.poll_once()
+    # Exactly one new comment_posted INSERT (for id 5002), none for 5001.
+    assert call_log.count("comment_posted") == 1
+    comment_events = [p for t, p in published if t == TOPIC_COMMENT_POSTED]
+    assert [p["comment_id"] for p in comment_events] == [5001, 5002]
+
+
+# ---------------------------------------------------------------------------
+# Case-insensitive self-login filter (Copilot PR #39 nit).
+# GitHub logins are case-insensitive; comparing raw strings would leak
+# self-authored comments when storage / config cases differ.
+# ---------------------------------------------------------------------------
+
+
+async def test_self_login_filter_is_case_insensitive(tmp_path):
+    """Mixed-case ``self_login`` must still filter self-authored comments
+    on both channels. Uses ``.casefold()`` in the filter so e.g. a
+    stored ``self_login='Tolldog'`` still drops an issue comment
+    authored as ``tolldog`` (or ``TOLLDOG``)."""
+    from developer.pr_watcher import _snapshot_from_github
+
+    class _FakeClient:
+        async def get_pr(self, repo, pr_number):
+            return {
+                "state": "open", "merged": False, "merged_at": None,
+                "mergeable": True, "mergeable_state": "clean",
+                "head_sha": "sha1", "author": "Tolldog",
+            }
+
+        async def list_pr_reviews(self, repo, pr_number):
+            return []
+
+        async def list_pr_issue_comments(self, repo, pr_number):
+            return [
+                # Lowercase author; config is mixed-case "Tolldog" — must drop.
+                {"id": 1, "user": "tolldog", "body": "self lower",
+                 "created_at": "2026-04-22T10:00:00Z"},
+                # Uppercase variant — must also drop.
+                {"id": 2, "user": "TOLLDOG", "body": "self upper",
+                 "created_at": "2026-04-22T10:01:00Z"},
+                # External author — must retain.
+                {"id": 3, "user": "copilot-pull-request-reviewer[bot]",
+                 "body": "external", "created_at": "2026-04-22T10:02:00Z"},
+            ]
+
+        async def list_pr_review_comments(self, repo, pr_number):
+            from developer.github_client import GithubReviewComment
+            return [
+                # Case variant of config login — must drop.
+                GithubReviewComment(
+                    id=10, pr_number=pr_number, repo=repo, reviewer="TollDog",
+                    path="a.py", line=1, body="self mixed",
+                    created_at="2026-04-22T10:03:00Z", pull_request_review_id=None,
+                ),
+                # External — must retain.
+                GithubReviewComment(
+                    id=11, pr_number=pr_number, repo=repo,
+                    reviewer="copilot-pull-request-reviewer[bot]",
+                    path="b.py", line=5, body="bot",
+                    created_at="2026-04-22T10:04:00Z", pull_request_review_id=7,
+                ),
+            ]
+
+    # Mixed-case self_login value, simulating whatever the stored config
+    # surface happens to hand in — filter must still do the right thing.
+    snap = await _snapshot_from_github(
+        _FakeClient(), "owner/repo", 1, self_login="Tolldog",
+    )
+    # Both case variants of the self login are dropped; external kept.
+    assert [c["id"] for c in snap.external_issue_comments] == [3]
+    assert [f["id"] for f in snap.inline_findings] == [11]
