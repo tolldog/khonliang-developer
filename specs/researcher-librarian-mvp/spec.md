@@ -1,8 +1,11 @@
 # Researcher Librarian MVP
 
+**FR:** `fr_researcher_9cbe1e54`
+**Priority:** medium
+**Class:** agent
+**Status:** proposed
 **Milestone:** `ms_researcher_b99b97ea`
 **Target:** `researcher` (Phase 1 in-repo; Phase 2 potential split)
-**Status:** proposed
 **Seed source:** `khonliang-developer/docs/researcher-librarian-spec-seed.md`
 
 ## Summary

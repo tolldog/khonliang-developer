@@ -2,7 +2,7 @@
 
 A design proposal that split into **four milestones**:
 
-- **Milestone A** — Versioning primitives in `khonliang-bus-lib` (supersedes `tolldog/khonliang-bus-lib#12`). Ship immediately.
+- **Milestone A** — Versioning primitives in `khonliang-bus-lib` (builds on / extends `tolldog/khonliang-bus-lib#12`). **Landed** (see Status below).
 - **Milestone B** — `.reviewer/` directory + deterministic check framework in `khonliang-reviewer`.
 - **Milestone C** — Reusable GH Action for CI hard-gate on version bumps.
 - **Milestone D** — Benchmark harness with cross-source scoring (ground truth / local / external).
