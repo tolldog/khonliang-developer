@@ -911,6 +911,59 @@ async def test_update_milestone_status_and_supersede_via_agent(harness):
 
 
 @pytest.mark.asyncio
+async def test_update_milestone_status_force_false_string_not_treated_as_true(harness):
+    """String 'false' must NOT coerce to force=True.
+
+    Regression guard for PR #43 Copilot R1 finding 1: previously
+    ``force=bool(args.get("force", False))`` treated any non-empty
+    string as True, so JSON/CLI callers sending ``force="false"``
+    accidentally enabled forced rollbacks. The handler now uses
+    ``_bool_arg`` which strictly treats common false-ish strings
+    (``"false"``, ``"0"``, ``"no"``, ``"off"``, ``""``) as False.
+    """
+    work_unit = """{
+      "name": "Force-string cluster",
+      "targets": ["developer"],
+      "frs": [{"fr_id": "fr_developer_forcestr", "description": "scope", "priority": "high"}]
+    }"""
+    proposed = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": work_unit, "title": "Force-string milestone",
+    })
+    mid = proposed["milestone"]["id"]
+
+    # Drive the milestone into a terminal state so rollback requires force.
+    await harness.call("update_milestone_status", {
+        "milestone_id": mid, "status": "in_progress",
+    })
+    await harness.call("update_milestone_status", {
+        "milestone_id": mid, "status": "completed",
+    })
+
+    # Attempt rollback with the literal string "false" as force — must
+    # be refused, just as `force=False` would be.
+    result = await harness.call("update_milestone_status", {
+        "milestone_id": mid,
+        "status": "in_progress",
+        "force": "false",
+    })
+    assert "error" in result
+    assert "illegal transition" in result["error"]
+
+    # Confirm status unchanged on disk.
+    fetched = await harness.call("get_milestone", {"milestone_id": mid})
+    assert fetched["milestone"]["status"] == "completed"
+
+    # Sanity: the string "true" DOES coerce to True and permits rollback.
+    rolled = await harness.call("update_milestone_status", {
+        "milestone_id": mid,
+        "status": "in_progress",
+        "force": "true",
+    })
+    assert "error" not in rolled
+    assert rolled["milestone"]["status"] == "in_progress"
+
+
+@pytest.mark.asyncio
 async def test_delete_milestone_via_agent_refuses_with_audit_trail(harness):
     stale_wu = """{
       "name": "Mutated cluster",

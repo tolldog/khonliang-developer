@@ -963,7 +963,7 @@ class DeveloperAgent(BaseAgent):
                 milestone_id,
                 status,
                 notes=args.get("notes", ""),
-                force=bool(args.get("force", False)),
+                force=_bool_arg(args, "force", False),
             )
         except MilestoneError as e:
             await self._safe_report_gap("update_milestone_status", str(e))

@@ -360,3 +360,53 @@ def test_update_milestone_frs_refuses_on_non_proposed_milestone(pipeline):
         pipeline.milestones.update_frs(
             milestone.id, add_fr_ids=["fr_developer_lateadd"],
         )
+
+
+def test_update_milestone_status_rejects_backward_transition_without_force(pipeline):
+    """Monotonic-forward: planned → proposed requires force.
+
+    Guards against the permissive-table regression where backward
+    edges (planned→proposed, in_progress→planned) were allowed
+    without force. PR #43 Copilot R1 finding 2.
+    """
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+    pipeline.milestones.update_status(milestone.id, "planned")
+
+    with pytest.raises(MilestoneError, match="illegal transition"):
+        pipeline.milestones.update_status(milestone.id, MILESTONE_STATUS_PROPOSED)
+
+    # And in_progress → planned is also a backward edge now.
+    pipeline.milestones.update_status(milestone.id, MILESTONE_STATUS_IN_PROGRESS)
+    with pytest.raises(MilestoneError, match="illegal transition"):
+        pipeline.milestones.update_status(milestone.id, "planned")
+
+    # Force=True permits the rollback and records the audit marker.
+    rolled_back = pipeline.milestones.update_status(
+        milestone.id, "planned", notes="reopen for rescoping", force=True,
+    )
+    assert rolled_back.status == "planned"
+    assert rolled_back.notes_history[-1].get("force_rollback") is True
+
+
+def test_delete_milestone_refuses_when_fr_store_lookup_raises(pipeline):
+    """fr_store.get() raising must surface as a MilestoneError.
+
+    Previously the exception was silently swallowed, bypassing the
+    "refuse deletion when any bundled FR is in_progress" guard. PR #43
+    Copilot R1 finding 3.
+    """
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+    # Rewire the bundle to a synthetic id that our broken fr_store will
+    # raise on — keeps the test hermetic.
+    milestone.fr_ids = ["fr_developer_lookup_boom"]
+    pipeline.milestones._store(milestone)
+
+    class BrokenFRStore:
+        def get(self, fr_id):
+            raise RuntimeError(f"simulated FR store failure for {fr_id}")
+
+    with pytest.raises(MilestoneError, match="failed to verify FR state"):
+        pipeline.milestones.delete(milestone.id, fr_store=BrokenFRStore())
+
+    # Milestone is still present — delete was refused, not partially applied.
+    assert pipeline.milestones.get(milestone.id) is not None

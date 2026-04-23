@@ -53,10 +53,15 @@ TERMINAL_MILESTONE_STATUSES = {
 }
 ALL_MILESTONE_STATUSES = ACTIVE_MILESTONE_STATUSES | TERMINAL_MILESTONE_STATUSES
 
-# Allowed forward transitions. Terminal states have no outgoing edges —
-# rolling back out of a terminal state requires the caller to pass
-# ``force=True`` to :meth:`MilestoneStore.update_status` (and is
-# recorded in ``notes_history`` with a ``force_rollback`` marker).
+# Allowed forward transitions. The lifecycle is monotonic-forward:
+# proposed → planned → in_progress → (completed | abandoned | superseded |
+# archived). Terminal states have no outgoing edges. ANY backward edge
+# (completed → in_progress, in_progress → planned, planned → proposed,
+# etc.) requires the caller to pass ``force=True`` to
+# :meth:`MilestoneStore.update_status` (and is recorded in
+# ``notes_history`` with a ``force_rollback`` marker). Sideways jumps
+# to terminal states (abandon / supersede / archive from any active
+# status) are allowed without force since they do not reopen work.
 ALLOWED_MILESTONE_TRANSITIONS: dict[str, set[str]] = {
     MILESTONE_STATUS_PROPOSED: {
         MILESTONE_STATUS_PLANNED,
@@ -66,14 +71,12 @@ ALLOWED_MILESTONE_TRANSITIONS: dict[str, set[str]] = {
         MILESTONE_STATUS_ARCHIVED,
     },
     MILESTONE_STATUS_PLANNED: {
-        MILESTONE_STATUS_PROPOSED,
         MILESTONE_STATUS_IN_PROGRESS,
         MILESTONE_STATUS_ABANDONED,
         MILESTONE_STATUS_SUPERSEDED,
         MILESTONE_STATUS_ARCHIVED,
     },
     MILESTONE_STATUS_IN_PROGRESS: {
-        MILESTONE_STATUS_PLANNED,
         MILESTONE_STATUS_COMPLETED,
         MILESTONE_STATUS_ABANDONED,
         MILESTONE_STATUS_SUPERSEDED,
@@ -285,10 +288,14 @@ class MilestoneStore:
     ) -> Milestone:
         """Transition a milestone among lifecycle statuses.
 
-        Default (``force=False``) enforces the forward-only transition
-        graph in :data:`ALLOWED_MILESTONE_TRANSITIONS`. Passing
-        ``force=True`` allows rollback out of a terminal state (the
-        audit entry records the force so the history makes it obvious).
+        Default (``force=False``) enforces the monotonic-forward
+        transition graph in :data:`ALLOWED_MILESTONE_TRANSITIONS`:
+        proposed → planned → in_progress → terminal, plus sideways
+        jumps to terminal states (abandoned / superseded / archived)
+        from any active status. Any backward edge (e.g. completed →
+        in_progress, in_progress → planned, planned → proposed)
+        requires ``force=True``; the audit entry records the force via
+        ``force_rollback=True`` so the history makes it obvious.
 
         The idempotent case (``status`` already matches) still appends
         an audit note when ``notes`` is provided, so "confirmed in-
@@ -481,9 +488,9 @@ class MilestoneStore:
         if _has_non_seed_history(milestone.notes_history):
             raise MilestoneError(
                 f"cannot delete milestone {milestone_id!r}: notes_history has "
-                f"{len(milestone.notes_history)} entries beyond the initial "
-                "seed (mutations recorded). Use supersede_milestone to "
-                "preserve the audit trail."
+                f"{len(milestone.notes_history)} entries recorded (including "
+                "any creation seed; mutations beyond the seed are present). "
+                "Use supersede_milestone to preserve the audit trail."
             )
 
         fr_check_skipped = False
@@ -492,10 +499,20 @@ class MilestoneStore:
             for fr_id in milestone.fr_ids:
                 try:
                     fr = fr_store.get(fr_id)
-                except Exception:
-                    # FR store raised on a specific id — skip, don't block
-                    # the whole delete on a store-side glitch.
-                    continue
+                except Exception as exc:
+                    # FR store raised — we cannot safely verify whether
+                    # this FR is in_progress, and silently continuing
+                    # would bypass the safety guard (e.g. on a redirect
+                    # cycle or DB issue). Refuse the delete and surface
+                    # the failure; callers who really want to proceed
+                    # can clear the FR bundle via ``update_frs`` first.
+                    raise MilestoneError(
+                        f"cannot delete milestone {milestone_id!r}: "
+                        f"failed to verify FR state for {fr_id!r} "
+                        f"({type(exc).__name__}: {exc}). Clear the "
+                        "FR bundle via update_milestone_frs first if "
+                        "the FR is unreachable by design."
+                    ) from exc
                 if fr is None:
                     continue
                 # Access the same status field surface the FR dataclass
