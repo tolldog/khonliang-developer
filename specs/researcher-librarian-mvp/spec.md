@@ -371,10 +371,24 @@ a test bus fixture.
 2. `rebuild_neighborhoods` persists:
    - taxonomy index
    - concept neighborhoods
-   - stable paper classification records
-   - compact classification-change artifacts
-   All writes are idempotent: running twice with unchanged corpus
-   produces identical artifact content.
+
+   The rebuild additionally triggers a cascade of per-paper
+   `classify_paper` calls (for papers whose classification is
+   stale relative to the new taxonomy), which in turn write:
+   - stable paper classification records (via `classify_paper`)
+   - compact classification-change artifacts (via `classify_paper`)
+
+   Persisting classification records and classification-change
+   artifacts is `classify_paper`'s responsibility — not
+   `rebuild_neighborhoods`'. `rebuild_neighborhoods` owns the
+   taxonomy/neighborhood artifacts and kicks off the classify
+   cascade; it does not write to the paper catalog directly.
+
+   All writes (taxonomy index, neighborhood snapshots, and the
+   per-paper classification records produced by the triggered
+   `classify_paper` cascade) are idempotent: running
+   `rebuild_neighborhoods` twice with an unchanged corpus
+   produces identical artifact content end-to-end.
 3. `taxonomy_report(audience="developer-researcher")` returns a
    developer-focused taxonomy view that does not drown in generic
    groups. Similar per other audience lenses.
@@ -394,10 +408,13 @@ a test bus fixture.
    payloads conform to the structured-research-request shape
    specified in the Event + Workflow Integration section
    (`request_id`, `topic`, `audience`, `branch`, `priority`,
-   `rationale`, `suggested_sources`). Researcher-side consumption
-   is a cross-cluster dep (new FR — see below); for this spec's
-   acceptance, librarian's responsibility ends at the event
-   emission with a well-formed payload.
+   `rationale`, `suggested_sources`, `detail`). All fields listed
+   are required on the wire; `detail` defaults to `"brief"` at
+   the caller when unspecified but the payload must still carry
+   it explicitly so the shape is self-describing. Researcher-side
+   consumption is a cross-cluster dep (new FR — see below); for
+   this spec's acceptance, librarian's responsibility ends at
+   the event emission with a well-formed payload.
 7. When a paper can't be cleanly classified, `classify_paper` emits
    `library.classification_ambiguous` with the top-k candidates and
    does NOT write a guess to the durable catalog.
