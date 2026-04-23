@@ -448,20 +448,26 @@ def scan_fr_store(
             key = (fr_id, SIGNAL_MIGRATE)
             if key not in seen:
                 seen.add(key)
-                shared = sorted(surface_tokens & fr_tokens)[:8]
+                # Full intersection drives the reported count; the preview
+                # slice is for UI readability only. Conflating the two
+                # under-reports overlap for highly similar FRs (every FR
+                # with 9+ shared tokens used to read as exactly 8).
+                full_overlap = sorted(surface_tokens & fr_tokens)
+                shared_preview = full_overlap[:8]
                 candidates.append(IntegrationCandidate(
                     kind="fr", target_id=fr_id,
                     signal=SIGNAL_MIGRATE,
                     score=min(0.99, score),
                     rationale=(
-                        f"FR overlaps on {len(shared)} tokens "
-                        f"(e.g. {', '.join(shared[:4])})"
+                        f"FR overlaps on {len(full_overlap)} tokens "
+                        f"(e.g. {', '.join(shared_preview[:4])})"
                     ),
                     metadata={
                         "status": getattr(fr, "status", ""),
                         "target": getattr(fr, "target", ""),
                         "body_sim": round(body_sim, 3),
-                        "shared_tokens": shared,
+                        "shared_token_count": len(full_overlap),
+                        "shared_tokens": shared_preview,
                     },
                 ))
 

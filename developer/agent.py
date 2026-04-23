@@ -1016,22 +1016,54 @@ class DeveloperAgent(BaseAgent):
             await self._safe_report_gap("distill_integration_points", msg)
             return {"error": msg}
 
-        raw_candidates = payload.get("candidates") or []
+        # Defensive shape validation — older / truncated / hand-edited
+        # KnowledgeEntry rows must not crash the handler. Each gate
+        # surfaces a specific error so a caller can diagnose without
+        # pulling the raw artifact.
+        if not isinstance(payload, dict):
+            msg = (
+                f"scan artifact {scan_id!r} malformed: payload is "
+                f"{type(payload).__name__}, expected dict"
+            )
+            await self._safe_report_gap("distill_integration_points", msg)
+            return {"error": msg}
+        raw_candidates = payload.get("candidates")
+        if raw_candidates is None:
+            raw_candidates = []
+        if not isinstance(raw_candidates, list):
+            msg = (
+                f"scan artifact {scan_id!r} malformed: candidates is "
+                f"{type(raw_candidates).__name__}, expected list"
+            )
+            await self._safe_report_gap("distill_integration_points", msg)
+            return {"error": msg}
         if signal:
-            raw_candidates = [c for c in raw_candidates if c.get("signal") == signal]
+            raw_candidates = [
+                c for c in raw_candidates
+                if isinstance(c, dict) and c.get("signal") == signal
+            ]
         # The stored shape matches IntegrationCandidate.to_full(); rehydrate
         # into objects for uniform ranking with the live-scan path.
-        rehydrated = [
-            integration_scan.IntegrationCandidate(
+        # Non-dict entries are skipped with a warning rather than crashing
+        # the handler — an artifact full of bad rows still returns whatever
+        # good rows survived.
+        rehydrated: list[integration_scan.IntegrationCandidate] = []
+        for c in raw_candidates:
+            if not isinstance(c, dict):
+                logger.warning(
+                    "distill_integration_points: skipping non-dict candidate "
+                    "in scan %s: %r",
+                    scan_id, type(c).__name__,
+                )
+                continue
+            rehydrated.append(integration_scan.IntegrationCandidate(
                 kind=c.get("kind", ""),
                 target_id=c.get("target_id", ""),
                 signal=c.get("signal", ""),
                 score=float(c.get("score") or 0.0),
                 rationale=c.get("rationale", ""),
                 metadata=dict(c.get("metadata") or {}),
-            )
-            for c in raw_candidates
-        ]
+            ))
         ranked = integration_scan.rank_candidates(rehydrated)
         return self._project_scan_response(
             scan_id=scan_id,
@@ -1049,7 +1081,9 @@ class DeveloperAgent(BaseAgent):
     ) -> integration_scan.FeatureSurface:
         """Load the underlying feature and extract a scan surface.
 
-        Raises ``LookupError`` when the source can't be found and
+        Raises ``LookupError`` when the source can't be found (includes
+        bus / network faults while resolving the skill registry — an
+        unreachable registry is semantically a lookup miss) and
         ``ValueError`` when the id shape is unparseable. Callers convert
         both into an error-dict response.
         """
@@ -1086,7 +1120,20 @@ class DeveloperAgent(BaseAgent):
         if kind == "skill":
             # source_id is '<agent>.<skill>'; resolve via the bus skill
             # registry to pull the description + args schema.
-            skills = await self._fetch_remote_skills()
+            # ``_fetch_remote_skills`` can raise network / HTTP errors when
+            # the bus is unreachable; the handler's caller only handles
+            # ``ValueError`` / ``LookupError`` so we normalise bus/network
+            # faults into ``LookupError`` here (the skill can't be located
+            # without a reachable registry; that's semantically a lookup miss
+            # from the handler's perspective).
+            try:
+                skills = await self._fetch_remote_skills()
+            except (ValueError, LookupError):
+                raise
+            except Exception as e:  # noqa: BLE001 — any httpx/bus error
+                raise LookupError(
+                    f"skill registry unavailable while resolving {source_id!r}: {e}"
+                ) from e
             target_name = source_id
             if "." in source_id:
                 agent_id, skill_name = source_id.split(".", 1)

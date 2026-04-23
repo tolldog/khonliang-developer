@@ -7,6 +7,8 @@ the distill helper's no-rescan contract and LLM-rationale cap.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from khonliang_bus.testing import AgentTestHarness
 
@@ -747,7 +749,7 @@ def test_compute_scan_id_same_second_distinct_sources_unique():
     assert integration_scan.compute_scan_id(src1, seed=seed) != integration_scan.compute_scan_id(src2, seed=seed)
 
 
-def test_compute_scan_id_same_source_distinct_seconds_unique():
+def test_compute_scan_id_same_source_distinct_seconds_unique(monkeypatch):
     """Two scans of the same source with nanosecond-adjacent seeds produce
     distinct ids — catches the pre-fix int(epoch) same-second collision.
 
@@ -755,6 +757,13 @@ def test_compute_scan_id_same_source_distinct_seconds_unique():
     the same wall-clock second used to hash to the same ``scan_id`` and
     overwrite each other's KnowledgeEntry. ``time.time_ns()`` + integer
     seeding avoids the collision.
+
+    The default-seeded branch monkeypatches ``time.time_ns`` to a counter
+    so the assertion that "distinct ns seeds → distinct ids" is exercised
+    deterministically. Earlier the test called ``time.time_ns()`` three
+    times and asserted the results diverged on wall-clock resolution —
+    flaky on low-resolution platforms where three back-to-back calls can
+    return the same value.
     """
     src = {"kind": "fr", "id": "fr_developer_abc"}
     # Two seeds 1 ns apart — would collide under int(epoch) second-resolution.
@@ -763,11 +772,197 @@ def test_compute_scan_id_same_source_distinct_seconds_unique():
     assert integration_scan.compute_scan_id(src, seed=seed_a) != integration_scan.compute_scan_id(src, seed=seed_b)
 
     # Default-seeded (no explicit seed) calls also differ across nanosecond
-    # boundaries. This is the real-world scenario — back-to-back scans.
+    # boundaries. Inject a deterministic counter into ``time.time_ns`` so
+    # the regression assertion isn't sensitive to host-clock resolution.
+    counter = iter([
+        1_700_000_000_000_000_000,
+        1_700_000_000_000_000_001,
+        1_700_000_000_000_000_002,
+    ])
+    monkeypatch.setattr(integration_scan.time, "time_ns", lambda: next(counter))
     id1 = integration_scan.compute_scan_id(src)
     id2 = integration_scan.compute_scan_id(src)
-    # Nanosecond resolution makes back-to-back Python calls overwhelmingly
-    # likely to land on distinct ns timestamps; a sequence of three ids
-    # cannot all be identical unless ns resolution isn't working.
     id3 = integration_scan.compute_scan_id(src)
-    assert len({id1, id2, id3}) >= 2
+    # All three seeds are distinct → all three ids must be distinct
+    # (hash collisions on 8-hex prefixes aren't feasible at this scale).
+    assert len({id1, id2, id3}) == 3
+
+
+# ---------------------------------------------------------------------------
+# Copilot R2 — _resolve_feature_surface wraps bus / network errors
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_feature_surface_skill_source_wraps_bus_error_as_lookup_error(
+    harness,
+):
+    """Bus / network failures while fetching the skill registry surface
+    as ``LookupError`` from ``_resolve_feature_surface``, matching the
+    docstring contract. The handler's ``except (ValueError, LookupError)``
+    then converts that into a clean error-dict rather than a 500-equivalent
+    unhandled-exception unwind.
+
+    Regression for Copilot R2 finding #1: ``_fetch_remote_skills`` raises
+    ``httpx.HTTPError`` / ``RuntimeError`` shapes that escape the caller's
+    narrow exception set.
+    """
+    # Patch _fetch_remote_skills to raise a representative bus error.
+    async def _boom(self):
+        raise RuntimeError("bus unreachable — connection refused")
+    harness.agent._fetch_remote_skills = _boom.__get__(harness.agent)
+
+    with pytest.raises(LookupError) as exc_info:
+        await harness.agent._resolve_feature_surface(
+            "skill", "developer-primary.something",
+        )
+    assert "registry unavailable" in str(exc_info.value)
+    assert "developer-primary.something" in str(exc_info.value)
+
+    # End-to-end: the handler surfaces the LookupError as an error-dict
+    # with no unhandled exception escaping.
+    result = await harness.call(
+        "suggest_integration_points",
+        {"source": {"kind": "skill", "id": "developer-primary.something"}},
+    )
+    assert "error" in result
+    assert "registry unavailable" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Copilot R2 — distill_integration_points handles malformed payloads
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_distill_integration_points_handles_malformed_payload(harness):
+    """Older / hand-edited / truncated KnowledgeEntry artifacts must not
+    crash ``distill_integration_points``. Three failure modes are covered:
+
+    * payload is not a dict (e.g. a bare list)
+    * payload['candidates'] is not a list (e.g. a string)
+    * individual candidates in the list are not dicts (e.g. None)
+
+    Regression for Copilot R2 finding #2: the handler assumed the stored
+    shape verbatim and threw ``AttributeError`` on malformed rows.
+    """
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+
+    _install_empty_bus(harness)
+
+    def _put_artifact(scan_id: str, content: str) -> None:
+        entry = KnowledgeEntry(
+            id=scan_id,
+            tier=Tier.DERIVED,
+            title=f"Malformed artifact {scan_id}",
+            content=content,
+            source="developer.integration_scan",
+            scope="development",
+            confidence=1.0,
+            status=EntryStatus.DISTILLED,
+            tags=["scan_integration"],
+            metadata={},
+        )
+        harness.agent.pipeline.knowledge.add(entry)
+
+    # 1. payload is a list, not a dict.
+    _put_artifact("scan_integration_bad1", json.dumps(["not", "a", "dict"]))
+    r1 = await harness.call(
+        "distill_integration_points",
+        {"scan_id": "scan_integration_bad1"},
+    )
+    assert "error" in r1
+    assert "not a dict" in r1["error"] or "expected dict" in r1["error"]
+
+    # 2. payload is a dict but candidates is not a list.
+    _put_artifact(
+        "scan_integration_bad2",
+        json.dumps({"source": {"kind": "fr", "id": "x"}, "candidates": "oops"}),
+    )
+    r2 = await harness.call(
+        "distill_integration_points",
+        {"scan_id": "scan_integration_bad2"},
+    )
+    assert "error" in r2
+    assert "candidates" in r2["error"]
+
+    # 3. Mixed valid + invalid candidate entries — invalid ones skipped,
+    # valid ones survive. Artifact must successfully distil into a
+    # non-error response with the good rows intact.
+    _put_artifact(
+        "scan_integration_bad3",
+        json.dumps({
+            "source": {"kind": "fr", "id": "fr_developer_abc"},
+            "surface": {"kind": "fr", "id": "fr_developer_abc"},
+            "candidates": [
+                None,
+                "also-not-a-dict",
+                {
+                    "kind": "fr",
+                    "target_id": "fr_developer_xyz",
+                    "signal": integration_scan.SIGNAL_MIGRATE,
+                    "score": 0.7,
+                    "rationale": "valid",
+                    "metadata": {"status": "open"},
+                },
+            ],
+            "audience": "",
+        }),
+    )
+    r3 = await harness.call(
+        "distill_integration_points",
+        {"scan_id": "scan_integration_bad3"},
+    )
+    assert "error" not in r3, f"valid rows should survive: {r3!r}"
+    assert r3["total_candidates"] == 1
+    assert r3["top_candidates"][0]["target_id"] == "fr_developer_xyz"
+
+
+# ---------------------------------------------------------------------------
+# Copilot R2 — migrate rationale reports full overlap, not truncated
+# ---------------------------------------------------------------------------
+
+
+def test_scan_fr_store_migrate_rationale_reports_full_overlap_count():
+    """The migrate-signal rationale must reflect the FULL intersection
+    size, not the truncated preview slice. Pre-fix, two FRs with 9 and
+    20 shared tokens both read as "overlaps on 8 tokens" because the
+    count was taken after the ``[:8]`` slice.
+
+    Regression for Copilot R2 finding #3: separate preview from count.
+    """
+    class StubFR:
+        def __init__(self, id_, title, description):
+            self.id = id_
+            self.title = title
+            self.description = description
+            self.concept = ""
+
+    # Build a surface with many tokens; FR shares >> 8 of them.
+    many_shared = {
+        "alpha", "bravo", "charlie", "delta", "echo",
+        "foxtrot", "golf", "hotel", "india", "juliet",
+        "kilo", "lima",
+    }
+    surface = integration_scan.FeatureSurface(
+        kind="fr", id="fr_developer_source",
+        title="Token overlap test",
+        description="Token overlap test.",
+        tokens=many_shared | {"source_only"},
+    )
+    fr = StubFR(
+        id_="fr_developer_dup",
+        title="Alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima extra",
+        description="Alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima.",
+    )
+
+    candidates = integration_scan.scan_fr_store(surface, [fr])
+    migrate = [c for c in candidates if c.signal == integration_scan.SIGNAL_MIGRATE]
+    assert migrate, "test expects a migrate candidate"
+    cand = migrate[0]
+    # Rationale reports the full 12-token overlap, not "8".
+    assert "12 tokens" in cand.rationale, cand.rationale
+    # Preview slice in metadata is still capped at 8.
+    assert len(cand.metadata["shared_tokens"]) == 8
+    # Full count lives in its own field.
+    assert cand.metadata["shared_token_count"] == 12
