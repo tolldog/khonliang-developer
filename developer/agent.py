@@ -19,9 +19,13 @@ import json
 import logging
 import re
 import sys
+import time
 from pathlib import Path
+from typing import Any, Optional
 
 from khonliang_bus import BaseAgent, Skill, Collaboration, handler
+
+from developer import integration_scan
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +229,32 @@ class DeveloperAgent(BaseAgent):
                    "detail": {"type": "string", "default": "brief"},
                    "timeout_s": {"type": "number", "default": 90}},
                   since="0.9.0"),
+            # Symmetric partner to fr_candidates_from_concepts — turns a
+            # merged feature into ranked ecosystem-adoption proposals.
+            # MVP covers 4 of 5 scan sources; source-code grep across
+            # dev repos is deferred until a `dev_repos` registry lands
+            # (fr_developer_82fe7309).
+            Skill("suggest_integration_points",
+                  "Scan the ecosystem for adoption sites of a merged feature "
+                  "(FR / PR / skill). Returns ranked candidates by signal.",
+                  {"source": {"type": "object", "required": True,
+                              "description": "{'kind':'fr'|'pr'|'skill','id':str}"},
+                   "detail": {"type": "string", "default": "brief",
+                              "description": "brief / compact / full"},
+                   "audience": {"type": "string", "default": "",
+                                "description": "optional filter, e.g. 'builder'"},
+                   "top_n": {"type": "integer", "default": 20,
+                             "description": "max candidates returned in brief"}},
+                  since="0.17.0"),
+            Skill("distill_integration_points",
+                  "Re-project a prior suggest_integration_points scan artifact "
+                  "without rescanning. Filter by signal / top_n / detail.",
+                  {"scan_id": {"type": "string", "required": True},
+                   "top_n": {"type": "integer", "default": 20},
+                   "signal": {"type": "string", "default": "",
+                              "description": "optional signal filter"},
+                   "detail": {"type": "string", "default": "brief"}},
+                  since="0.17.0"),
             # Developer-owned FR work planning
             Skill("next_work_unit", "Get the highest-ranked developer FR work unit",
                   {"target": {"type": "string", "default": ""},
@@ -832,6 +862,623 @@ class DeveloperAgent(BaseAgent):
             "existing_match_count": sum(1 for c in candidates if c["existing_matches"]),
             "candidates": candidates,
         }
+
+    # -- integration-point scanning (fr_developer_82fe7309) --
+
+    @handler("suggest_integration_points")
+    async def handle_suggest_integration_points(self, args):
+        """Scan the ecosystem for adoption sites of a merged feature.
+
+        Symmetric partner to ``fr_candidates_from_concepts`` — that skill
+        turns concept bundles into new-FR proposals; this one turns merged
+        features into integration proposals. MVP covers 4 of 5 documented
+        scan sources (FR store, agent-registered skills, bus events without
+        subscribers, FR-body keyword mentions). Source-code grep across dev
+        repos is deferred.
+        """
+        source = args.get("source")
+        if not isinstance(source, dict):
+            msg = f"source must be an object with 'kind' and 'id', got {type(source).__name__}"
+            await self._safe_report_gap("suggest_integration_points", msg)
+            return {"error": msg}
+
+        kind = str(source.get("kind") or "").strip().lower()
+        source_id = str(source.get("id") or "").strip()
+        if kind not in ("fr", "pr", "skill"):
+            msg = f"source.kind must be 'fr', 'pr', or 'skill', got {kind!r}"
+            await self._safe_report_gap("suggest_integration_points", msg)
+            return {"error": msg}
+        if not source_id:
+            msg = "source.id is required"
+            await self._safe_report_gap("suggest_integration_points", msg)
+            return {"error": msg}
+
+        detail = str(args.get("detail") or "brief").strip() or "brief"
+        audience = str(args.get("audience") or "").strip()
+        try:
+            top_n = int(args.get("top_n") or 20)
+        except (TypeError, ValueError):
+            top_n = 20
+        top_n = max(1, top_n)
+
+        # Resolve the feature surface. Each branch raises a descriptive
+        # error that we surface verbatim rather than mapping to a generic
+        # "invalid source" — callers want to know which field broke.
+        # For ``kind == "skill"`` the registry is fetched here as a
+        # side-effect of resolution and threaded through to ``scan_agent_skills``
+        # below to avoid a second bus round-trip. PR #46 Copilot R7 finding #4.
+        try:
+            surface, prefetched_registry = await self._resolve_feature_surface(
+                kind, source_id,
+            )
+        except (ValueError, LookupError) as e:
+            msg = str(e)
+            await self._safe_report_gap("suggest_integration_points", msg)
+            return {"error": msg}
+
+        # Gather candidates from the four active scan sources. Each scan
+        # is independent — a failure in the bus-skills lookup mustn't
+        # stop FR-store scanning. We accumulate and rank the survivors.
+        candidates: list[integration_scan.IntegrationCandidate] = []
+
+        try:
+            existing = self.pipeline.frs.list(include_all=True)
+        except Exception as e:
+            logger.warning("suggest_integration_points: fr_store.list failed: %s", e)
+            existing = []
+        candidates.extend(integration_scan.scan_fr_store(surface, existing))
+
+        if prefetched_registry is not None:
+            remote_skills = prefetched_registry
+        else:
+            try:
+                remote_skills = await self._fetch_remote_skills()
+            except Exception as e:
+                logger.warning(
+                    "suggest_integration_points: bus skill fetch failed: %s", e,
+                )
+                remote_skills = []
+        skill_candidates = integration_scan.scan_agent_skills(surface, remote_skills)
+        # Defensive self-reference filter. ``scan_agent_skills`` already
+        # excludes the source's own ``(agent_id, skill_name)`` pair when
+        # the source is itself a skill, but any future scan source that
+        # emits skill_callsite candidates could miss this gate. Filter
+        # here against the authoritative source identity so a scan can
+        # never recommend the feature replace itself. PR #46 Copilot R5.
+        if kind == "skill" and "." in source_id:
+            src_agent, src_skill = source_id.split(".", 1)
+            skill_candidates = [
+                c for c in skill_candidates
+                if not (
+                    c.metadata.get("agent_id") == src_agent
+                    and c.metadata.get("skill_name") == src_skill
+                )
+            ]
+        candidates.extend(skill_candidates)
+
+        try:
+            subscribers = await self._fetch_subscriber_counts(surface.new_events)
+        except Exception as e:
+            logger.warning("suggest_integration_points: subscriber fetch failed: %s", e)
+            subscribers = {}
+        candidates.extend(integration_scan.scan_event_subscribers(surface, subscribers))
+
+        # Audience filter is applied post-scan: the metadata on each
+        # candidate may carry an 'audience' hint (e.g. from FR tags).
+        # MVP keeps this simple — filter out candidates whose metadata
+        # carries an explicit audience that doesn't match. Candidates
+        # without an audience tag pass through unfiltered.
+        if audience:
+            candidates = [
+                c for c in candidates
+                if not c.metadata.get("audience")
+                or c.metadata.get("audience") == audience
+            ]
+
+        ranked = integration_scan.rank_candidates(candidates)
+
+        # Best-effort LLM rationales for the top slice — cap at the
+        # module's MAX_LLM_RATIONALES to keep the budget bounded even
+        # if a caller passes a huge top_n.
+        rationale_cap = min(top_n, integration_scan.MAX_LLM_RATIONALES)
+        rationale_fn = getattr(self, "_llm_rationale", None)
+        llm_calls = await integration_scan.apply_llm_rationales(
+            ranked, surface, rationale_fn, top_n=rationale_cap,
+        )
+
+        # Persist the full scan artifact so distill_integration_points
+        # can re-project without rescanning. Storage uses the local
+        # knowledge store with a 'scan_integration' tag — keeps the
+        # pattern consistent with FR / milestone storage.
+        scan_id = integration_scan.compute_scan_id({"kind": kind, "id": source_id})
+        persistence_error: Optional[str] = None
+        try:
+            self._store_integration_scan(
+                scan_id=scan_id,
+                source={"kind": kind, "id": source_id},
+                surface=surface,
+                ranked=ranked,
+                audience=audience,
+            )
+        except Exception as e:
+            logger.warning("suggest_integration_points: artifact write failed: %s", e)
+            persistence_error = str(e)
+
+        extra: dict[str, Any] = {"llm_rationale_calls": llm_calls}
+        # Signal persistence failure explicitly so callers can't accidentally
+        # call ``distill_integration_points`` on an id that won't resolve.
+        # We still return the computed scan id (as ``scan_id_unpersisted``)
+        # so the value isn't lost, but ``scan_id`` itself is nulled — the
+        # live-scan result is still fully available in ``top_candidates``.
+        # PR #46 Copilot R3 finding #4.
+        if persistence_error is not None:
+            return self._project_scan_response(
+                scan_id="",  # distill will not resolve — signal via explicit empty
+                source={"kind": kind, "id": source_id, "surface": surface.to_public_dict()},
+                ranked=ranked,
+                top_n=top_n,
+                detail=detail,
+                extra={
+                    **extra,
+                    "persistence_error": persistence_error,
+                    "scan_id_unpersisted": scan_id,
+                },
+            )
+
+        return self._project_scan_response(
+            scan_id=scan_id,
+            source={"kind": kind, "id": source_id, "surface": surface.to_public_dict()},
+            ranked=ranked,
+            top_n=top_n,
+            detail=detail,
+            extra=extra,
+        )
+
+    @handler("distill_integration_points")
+    async def handle_distill_integration_points(self, args):
+        """Re-project a stored scan artifact without rescanning.
+
+        ``scan_id`` is the id returned by ``suggest_integration_points``.
+        Filtering is pure re-ranking — no new scan, no bus requests,
+        no LLM calls. The same artifact id is echoed back unchanged.
+        """
+        scan_id = str(args.get("scan_id") or "").strip()
+        if not scan_id:
+            return {"error": "scan_id is required"}
+        try:
+            top_n = int(args.get("top_n") or 20)
+        except (TypeError, ValueError):
+            top_n = 20
+        top_n = max(1, top_n)
+        signal = str(args.get("signal") or "").strip()
+        detail = str(args.get("detail") or "brief").strip() or "brief"
+
+        entry = self.pipeline.knowledge.get(scan_id)
+        if entry is None:
+            msg = f"scan artifact not found: {scan_id!r}"
+            await self._safe_report_gap("distill_integration_points", msg)
+            return {"error": msg}
+
+        # Artifact-type gate: refuse to distill entries that weren't
+        # produced by ``suggest_integration_points``. The caller could
+        # pass any KnowledgeEntry id whose content happens to parse as
+        # JSON; without this check we'd return a misleading
+        # ``from_artifact`` response instead of a clear error. PR #46
+        # Copilot R4 finding #1.
+        tags = getattr(entry, "tags", None) or []
+        if "scan_integration" not in tags:
+            msg = f"not an integration-scan artifact: {scan_id}"
+            await self._safe_report_gap("distill_integration_points", msg)
+            return {"error": msg}
+
+        try:
+            payload = json.loads(entry.content)
+        except (ValueError, TypeError) as e:
+            msg = f"scan artifact {scan_id!r} is malformed: {e}"
+            await self._safe_report_gap("distill_integration_points", msg)
+            return {"error": msg}
+
+        # Defensive shape validation — older / truncated / hand-edited
+        # KnowledgeEntry rows must not crash the handler. Each gate
+        # surfaces a specific error so a caller can diagnose without
+        # pulling the raw artifact.
+        if not isinstance(payload, dict):
+            msg = (
+                f"scan artifact {scan_id!r} malformed: payload is "
+                f"{type(payload).__name__}, expected dict"
+            )
+            await self._safe_report_gap("distill_integration_points", msg)
+            return {"error": msg}
+
+        # Payload-shape gate: even with the scan_integration tag, the
+        # JSON body must carry the expected integration-scan keys
+        # (candidates + source). Otherwise it's either a corrupted
+        # artifact or a mis-tagged row — either way we shouldn't pretend
+        # to distill it. PR #46 Copilot R4 finding #1.
+        if "candidates" not in payload or "source" not in payload:
+            msg = f"not an integration-scan artifact: {scan_id}"
+            await self._safe_report_gap("distill_integration_points", msg)
+            return {"error": msg}
+
+        raw_candidates = payload.get("candidates")
+        if raw_candidates is None:
+            raw_candidates = []
+        if not isinstance(raw_candidates, list):
+            msg = (
+                f"scan artifact {scan_id!r} malformed: candidates is "
+                f"{type(raw_candidates).__name__}, expected list"
+            )
+            await self._safe_report_gap("distill_integration_points", msg)
+            return {"error": msg}
+        # The stored shape matches IntegrationCandidate.to_full(); rehydrate
+        # into objects for uniform ranking with the live-scan path.
+        # Non-dict entries and individual items with non-coercible fields
+        # (e.g. a non-numeric score string, a metadata value that's a list
+        # instead of a mapping) are skipped with a warning rather than
+        # crashing the handler — an artifact full of bad rows still returns
+        # whatever good rows survived. The response carries a
+        # ``skipped_items`` counter so callers can tell the artifact was
+        # partial without diffing against a fresh scan.
+        #
+        # Signal filtering happens post-rehydration so malformed non-dict
+        # items are still counted in skipped_items — filtering them out
+        # pre-rehydration would silently drop them, undermining the
+        # "partial artifact" signal. PR #46 Copilot R7 finding #2.
+        rehydrated: list[integration_scan.IntegrationCandidate] = []
+        skipped = 0
+        for c in raw_candidates:
+            if not isinstance(c, dict):
+                skipped += 1
+                logger.warning(
+                    "distill_integration_points: skipping non-dict candidate "
+                    "in scan %s: %r",
+                    scan_id, type(c).__name__,
+                )
+                continue
+            # Per-item type gates: score must coerce to float; metadata
+            # must be mapping-shaped (accept a missing/None field, reject
+            # lists/strings which would raise in ``dict(...)``). PR #46
+            # Copilot R3 finding #3.
+            raw_score = c.get("score")
+            try:
+                score = float(raw_score) if raw_score is not None else 0.0
+            except (TypeError, ValueError):
+                skipped += 1
+                logger.warning(
+                    "distill_integration_points: skipping candidate with "
+                    "non-numeric score in scan %s: %r (score=%r)",
+                    scan_id, c.get("target_id"), raw_score,
+                )
+                continue
+            raw_meta = c.get("metadata")
+            if raw_meta is None:
+                meta: dict[str, Any] = {}
+            elif isinstance(raw_meta, dict):
+                meta = dict(raw_meta)
+            else:
+                skipped += 1
+                logger.warning(
+                    "distill_integration_points: skipping candidate with "
+                    "non-dict metadata in scan %s: %r (metadata type=%s)",
+                    scan_id, c.get("target_id"), type(raw_meta).__name__,
+                )
+                continue
+            rehydrated.append(integration_scan.IntegrationCandidate(
+                kind=str(c.get("kind", "")),
+                target_id=str(c.get("target_id", "")),
+                signal=str(c.get("signal", "")),
+                score=score,
+                rationale=str(c.get("rationale", "")),
+                metadata=meta,
+            ))
+        if signal:
+            rehydrated = [r for r in rehydrated if r.signal == signal]
+        ranked = integration_scan.rank_candidates(rehydrated)
+        extra: dict[str, Any] = {"from_artifact": True, "signal_filter": signal}
+        if skipped:
+            extra["skipped_items"] = skipped
+        # Rebuild the live-scan response shape: ``source.surface`` is a
+        # nested key on the suggest path (see handle_suggest_integration_points)
+        # but stored as a sibling of ``source`` in the artifact payload. Merge
+        # them back so distill and suggest responses are symmetric — callers
+        # reproducing a scan from the artifact can see what surface was
+        # scanned. PR #46 Copilot R4 finding #2.
+        #
+        # Defensive type gate: a mis-tagged or corrupted artifact with a
+        # non-dict ``source`` (string / list / number) would crash
+        # ``dict(raw_source)`` on list/str inputs in non-obvious ways
+        # (``dict(["a", "b"])`` raises ``ValueError``; ``dict("ab")`` raises
+        # ``ValueError`` too). Surface a clear validation error rather than
+        # bypass the earlier payload-shape gates. Same class as the
+        # per-candidate validation (Copilot R3 finding #3) — PR #46 Copilot
+        # R6 finding #1.
+        # The earlier ``"source" not in payload`` gate catches a missing
+        # key but lets ``"source": null`` through. Previously we defaulted
+        # ``None`` to ``{}`` and proceeded silently, which produced
+        # responses missing ``source.kind`` / ``source.id`` — consumers
+        # expecting those fields would break without a clear error. A
+        # single ``isinstance(..., dict)`` check cleanly rejects both
+        # ``None`` and non-dict types (list/str/number) with one error
+        # message. PR #46 Copilot R9 findings #2, #3.
+        raw_source = payload.get("source")
+        if not isinstance(raw_source, dict):
+            msg = (
+                f"scan artifact {scan_id!r} malformed: source is "
+                f"{type(raw_source).__name__}, expected dict"
+            )
+            await self._safe_report_gap("distill_integration_points", msg)
+            return {"error": msg}
+        merged_source: dict[str, Any] = dict(raw_source)
+        stored_surface = payload.get("surface")
+        if stored_surface is not None and "surface" not in merged_source:
+            merged_source["surface"] = stored_surface
+        return self._project_scan_response(
+            scan_id=scan_id,
+            source=merged_source,
+            ranked=ranked,
+            top_n=top_n,
+            detail=detail,
+            extra=extra,
+        )
+
+    # -- integration scan helpers --
+
+    async def _resolve_feature_surface(
+        self, kind: str, source_id: str,
+    ) -> tuple[integration_scan.FeatureSurface, Optional[list[dict]]]:
+        """Load the underlying feature and extract a scan surface.
+
+        Returns ``(surface, prefetched_registry)``. The second slot is
+        the bus skill registry when ``kind == "skill"`` (fetched here to
+        resolve the surface) and ``None`` otherwise. The handler threads
+        the prefetched registry into ``scan_agent_skills`` to avoid a
+        second bus round-trip — one fetch, one failure surface, lower
+        latency. PR #46 Copilot R7 finding #4.
+
+        Raises ``LookupError`` when the source can't be found (includes
+        bus / network faults while resolving the skill registry — an
+        unreachable registry is semantically a lookup miss) and
+        ``ValueError`` when the id shape is unparseable. Callers convert
+        both into an error-dict response.
+        """
+        if kind == "fr":
+            fr = self.pipeline.frs.get(source_id)
+            if fr is None:
+                raise LookupError(f"FR {source_id!r} not found in developer store")
+            return integration_scan.extract_feature_surface_from_fr(fr), None
+
+        if kind == "pr":
+            parsed = integration_scan.parse_pr_id(source_id)
+            if parsed is None:
+                raise ValueError(
+                    f"PR id must be 'owner/repo#N' or a canonical GitHub URL, got {source_id!r}"
+                )
+            owner, repo_name, pr_number = parsed
+            gh = self._github_client()
+            repo_slug = f"{owner}/{repo_name}"
+            # ``gh.get_pr`` raises ``GithubClientError`` for HTTP/network
+            # faults and 404s; the handler's caller only handles
+            # ``(ValueError, LookupError)`` so we normalise GitHub faults
+            # into ``LookupError`` here (the PR can't be resolved without
+            # a reachable API — semantically a lookup miss). Same shape
+            # as the ``_fetch_remote_skills`` wrap (PR #46 Copilot R2).
+            from developer.github_client import GithubClientError
+            try:
+                pr_data = await gh.get_pr(repo_slug, pr_number)
+            except (ValueError, LookupError):
+                raise
+            except GithubClientError as e:
+                raise LookupError(
+                    f"GitHub API unavailable while resolving PR {source_id!r}: {e}"
+                ) from e
+            except Exception as e:  # noqa: BLE001 — any httpx/network error
+                raise LookupError(
+                    f"GitHub API unavailable while resolving PR {source_id!r}: {e}"
+                ) from e
+            if not pr_data.get("merged"):
+                raise ValueError(
+                    f"PR {source_id!r} is not merged (state={pr_data.get('state')!r}); "
+                    "MVP accepts merged PRs only"
+                )
+            # Body isn't returned by GithubClient.get_pr's default projection;
+            # title covers most of the signal for MVP extraction.
+            return integration_scan.extract_feature_surface_from_pr(
+                pr_id=source_id,
+                title=pr_data.get("title", ""),
+                body=pr_data.get("body", "") or "",
+                owner=owner, repo=repo_name,
+            ), None
+
+        if kind == "skill":
+            # source_id is '<agent>.<skill>'; resolve via the bus skill
+            # registry to pull the description + args schema.
+            # ``_fetch_remote_skills`` can raise network / HTTP errors when
+            # the bus is unreachable; the handler's caller only handles
+            # ``ValueError`` / ``LookupError`` so we normalise bus/network
+            # faults into ``LookupError`` here (the skill can't be located
+            # without a reachable registry; that's semantically a lookup miss
+            # from the handler's perspective).
+            try:
+                skills = await self._fetch_remote_skills()
+            except (ValueError, LookupError):
+                raise
+            except Exception as e:  # noqa: BLE001 — any httpx/bus error
+                raise LookupError(
+                    f"skill registry unavailable while resolving {source_id!r}: {e}"
+                ) from e
+            # Require fully-qualified ``<agent>.<skill>`` form. A bare
+            # skill name is ambiguous — multiple agents commonly expose
+            # the same name (``health_check``, ``file_bug``, …) and
+            # first-match-wins is non-deterministic. Worse, the resolved
+            # skill would often match itself against the scan (see
+            # ``_filter_self_reference_skill_candidates``), producing a
+            # nonsensical self-direct_replace suggestion. PR #46 Copilot R5.
+            if "." not in source_id:
+                raise LookupError(
+                    f"source_id must be 'agent.skill', got {source_id!r}"
+                )
+            agent_id, skill_name = source_id.split(".", 1)
+            if not agent_id or not skill_name:
+                raise LookupError(
+                    f"source_id must be 'agent.skill', got {source_id!r}"
+                )
+            match = next(
+                (
+                    row for row in skills
+                    if row.get("name") == skill_name
+                    and row.get("agent_id") == agent_id
+                ),
+                None,
+            )
+            if match is None:
+                raise LookupError(
+                    f"skill {source_id!r} not found in bus registry"
+                )
+            return integration_scan.extract_feature_surface_from_skill(
+                skill_id=source_id,
+                description=match.get("description", ""),
+                agent_id=match.get("agent_id", ""),
+                args_schema=match.get("parameters"),
+            ), skills
+
+        # Unreachable — validated at handler entry, but belt-and-braces.
+        raise ValueError(f"unknown feature kind: {kind!r}")
+
+    async def _fetch_remote_skills(self) -> list[dict]:
+        """Return the bus-side skill registry as a list of dicts.
+
+        Uses the agent's own :attr:`_http` client + ``self.bus_url`` so
+        tests can monkeypatch the attribute directly. Exceptions from
+        ``client.get`` (network faults) or ``response.raise_for_status()``
+        (HTTP 4xx/5xx) propagate to the caller; callers are responsible
+        for catching + logging and degrading to an empty-registry scan
+        path. The ``_http is None`` branch below still returns ``[]``
+        (pre-init / older base class) — that's the only fall-through
+        default. PR #46 Copilot R9 finding #1.
+        """
+        # _http is set by BaseAgent.__init__. If we somehow got constructed
+        # without it (older base class), degrade to empty list.
+        client = getattr(self, "_http", None)
+        if client is None:
+            return []
+        response = await client.get(f"{self.bus_url}/v1/skills")
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, list) else []
+
+    async def _fetch_subscriber_counts(self, topics: list[str]) -> dict[str, int]:
+        """Per-topic subscriber counts.
+
+        No canonical bus endpoint exposes per-topic subscribers yet — the
+        relevant data lives in bus-side ``subscriptions`` table but isn't
+        surfaced via HTTP. For MVP we treat the map as empty (every
+        listed topic counts as having zero subscribers, which is what
+        wire_subscriber is meant to flag). Tests inject a real map by
+        monkeypatching this method. When the bus grows a proper endpoint
+        (tracked as follow-up), this method picks it up without touching
+        the handler.
+        """
+        if not topics:
+            return {}
+        return {}
+
+    def _store_integration_scan(
+        self, *, scan_id: str,
+        source: dict[str, Any],
+        surface: integration_scan.FeatureSurface,
+        ranked: list[integration_scan.IntegrationCandidate],
+        audience: str,
+    ) -> None:
+        """Persist the scan as a derived KnowledgeEntry.
+
+        Matches the ``identify_gaps`` precedent in librarian_agent in
+        spirit — a single JSON-serialized artifact indexed by a stable
+        id — but uses the developer-owned KnowledgeStore rather than the
+        bus artifact service so the distill path is a pure local read
+        with no round-trip.
+        """
+        from khonliang.knowledge.store import (
+            EntryStatus, KnowledgeEntry, Tier,
+        )
+        payload = {
+            "source": source,
+            "surface": surface.to_public_dict(),
+            "candidates": [c.to_full() for c in ranked],
+            "audience": audience,
+            "generated_at": time.time(),
+        }
+        entry = KnowledgeEntry(
+            id=scan_id,
+            tier=Tier.DERIVED,
+            title=f"Integration scan for {source.get('kind')}:{source.get('id')}",
+            content=json.dumps(payload, default=str, separators=(",", ":")),
+            source="developer.integration_scan",
+            scope="development",
+            confidence=1.0,
+            status=EntryStatus.DISTILLED,
+            tags=["scan_integration", f"kind:{source.get('kind', '')}"],
+            metadata={
+                "source_kind": source.get("kind", ""),
+                "source_id": source.get("id", ""),
+                "candidate_count": len(ranked),
+                "audience": audience,
+            },
+        )
+        self.pipeline.knowledge.add(entry)
+
+    def _project_scan_response(
+        self, *, scan_id: str, source: dict[str, Any],
+        ranked: list[integration_scan.IntegrationCandidate],
+        top_n: int, detail: str, extra: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        # ``detail`` is a tri-state — ``brief`` (default), ``compact``, or
+        # ``full``. Unknown values fall through to ``brief`` so a typo in
+        # the caller doesn't surface as a scan error; the skill schema
+        # enumerates the valid values.
+        top = ranked[:top_n]
+        if detail == "full":
+            projected = [c.to_full() for c in top]
+        elif detail == "compact":
+            projected = [c.to_compact() for c in top]
+        else:
+            projected = [c.to_brief() for c in top]
+        # Hint selection depends on whether the scan actually persisted.
+        # When ``scan_id`` is empty the handler has signalled a persistence
+        # failure (see ``handle_suggest_integration_points``); pointing
+        # callers at ``distill_integration_points`` would send them into
+        # a guaranteed "scan_id is required" error. Explain the situation
+        # and recommend the retry path instead. PR #46 Copilot R5.
+        if scan_id:
+            hint = (
+                "Use distill_integration_points(scan_id, top_n=..., signal=...) "
+                "to filter without rescanning"
+            )
+        else:
+            hint = (
+                "scan persistence failed; re-run suggest_integration_points "
+                "to retry — distill_integration_points is unavailable without "
+                "a persisted scan_id"
+            )
+        response = {
+            "scan_id": scan_id,
+            "source": source,
+            "total_candidates": len(ranked),
+            "top_candidates": projected,
+            "hint": hint,
+        }
+        if extra:
+            response.update(extra)
+        return response
+
+    def _github_client(self):
+        """Lazy GithubClient factory, overridable for tests.
+
+        Kept as a method (not a property) so tests can monkeypatch it
+        with a plain function returning a stub without worrying about
+        descriptor semantics.
+        """
+        from developer.github_client import GithubClient
+        return GithubClient()
 
     # -- developer-owned FR work planning --
 

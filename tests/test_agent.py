@@ -25,7 +25,9 @@ def test_skill_count(harness):
     #   triage_dogfood / dogfood_triage_queue / report_gap = 5).
     # + milestone lifecycle (fr_developer_91a5a072): update_status /
     #   supersede / update_frs / delete = 4.
-    assert len(harness.skills) == 69
+    # + integration-point scanner (fr_developer_82fe7309): suggest +
+    #   distill = 2.
+    assert len(harness.skills) == 71
 
 
 def test_skills_registered(harness):
@@ -71,6 +73,8 @@ def test_skills_registered(harness):
         # milestone lifecycle (fr_developer_91a5a072)
         "update_milestone_status", "supersede_milestone",
         "update_milestone_frs", "delete_milestone",
+        # integration-point scanner (fr_developer_82fe7309)
+        "suggest_integration_points", "distill_integration_points",
     }
     assert harness.skill_names == expected
 
@@ -101,6 +105,15 @@ def test_get_paper_context_skill(harness):
 
 def test_fr_candidates_from_concepts_skill(harness):
     harness.assert_skill_exists("fr_candidates_from_concepts", description="concept bundles")
+
+
+def test_integration_scanner_skills(harness):
+    harness.assert_skill_exists(
+        "suggest_integration_points", description="adoption sites",
+    )
+    harness.assert_skill_exists(
+        "distill_integration_points", description="Re-project",
+    )
 
 
 def test_pr_ready_skill(harness):
@@ -477,7 +490,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 69
+    assert len(reg.skills) == 71
     assert len(reg.collaborations) == 1
 
 
