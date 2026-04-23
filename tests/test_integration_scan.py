@@ -458,3 +458,316 @@ async def test_distill_integration_points_errors_on_missing_scan(harness):
     )
     assert "error" in result
     assert "not found" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Copilot R1 — word-boundary keyword matching
+# ---------------------------------------------------------------------------
+
+
+def test_scan_fr_store_word_boundary_rejects_substring_matches():
+    """_ADOPT_KEYWORDS must match whole words only — "adopt" must not
+    register on "adoptable", "todo" must not register on "todolist".
+
+    Regression for Copilot R1 finding #1: the docstring documents
+    whole-word matching but the original implementation used substring
+    containment, generating false positives.
+    """
+    class StubFR:
+        def __init__(self, id_, title, description, concept=""):
+            self.id = id_
+            self.title = title
+            self.description = description
+            self.concept = concept
+
+    # Surface has strong token overlap so the "shared tokens" gate passes
+    # for both the false-positive FR and the true-positive FR. This makes
+    # the assertion isolate the keyword-matching change specifically.
+    surface = integration_scan.FeatureSurface(
+        kind="fr", id="fr_developer_source",
+        title="Primitive for structured adoption records",
+        description="Adoption primitive for records.",
+        tokens={"adoption", "primitive", "records", "structured"},
+    )
+
+    # FRs whose bodies contain substrings of the keywords only. "adoptable"
+    # contains "adopt" as a substring; "todolist" contains "todo"; the FR
+    # must NOT surface under refactor_to_primitive.
+    substring_only = StubFR(
+        id_="fr_developer_substr",
+        title="Adoptable records todolist",
+        description=(
+            "Adoptable records here; todolist is already managed. No "
+            "migration needed."
+        ),
+        concept="adoption records",
+    )
+    # FR with a real whole-word keyword hit — "TODO: adopt" — must surface.
+    real_hit = StubFR(
+        id_="fr_developer_real",
+        title="Real keyword hit",
+        description=(
+            "TODO: adopt the new primitive for these records once it lands."
+        ),
+        concept="adoption records",
+    )
+
+    candidates = integration_scan.scan_fr_store(
+        surface, [substring_only, real_hit],
+    )
+    by_signal = [
+        (c.target_id, c.signal) for c in candidates
+    ]
+    # The substring-only FR must not surface under refactor_to_primitive.
+    assert ("fr_developer_substr", integration_scan.SIGNAL_REFACTOR_TO_PRIMITIVE) not in by_signal
+    # The real keyword hit must still surface.
+    assert ("fr_developer_real", integration_scan.SIGNAL_REFACTOR_TO_PRIMITIVE) in by_signal
+
+
+# ---------------------------------------------------------------------------
+# Copilot R1 — to_full preserves unrounded score
+# ---------------------------------------------------------------------------
+
+
+def test_candidate_full_preserves_unrounded_score():
+    """to_full() must preserve full precision; to_brief() still rounds.
+
+    Regression for Copilot R1 finding #2: distill rehydrates from the
+    stored full projection and re-ranks. Rounding at persist time
+    corrupts close-score orderings.
+    """
+    c = integration_scan.IntegrationCandidate(
+        kind="fr", target_id="fr_developer_xyz",
+        signal=integration_scan.SIGNAL_MIGRATE,
+        score=0.123456789,
+        rationale="x",
+        metadata={"body_sim": 0.321},
+    )
+    brief = c.to_brief()
+    full = c.to_full()
+    assert brief["score"] == 0.123  # rounded
+    assert full["score"] == 0.123456789  # unrounded
+    # Full still carries metadata.
+    assert full["metadata"] == {"body_sim": 0.321}
+
+
+@pytest.mark.asyncio
+async def test_distill_reranks_with_unrounded_scores(harness):
+    """Close-score ordering survives persist + rehydrate.
+
+    Directly inject two candidates whose scores differ only past the third
+    decimal, persist + rehydrate via the distill path, and assert the
+    stable ordering is preserved.
+    """
+    _install_empty_bus(harness)
+
+    # Build a synthetic scan artifact with two candidates whose scores
+    # differ in the 4th decimal. Under the pre-fix behaviour both stored
+    # to 0.500 and the tiebreaker on target_id alphabetised them; under
+    # the fix the higher-precision score wins.
+    from khonliang.knowledge.store import (
+        EntryStatus, KnowledgeEntry, Tier,
+    )
+    import json as _json
+
+    hi = integration_scan.IntegrationCandidate(
+        kind="fr", target_id="fr_developer_zzz_higher",
+        signal=integration_scan.SIGNAL_MIGRATE,
+        score=0.50049,
+        rationale="hi",
+    )
+    lo = integration_scan.IntegrationCandidate(
+        kind="fr", target_id="fr_developer_aaa_lower",
+        signal=integration_scan.SIGNAL_MIGRATE,
+        score=0.50001,
+        rationale="lo",
+    )
+    scan_id = "scan_integration_test01"
+    payload = {
+        "source": {"kind": "fr", "id": "fr_developer_synth"},
+        "surface": {},
+        "candidates": [hi.to_full(), lo.to_full()],
+        "audience": "",
+        "generated_at": 0,
+    }
+    entry = KnowledgeEntry(
+        id=scan_id,
+        tier=Tier.DERIVED,
+        title="synth",
+        content=_json.dumps(payload),
+        source="developer.integration_scan",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["scan_integration", "kind:fr"],
+        metadata={},
+    )
+    harness.agent.pipeline.knowledge.add(entry)
+
+    distilled = await harness.call(
+        "distill_integration_points",
+        {"scan_id": scan_id, "top_n": 10},
+    )
+    assert "error" not in distilled
+    ordered = [c["target_id"] for c in distilled["top_candidates"]]
+    # Higher unrounded score wins despite alphabetic tiebreak being against it.
+    assert ordered.index("fr_developer_zzz_higher") < ordered.index("fr_developer_aaa_lower")
+
+
+# ---------------------------------------------------------------------------
+# Copilot R1 — multi-signal per FR with dedupe only at (target_id, signal)
+# ---------------------------------------------------------------------------
+
+
+def test_scan_fr_store_emits_multiple_signals_per_fr():
+    """A single FR that matches direct_replace AND refactor_to_primitive
+    must surface under both signals; dedupe happens only at the
+    (target_id, signal) tuple level.
+
+    Regression for Copilot R1 finding #3: an early ``continue`` in the
+    direct_replace branch prevented downstream signals from being
+    evaluated on the same FR.
+    """
+    class StubFR:
+        id = "fr_developer_both"
+        title = "BugStore primitive"
+        description = (
+            "BugStore primitive — TODO: adopt the new primitive for the "
+            "structured records workflow."
+        )
+        concept = "bug tracking"
+
+    # Surface title matches the FR title verbatim → direct_replace fires.
+    # Surface also shares tokens + FR body contains "TODO" + "adopt" → the
+    # refactor_to_primitive path must ALSO fire on the same FR.
+    surface = integration_scan.FeatureSurface(
+        kind="fr", id="fr_developer_source",
+        title="BugStore primitive",
+        description="BugStore primitive for structured bug records.",
+        tokens={"bugstore", "primitive", "structured", "records"},
+    )
+
+    candidates = integration_scan.scan_fr_store(surface, [StubFR()])
+    signals_for_fr = {
+        c.signal for c in candidates if c.target_id == "fr_developer_both"
+    }
+    assert integration_scan.SIGNAL_DIRECT_REPLACE in signals_for_fr
+    assert integration_scan.SIGNAL_REFACTOR_TO_PRIMITIVE in signals_for_fr
+
+    # Dedupe still holds: calling scan_fr_store again on a single-FR input
+    # must not produce duplicate (target_id, signal) pairs.
+    keys = [(c.target_id, c.signal) for c in candidates]
+    assert len(keys) == len(set(keys))
+
+
+# ---------------------------------------------------------------------------
+# Copilot R1 — compact projection is distinct from brief
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_suggest_integration_points_compact_projection_is_distinct(harness):
+    """``detail='compact'`` must return something distinct from ``brief``.
+
+    Regression for Copilot R1 finding #4: the skill schema advertised
+    brief/compact/full but the projection only distinguished full vs
+    not-full, silently collapsing compact into brief.
+    """
+    _install_empty_bus(harness)
+    feature = harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Compact projection test primitive",
+        description="Compact projection test primitive for structured records.",
+        priority="high",
+        concept="compact testing",
+    )
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Adopt compact projection primitive",
+        description=(
+            "Existing workflow — TODO: adopt the compact projection "
+            "primitive once it lands. Tracks structured records."
+        ),
+        priority="medium",
+        concept="compact testing",
+    )
+
+    brief = await harness.call(
+        "suggest_integration_points",
+        {"source": {"kind": "fr", "id": feature.id}, "detail": "brief"},
+    )
+    compact = await harness.call(
+        "suggest_integration_points",
+        {"source": {"kind": "fr", "id": feature.id}, "detail": "compact"},
+    )
+    full = await harness.call(
+        "suggest_integration_points",
+        {"source": {"kind": "fr", "id": feature.id}, "detail": "full"},
+    )
+
+    assert brief["top_candidates"], "test needs at least one candidate to compare projections"
+    b = brief["top_candidates"][0]
+    c = compact["top_candidates"][0]
+    f = full["top_candidates"][0]
+
+    # brief lacks metadata entirely.
+    assert "metadata" not in b
+    # full carries full metadata.
+    assert "metadata" in f
+    assert isinstance(f["metadata"], dict)
+
+    # compact is distinct from brief AND from full. If the candidate has
+    # any compact-eligible metadata fields, compact must carry them; and
+    # compact must remain leaner than full (fewer or equal metadata keys).
+    # Any candidate surfacing from FR-store scan carries "status" and
+    # "target" in its metadata, both of which are in the compact set.
+    assert "metadata" in c, f"compact projection must include lean metadata; got {c!r}"
+    assert c != b, "compact projection must differ from brief"
+    # compact metadata is a subset of full metadata.
+    assert set(c["metadata"].keys()).issubset(set(f["metadata"].keys()))
+    assert len(c["metadata"]) <= len(f["metadata"])
+
+
+# ---------------------------------------------------------------------------
+# Copilot R1 — scan_id nanosecond resolution
+# ---------------------------------------------------------------------------
+
+
+def test_compute_scan_id_same_second_distinct_sources_unique():
+    """Two scans of distinct sources in the same nanosecond seed collide
+    only if their source payloads match — unchanged behaviour.
+
+    The primary fix is about same-source same-second collisions (see the
+    next test); this one asserts the ``source`` dict still participates
+    in the hash so changing it changes the id.
+    """
+    src1 = {"kind": "fr", "id": "fr_developer_abc"}
+    src2 = {"kind": "fr", "id": "fr_developer_xyz"}
+    seed = 1_700_000_000_000_000_000
+    assert integration_scan.compute_scan_id(src1, seed=seed) != integration_scan.compute_scan_id(src2, seed=seed)
+
+
+def test_compute_scan_id_same_source_distinct_seconds_unique():
+    """Two scans of the same source with nanosecond-adjacent seeds produce
+    distinct ids — catches the pre-fix int(epoch) same-second collision.
+
+    Regression for Copilot R1 finding #5: two scans of the same FR within
+    the same wall-clock second used to hash to the same ``scan_id`` and
+    overwrite each other's KnowledgeEntry. ``time.time_ns()`` + integer
+    seeding avoids the collision.
+    """
+    src = {"kind": "fr", "id": "fr_developer_abc"}
+    # Two seeds 1 ns apart — would collide under int(epoch) second-resolution.
+    seed_a = 1_700_000_000_000_000_000
+    seed_b = 1_700_000_000_000_000_001
+    assert integration_scan.compute_scan_id(src, seed=seed_a) != integration_scan.compute_scan_id(src, seed=seed_b)
+
+    # Default-seeded (no explicit seed) calls also differ across nanosecond
+    # boundaries. This is the real-world scenario — back-to-back scans.
+    id1 = integration_scan.compute_scan_id(src)
+    id2 = integration_scan.compute_scan_id(src)
+    # Nanosecond resolution makes back-to-back Python calls overwhelmingly
+    # likely to land on distinct ns timestamps; a sequence of three ids
+    # cannot all be identical unless ns resolution isn't working.
+    id3 = integration_scan.compute_scan_id(src)
+    assert len({id1, id2, id3}) >= 2

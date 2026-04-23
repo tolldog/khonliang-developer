@@ -48,7 +48,9 @@ ALL_SIGNALS = (
 
 # Regex keywords used by scan source #5 — FR-body mentions that hint at
 # adoption opportunities. Case-insensitive; bounded to whole-word matches
-# so "adopted" doesn't match "adoptable" accidentally.
+# so "adopt" doesn't match "adoptable" / "todo" doesn't match "todolist"
+# accidentally. Multi-word phrases are matched as whole phrases with
+# word boundaries on both ends.
 _ADOPT_KEYWORDS = (
     "todo",
     "follow-up",
@@ -56,6 +58,16 @@ _ADOPT_KEYWORDS = (
     "adopt",
     "future work",
     "should migrate",
+)
+
+# Pre-compiled word-boundary regexes per keyword. Each keyword is wrapped
+# in ``\b`` anchors so substring collisions (e.g. "adopt" → "adoptable")
+# don't register as matches. For multi-word / hyphenated keywords the
+# anchors still bracket the full phrase correctly because ``\b`` is a
+# zero-width boundary between a word and non-word character.
+_ADOPT_KEYWORD_RES = tuple(
+    (kw, re.compile(r"\b" + re.escape(kw) + r"\b", re.IGNORECASE))
+    for kw in _ADOPT_KEYWORDS
 )
 
 # Regex for parsing "owner/repo#123" or a full GH URL. Deliberately narrow —
@@ -134,6 +146,7 @@ class IntegrationCandidate:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_brief(self) -> dict[str, Any]:
+        """Display-oriented projection; rounds score to 3 decimals."""
         return {
             "kind": self.kind,
             "target_id": self.target_id,
@@ -142,10 +155,49 @@ class IntegrationCandidate:
             "signal": self.signal,
         }
 
+    # Metadata fields that are small, scalar, and useful for routing /
+    # triage decisions. Heavier fields (e.g. shared_tokens, keywords lists)
+    # stay behind the ``full`` detail to keep ``compact`` genuinely leaner.
+    _COMPACT_META_FIELDS = (
+        "status", "target", "title_sim", "body_sim",
+        "agent_id", "skill_name", "similarity",
+        "subscriber_count", "expected",
+    )
+
+    def to_compact(self) -> dict[str, Any]:
+        """Brief projection plus a lean subset of metadata.
+
+        Sits between ``brief`` (name-only) and ``full`` (everything). Picks
+        the small scalar metadata fields that help a caller decide which
+        candidates warrant a ``full`` follow-up, without dragging along
+        shared-token / keyword lists that make the response heavy.
+        Rounds score to 3 decimals to match ``brief`` display behaviour.
+        """
+        out = self.to_brief()
+        compact_meta = {
+            k: v for k, v in self.metadata.items()
+            if k in self._COMPACT_META_FIELDS
+        }
+        if compact_meta:
+            out["metadata"] = compact_meta
+        return out
+
     def to_full(self) -> dict[str, Any]:
-        brief = self.to_brief()
-        brief["metadata"] = dict(self.metadata)
-        return brief
+        """Persistence-oriented projection; preserves unrounded score.
+
+        ``to_full`` feeds the KnowledgeEntry that ``distill_integration_points``
+        rehydrates and re-ranks. Re-using ``to_brief`` here would round
+        the score and corrupt the ordering of close-score candidates
+        after persist + rehydrate. Display rounding stays in ``to_brief``.
+        """
+        return {
+            "kind": self.kind,
+            "target_id": self.target_id,
+            "rationale": self.rationale,
+            "score": float(self.score),
+            "signal": self.signal,
+            "metadata": dict(self.metadata),
+        }
 
 
 def tokens(text: str) -> set[str]:
@@ -348,6 +400,11 @@ def scan_fr_store(
         fr_tokens = tokens(haystack)
 
         # --- direct_replace: exact-ish title match ------------------------
+        # Evaluating direct_replace does NOT short-circuit the rest of the
+        # signals: the docstring promises that a single FR may surface under
+        # multiple signals, deduplicated at the (target_id, signal) level.
+        # An FR whose title matches AND whose body mentions "TODO" legitimately
+        # belongs under both direct_replace and refactor_to_primitive.
         title_sim = jaccard(tokens(fr_title), tokens(surface.title))
         if surface_title and fr_title.lower().strip() == surface_title:
             key = (fr_id, SIGNAL_DIRECT_REPLACE)
@@ -364,7 +421,6 @@ def scan_fr_store(
                         "title_sim": round(title_sim, 3),
                     },
                 ))
-                continue
         elif title_sim >= 0.8:
             key = (fr_id, SIGNAL_DIRECT_REPLACE)
             if key not in seen:
@@ -380,7 +436,6 @@ def scan_fr_store(
                         "title_sim": round(title_sim, 3),
                     },
                 ))
-                continue
 
         # --- migrate: description cosine-fallback (jaccard) ---------------
         body_sim = jaccard(surface_tokens, fr_tokens)
@@ -411,10 +466,11 @@ def scan_fr_store(
                 ))
 
         # --- refactor_to_primitive: adoption-keyword co-occurrence --------
-        lower = haystack.lower()
+        # Word-boundary match via pre-compiled regexes: "adopt" must not
+        # hit "adoptable", "todo" must not hit "todolist".
         hit_kw: list[str] = []
-        for kw in _ADOPT_KEYWORDS:
-            if kw in lower:
+        for kw, kw_re in _ADOPT_KEYWORD_RES:
+            if kw_re.search(haystack):
                 hit_kw.append(kw)
         if hit_kw:
             # Require some thematic link before flagging — an FR that
@@ -600,15 +656,16 @@ def rank_candidates(candidates: list[IntegrationCandidate]) -> list[IntegrationC
     )
 
 
-def compute_scan_id(source: dict[str, Any], *, seed: Optional[float] = None) -> str:
+def compute_scan_id(source: dict[str, Any], *, seed: Optional[int] = None) -> str:
     """Stable 8-hex identifier for a scan of ``source``.
 
-    ``seed`` defaults to the current epoch second so repeat scans don't
-    collide; callers with a fixed timestamp can pass one in for
-    deterministic fixtures.
+    ``seed`` is a nanosecond epoch timestamp. Defaults to
+    ``time.time_ns()`` so two scans of the same source in the same wall-clock
+    second still produce distinct ids — matches the PR #29 snapshot_id fix.
+    Callers with a fixed timestamp can pass one in for deterministic fixtures.
     """
     if seed is None:
-        seed = time.time()
+        seed = time.time_ns()
     payload = json.dumps(
         {"source": source, "ts": int(seed)},
         sort_keys=True,

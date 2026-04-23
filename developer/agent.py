@@ -1196,9 +1196,15 @@ class DeveloperAgent(BaseAgent):
         ranked: list[integration_scan.IntegrationCandidate],
         top_n: int, detail: str, extra: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
+        # ``detail`` is a tri-state — ``brief`` (default), ``compact``, or
+        # ``full``. Unknown values fall through to ``brief`` so a typo in
+        # the caller doesn't surface as a scan error; the skill schema
+        # enumerates the valid values.
         top = ranked[:top_n]
         if detail == "full":
             projected = [c.to_full() for c in top]
+        elif detail == "compact":
+            projected = [c.to_compact() for c in top]
         else:
             projected = [c.to_brief() for c in top]
         response = {
