@@ -180,18 +180,18 @@ class BugStore:
     # Read paths
     # ------------------------------------------------------------------
 
-    def get(self, bug_id: str) -> Optional[Bug]:
+    def get_bug(self, bug_id: str) -> Optional[Bug]:
         entry = self.knowledge.get(bug_id)
         if entry is None or "bug" not in (entry.tags or []):
             return None
         return _bug_from_entry(entry)
 
-    def list(
+    def list_bugs(
         self,
         *,
         target: str = "",
         severity_min: str = "",
-        status: Optional[Iterable[str]] = None,
+        status: Optional[Iterable[str] | str] = None,
         include_terminal: bool = False,
     ) -> list[Bug]:
         """List bugs in the store.
@@ -200,11 +200,20 @@ class BugStore:
         or a comma-separated string. When None, excludes terminal statuses
         (fixed / wontfix / duplicate). ``"all"`` overrides. ``severity_min``
         filters out anything less severe than the given cutoff (e.g.
-        ``"medium"`` keeps medium / high / blocker). Ordering is newest
+        ``"medium"`` keeps medium / high / blocker); must be ``""`` (no
+        filter) or one of the named severities. Ordering is newest
         ``observed_at`` first.
         """
         allowed_statuses = _parse_status_filter(status, include_terminal=include_terminal)
-        cutoff_rank = _SEVERITY_RANK.get(severity_min) if severity_min else None
+        if severity_min:
+            if severity_min not in ALLOWED_SEVERITIES:
+                raise BugError(
+                    f"severity_min must be one of {sorted(ALLOWED_SEVERITIES)} "
+                    f"or '' (no filter), got {severity_min!r}"
+                )
+            cutoff_rank = _SEVERITY_RANK[severity_min]
+        else:
+            cutoff_rank = None
 
         entries = self.knowledge.get_by_tier(Tier.DERIVED)
         bugs: list[Bug] = []
@@ -286,7 +295,7 @@ class BugStore:
         self._store(bug)
         return bug
 
-    def update_status(
+    def update_bug_status(
         self,
         bug_id: str,
         status: str,
@@ -295,18 +304,22 @@ class BugStore:
     ) -> Bug:
         """Advance a bug's lifecycle status.
 
-        Terminal statuses (fixed / wontfix / duplicate) are enforced by
-        dedicated methods (:meth:`close_bug`, :meth:`mark_duplicate`); the
-        general :meth:`update_status` accepts any name in ``ALL_STATUSES``
-        but is intended mainly for active-state transitions. Callers can
-        still pass a terminal status here for symmetry — the FR body lists
-        ``fixed / wontfix / duplicate`` as valid terminal statuses.
+        Terminal ``duplicate`` transitions are refused here because they
+        require a ``duplicate_of`` pointer — call :meth:`mark_duplicate`
+        instead. ``fixed`` and ``wontfix`` transitions are accepted for
+        symmetry, though :meth:`close_bug` is the preferred path.
         """
         if status not in ALL_STATUSES:
             raise BugError(
                 f"status must be one of {sorted(ALL_STATUSES)}, got {status!r}"
             )
-        bug = self.get(bug_id)
+        if status == BUG_STATUS_DUPLICATE:
+            raise BugError(
+                f"update_bug_status refuses status={BUG_STATUS_DUPLICATE!r}: "
+                "duplicate transitions require a duplicate_of pointer — "
+                "call mark_duplicate(bug_id, duplicate_of) instead"
+            )
+        bug = self.get_bug(bug_id)
         if bug is None:
             raise BugError(f"unknown bug id: {bug_id}")
 
@@ -332,7 +345,7 @@ class BugStore:
 
     def link_bug_pr(self, bug_id: str, pr_url: str) -> Bug:
         """Record the PR URL fixing this bug."""
-        bug = self.get(bug_id)
+        bug = self.get_bug(bug_id)
         if bug is None:
             raise BugError(f"unknown bug id: {bug_id}")
         if bug.status in TERMINAL_STATUSES:
@@ -362,7 +375,7 @@ class BugStore:
                 f"resolution must be 'fixed' or 'wontfix', got {resolution!r} "
                 "(for duplicates call mark_duplicate)"
             )
-        bug = self.get(bug_id)
+        bug = self.get_bug(bug_id)
         if bug is None:
             raise BugError(f"unknown bug id: {bug_id}")
         if bug.status in TERMINAL_STATUSES:
@@ -385,9 +398,9 @@ class BugStore:
             raise BugError("duplicate_of must be non-empty")
         if duplicate_of == bug_id:
             raise BugError("a bug cannot be marked a duplicate of itself")
-        if self.get(duplicate_of) is None:
+        if self.get_bug(duplicate_of) is None:
             raise BugError(f"unknown duplicate target id: {duplicate_of!r}")
-        bug = self.get(bug_id)
+        bug = self.get_bug(bug_id)
         if bug is None:
             raise BugError(f"unknown bug id: {bug_id}")
         if bug.status in TERMINAL_STATUSES:

@@ -77,7 +77,7 @@ def test_file_bug_roundtrip_through_get(store):
         description="d",
         reporter="user",
     )
-    out = store.get(bug.id)
+    out = store.get_bug(bug.id)
     assert out is not None
     assert out.id == bug.id
     assert out.title == "T"
@@ -111,7 +111,7 @@ def test_file_bug_deterministic_id_collision(store):
 
 
 def test_get_returns_none_for_unknown_id(store):
-    assert store.get("bug_developer_00000000") is None
+    assert store.get_bug("bug_developer_00000000") is None
 
 
 def test_source_field_accepts_attribution_struct(store):
@@ -134,7 +134,7 @@ def test_source_field_accepts_attribution_struct(store):
     # The keyword-only `source` arg isn't yet exposed via the MCP skill
     # (Phase 2 ingest will wire it); we test it's structurally accepted
     # and round-trips through storage.
-    round_tripped = store.get(bug.id)
+    round_tripped = store.get_bug(bug.id)
     assert round_tripped.source == src
 
 
@@ -148,7 +148,7 @@ def test_list_excludes_terminal_by_default(store):
     closed = store.file_bug(target="developer", title="Closed", description="d")
     store.close_bug(closed.id, resolution=BUG_STATUS_FIXED)
 
-    ids = [b.id for b in store.list()]
+    ids = [b.id for b in store.list_bugs()]
     assert open_bug.id in ids
     assert closed.id not in ids
 
@@ -157,7 +157,7 @@ def test_list_status_all_includes_terminal(store):
     a = store.file_bug(target="developer", title="A", description="d")
     b = store.file_bug(target="developer", title="B", description="d")
     store.close_bug(b.id, resolution=BUG_STATUS_FIXED)
-    ids = [x.id for x in store.list(status="all")]
+    ids = [x.id for x in store.list_bugs(status="all")]
     assert a.id in ids
     assert b.id in ids
 
@@ -165,7 +165,7 @@ def test_list_status_all_includes_terminal(store):
 def test_list_filter_by_target(store):
     a = store.file_bug(target="researcher", title="A", description="d")
     b = store.file_bug(target="developer", title="B", description="d")
-    ids = [x.id for x in store.list(target="researcher")]
+    ids = [x.id for x in store.list_bugs(target="researcher")]
     assert a.id in ids
     assert b.id not in ids
 
@@ -173,8 +173,8 @@ def test_list_filter_by_target(store):
 def test_list_filter_by_status_name(store):
     a = store.file_bug(target="developer", title="A", description="d")
     b = store.file_bug(target="developer", title="B", description="d")
-    store.update_status(b.id, BUG_STATUS_TRIAGED)
-    triaged = [x.id for x in store.list(status="triaged")]
+    store.update_bug_status(b.id, BUG_STATUS_TRIAGED)
+    triaged = [x.id for x in store.list_bugs(status="triaged")]
     assert triaged == [b.id]
 
 
@@ -185,10 +185,20 @@ def test_list_filter_by_severity_min_keeps_high_and_above(store):
                          severity=BUG_SEVERITY_MEDIUM, observed_entity="b")
     high = store.file_bug(target="developer", title="High", description="d",
                           severity=BUG_SEVERITY_HIGH, observed_entity="c")
-    kept = {x.id for x in store.list(severity_min="high")}
+    kept = {x.id for x in store.list_bugs(severity_min="high")}
     assert kept == {high.id}
-    kept_med = {x.id for x in store.list(severity_min="medium")}
+    kept_med = {x.id for x in store.list_bugs(severity_min="medium")}
     assert kept_med == {med.id, high.id}
+
+
+def test_list_bugs_raises_on_unknown_severity_min(store):
+    """Unknown severity_min must raise rather than silently ignore the filter."""
+    store.file_bug(target="developer", title="L", description="d",
+                   severity=BUG_SEVERITY_LOW, observed_entity="a")
+    with pytest.raises(BugError, match="severity_min"):
+        store.list_bugs(severity_min="urgent")
+    # Empty string is the valid "no filter" signal and must NOT raise.
+    assert len(store.list_bugs(severity_min="")) >= 1
 
 
 def test_list_ordering_newest_first(store):
@@ -198,7 +208,7 @@ def test_list_ordering_newest_first(store):
     _t.sleep(0.01)
     b = store.file_bug(target="developer", title="B", description="d",
                        observed_entity="b")
-    ids = [x.id for x in store.list()]
+    ids = [x.id for x in store.list_bugs()]
     assert ids.index(b.id) < ids.index(a.id)
 
 
@@ -209,18 +219,18 @@ def test_list_ordering_newest_first(store):
 
 def test_update_status_advances_lifecycle(store):
     bug = store.file_bug(target="developer", title="U", description="d")
-    triaged = store.update_status(bug.id, BUG_STATUS_TRIAGED, notes="t")
+    triaged = store.update_bug_status(bug.id, BUG_STATUS_TRIAGED, notes="t")
     assert triaged.status == BUG_STATUS_TRIAGED
-    in_prog = store.update_status(bug.id, BUG_STATUS_IN_PROGRESS, notes="claimed")
+    in_prog = store.update_bug_status(bug.id, BUG_STATUS_IN_PROGRESS, notes="claimed")
     assert in_prog.status == BUG_STATUS_IN_PROGRESS
     assert len(in_prog.notes_history) == 3
 
 
 def test_update_status_idempotent_without_notes(store):
     bug = store.file_bug(target="developer", title="I", description="d")
-    store.update_status(bug.id, BUG_STATUS_TRIAGED)
-    before = store.get(bug.id)
-    again = store.update_status(bug.id, BUG_STATUS_TRIAGED)
+    store.update_bug_status(bug.id, BUG_STATUS_TRIAGED)
+    before = store.get_bug(bug.id)
+    again = store.update_bug_status(bug.id, BUG_STATUS_TRIAGED)
     assert again.status == BUG_STATUS_TRIAGED
     assert len(again.notes_history) == len(before.notes_history)
 
@@ -228,19 +238,31 @@ def test_update_status_idempotent_without_notes(store):
 def test_update_status_rejects_invalid_status_name(store):
     bug = store.file_bug(target="developer", title="X", description="d")
     with pytest.raises(BugError, match="status must be one of"):
-        store.update_status(bug.id, "bogus")
+        store.update_bug_status(bug.id, "bogus")
 
 
 def test_update_status_rejects_on_terminal(store):
     bug = store.file_bug(target="developer", title="X", description="d")
     store.close_bug(bug.id, resolution=BUG_STATUS_FIXED)
     with pytest.raises(BugError, match="terminal"):
-        store.update_status(bug.id, BUG_STATUS_IN_PROGRESS)
+        store.update_bug_status(bug.id, BUG_STATUS_IN_PROGRESS)
 
 
 def test_update_status_rejects_unknown_id(store):
     with pytest.raises(BugError, match="unknown"):
-        store.update_status("bug_developer_missing", BUG_STATUS_TRIAGED)
+        store.update_bug_status("bug_developer_missing", BUG_STATUS_TRIAGED)
+
+
+def test_update_bug_status_rejects_duplicate_transition(store):
+    """Duplicate transitions require a ``duplicate_of`` pointer — force callers
+    onto ``mark_duplicate`` rather than let them file half-formed records."""
+    bug = store.file_bug(target="developer", title="D", description="d")
+    with pytest.raises(BugError, match="mark_duplicate"):
+        store.update_bug_status(bug.id, BUG_STATUS_DUPLICATE)
+    # The bug must not have been mutated by the rejected call.
+    still = store.get_bug(bug.id)
+    assert still.status == BUG_STATUS_OPEN
+    assert still.duplicate_of == ""
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +373,7 @@ def test_seed_data_present_on_first_init(tmp_path):
     """Fresh store gets the two curated seed entries."""
     knowledge = KnowledgeStore(str(tmp_path / "seeded.db"))
     store = BugStore(knowledge=knowledge)
-    bugs = store.list(status="all")
+    bugs = store.list_bugs(status="all")
     # Two seed bugs — distiller RL-mis-tag (low) + Substack 403 (medium)
     assert len(bugs) == 2
     titles = sorted(b.title for b in bugs)
@@ -369,12 +391,12 @@ def test_seed_data_idempotent_on_second_init(tmp_path):
     db_path = str(tmp_path / "idempotent.db")
     knowledge_a = KnowledgeStore(db_path)
     BugStore(knowledge=knowledge_a)  # seeds two
-    first_count = len(BugStore(knowledge=knowledge_a, seed=False).list(status="all"))
+    first_count = len(BugStore(knowledge=knowledge_a, seed=False).list_bugs(status="all"))
 
     # Fresh instance against the same DB (simulating a restart).
     knowledge_b = KnowledgeStore(db_path)
     BugStore(knowledge=knowledge_b)  # would-seed but shouldn't
-    second_count = len(BugStore(knowledge=knowledge_b, seed=False).list(status="all"))
+    second_count = len(BugStore(knowledge=knowledge_b, seed=False).list_bugs(status="all"))
 
     assert first_count == 2
     assert second_count == 2
@@ -391,7 +413,7 @@ def test_seed_data_skipped_when_store_already_has_rows(tmp_path):
     # store already has >0 bug rows.
     knowledge2 = KnowledgeStore(db_path)
     store_seeded = BugStore(knowledge=knowledge2)
-    assert len(store_seeded.list(status="all")) == 1
+    assert len(store_seeded.list_bugs(status="all")) == 1
 
 
 # ---------------------------------------------------------------------------

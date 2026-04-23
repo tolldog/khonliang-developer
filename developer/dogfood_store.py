@@ -168,13 +168,13 @@ class DogfoodStore:
     # Read paths
     # ------------------------------------------------------------------
 
-    def get(self, dog_id: str) -> Optional[Dogfood]:
+    def get_dogfood(self, dog_id: str) -> Optional[Dogfood]:
         entry = self.knowledge.get(dog_id)
         if entry is None or "dogfood" not in (entry.tags or []):
             return None
         return _dogfood_from_entry(entry)
 
-    def list(
+    def list_dogfood(
         self,
         *,
         kind: str = "",
@@ -277,7 +277,7 @@ class DogfoodStore:
 
     def mark_dismissed(self, dog_id: str, notes: str = "") -> Dogfood:
         """Terminal: dismiss a dogfood observation (won't act on it)."""
-        dog = self.get(dog_id)
+        dog = self.get_dogfood(dog_id)
         if dog is None:
             raise DogfoodError(f"unknown dogfood id: {dog_id}")
         if dog.status in TERMINAL_STATUSES:
@@ -302,9 +302,9 @@ class DogfoodStore:
             raise DogfoodError("duplicate_of must be non-empty")
         if duplicate_of == dog_id:
             raise DogfoodError("a dogfood entry cannot be a duplicate of itself")
-        if self.get(duplicate_of) is None:
+        if self.get_dogfood(duplicate_of) is None:
             raise DogfoodError(f"unknown duplicate target id: {duplicate_of!r}")
-        dog = self.get(dog_id)
+        dog = self.get_dogfood(dog_id)
         if dog is None:
             raise DogfoodError(f"unknown dogfood id: {dog_id}")
         if dog.status in TERMINAL_STATUSES:

@@ -1861,7 +1861,7 @@ class DeveloperAgent(BaseAgent):
         detail = args.get("detail", "brief")
 
         try:
-            bugs = self.pipeline.bugs.list(
+            bugs = self.pipeline.bugs.list_bugs(
                 target=target,
                 severity_min=severity_min,
                 status=status_arg or None,
@@ -1881,7 +1881,7 @@ class DeveloperAgent(BaseAgent):
     async def handle_get_bug(self, args):
         bug_id = args.get("bug_id", "")
         detail = args.get("detail", "brief")
-        bug = self.pipeline.bugs.get(bug_id)
+        bug = self.pipeline.bugs.get_bug(bug_id)
         if bug is None:
             return {"error": "not found", "bug_id": bug_id}
         if detail == "full":
@@ -1895,7 +1895,7 @@ class DeveloperAgent(BaseAgent):
         from developer.bug_store import BugError
 
         try:
-            bug = self.pipeline.bugs.update_status(
+            bug = self.pipeline.bugs.update_bug_status(
                 bug_id=args.get("bug_id", ""),
                 status=args.get("status", ""),
                 notes=args.get("notes", ""),
@@ -1997,7 +1997,7 @@ class DeveloperAgent(BaseAgent):
                 return {"error": f"since must be a number (epoch seconds), got {since_raw!r}"}
 
         try:
-            dogs = self.pipeline.dogfood.list(
+            dogs = self.pipeline.dogfood.list_dogfood(
                 kind=kind,
                 target=target,
                 since=since,
@@ -2018,10 +2018,15 @@ class DeveloperAgent(BaseAgent):
     @handler("get_dogfood")
     async def handle_get_dogfood(self, args):
         dog_id = args.get("dog_id", "")
-        dog = self.pipeline.dogfood.get(dog_id)
+        detail = args.get("detail", "brief")
+        dog = self.pipeline.dogfood.get_dogfood(dog_id)
         if dog is None:
             return {"error": "not found", "dog_id": dog_id}
-        return dog.to_public_dict()
+        if detail == "full":
+            return dog.to_public_dict()
+        if detail == "compact":
+            return dog.to_compact_dict()
+        return dog.to_brief_dict()
 
 
 def _parse_paths(value) -> list[str]:
