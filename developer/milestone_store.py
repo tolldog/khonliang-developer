@@ -501,8 +501,8 @@ class MilestoneStore:
         self,
         milestone_id: str,
         *,
+        fr_store: Any,
         reason: str = "",
-        fr_store: Any = None,
     ) -> dict[str, Any]:
         """Hard-delete a milestone.
 
@@ -532,13 +532,30 @@ class MilestoneStore:
         * FR(s) genuinely in_progress → move them to a different
           milestone or complete them first, then retry delete.
 
-        ``fr_store`` is an optional :class:`developer.fr_store.FRStore`.
-        When not supplied, the in-progress check is skipped with a
-        ``skipped_fr_check`` marker in the returned payload — this is
-        the documented fallback for callers that don't have an FR store
-        wired in (tests, offline tools). The primary agent wiring is
-        expected to always supply it.
+        ``fr_store`` is a required :class:`developer.fr_store.FRStore`
+        (required keyword-only; no default). Making it mandatory kills
+        the silent-bypass footgun that arose when callers — especially
+        REPL / direct-pipeline users — forgot to wire it: the
+        in-progress guard would be skipped with only a
+        ``skipped_fr_check`` marker, invalidating the safety promise.
+        Callers that legitimately cannot supply one (e.g. the bundle is
+        known-empty) must still pass the store; the method short-circuits
+        the FR check when ``milestone.fr_ids`` is empty. PR #43 Copilot
+        R5 finding 1.
         """
+        if fr_store is None:
+            # Explicit None is also rejected. The whole point of making
+            # fr_store required is to kill the silent-bypass footgun;
+            # accepting None here would reintroduce it through the back
+            # door. Callers that genuinely have no FR store wired (tests,
+            # REPL) must construct one — there is no skip-the-check
+            # escape hatch. PR #43 Copilot R5 finding 1.
+            raise TypeError(
+                "MilestoneStore.delete() requires fr_store (got None). "
+                "Pass the pipeline's FRStore so the in-progress guard "
+                "can run — there is no opt-in to bypass the check."
+            )
+
         milestone = self.get(milestone_id)
         if milestone is None:
             raise MilestoneError(f"unknown milestone id: {milestone_id}")
@@ -551,9 +568,8 @@ class MilestoneStore:
                 "Use supersede_milestone to preserve the audit trail."
             )
 
-        fr_check_skipped = False
         blocking_frs: list[str] = []
-        if fr_store is not None and milestone.fr_ids:
+        if milestone.fr_ids:
             for fr_id in milestone.fr_ids:
                 try:
                     fr = fr_store.get(fr_id)
@@ -602,15 +618,12 @@ class MilestoneStore:
                     f"{blocking_frs}. Move those FRs to another milestone "
                     "or complete them first."
                 )
-        elif fr_store is None and milestone.fr_ids:
-            fr_check_skipped = True
 
         removed = self.knowledge.remove(milestone_id)
         return {
             "milestone_id": milestone_id,
             "removed": bool(removed),
             "reason": reason,
-            "skipped_fr_check": fr_check_skipped,
         }
 
     def _store(self, milestone: Milestone) -> None:

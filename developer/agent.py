@@ -272,7 +272,9 @@ class DeveloperAgent(BaseAgent):
                    "status": {"type": "string", "required": True},
                    "notes": {"type": "string", "default": ""},
                    "force": {"type": "boolean", "default": False,
-                             "description": "allow rollback out of a terminal status"}},
+                             "description": "allow any transition not in the forward graph "
+                             "(including backward edges between active states and rollback "
+                             "from terminal states)"}},
                   since="0.16.0"),
             Skill("supersede_milestone",
                   "Mark one milestone as superseded by another. Does not cascade to FRs.",

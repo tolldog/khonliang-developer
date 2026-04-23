@@ -333,6 +333,28 @@ def test_delete_milestone_allows_clean_milestone(pipeline):
     assert pipeline.milestones.get(milestone.id) is None
 
 
+def test_delete_milestone_requires_fr_store_parameter(pipeline):
+    """fr_store is now a required keyword arg — calling without it must raise.
+
+    Previously fr_store defaulted to None and the in-progress guard was
+    silently skipped with a ``skipped_fr_check`` marker. REPL / direct-
+    pipeline callers that forgot to wire it got a hard-delete that
+    bypassed the "refuse if bundled FR in_progress" safety promise.
+    Making fr_store required turns that footgun into a TypeError at the
+    call site. PR #43 Copilot R5 finding 1.
+    """
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+
+    # No fr_store kwarg → TypeError from the function signature.
+    with pytest.raises(TypeError, match="fr_store"):
+        pipeline.milestones.delete(milestone.id)
+
+    # Explicit fr_store=None is also rejected — the parameter is
+    # required, there is no opt-in to skip the check.
+    with pytest.raises(TypeError, match="fr_store"):
+        pipeline.milestones.delete(milestone.id, fr_store=None)  # type: ignore[arg-type]
+
+
 def test_update_milestone_frs_add_remove(pipeline):
     milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
     original = list(milestone.fr_ids)
