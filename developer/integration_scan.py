@@ -1,0 +1,653 @@
+"""Integration-point scanner — symmetric partner to fr_candidates_from_concepts.
+
+Where ``fr_candidates_from_concepts`` turns researcher concept bundles into
+*new-FR* proposals, this module turns a *merged feature* (FR, PR, or skill)
+into a ranked list of ecosystem *adoption* proposals: existing FRs that
+should migrate to the new primitive, agents with near-duplicate skills,
+events that have no subscribers, TODO-style mentions that point at
+refactor opportunities.
+
+MVP exercises four of the five documented scan sources; source-code grep
+across dev repos is deferred until a `dev_repos` registry lands
+(``fr_developer_82fe7309``).
+
+The scanner is factored around small pure functions so the agent handler
+can plug in:
+
+- a live :class:`developer.fr_store.FRStore` for FR scanning,
+- a bus-backed async callable for remote skill discovery,
+- an async callable returning subscriber counts for a topic,
+- an optional LLM rationale callable capped by top_n.
+
+Tests substitute the callables with in-process fakes.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Iterable, Optional
+
+# Signal categories. Kept here (not in the agent module) so downstream
+# consumers that import the scanner directly can reuse the enum without
+# pulling in the agent's heavier dependencies.
+SIGNAL_DIRECT_REPLACE = "direct_replace"
+SIGNAL_MIGRATE = "migrate"
+SIGNAL_WIRE_SUBSCRIBER = "wire_subscriber"
+SIGNAL_REFACTOR_TO_PRIMITIVE = "refactor_to_primitive"
+
+ALL_SIGNALS = (
+    SIGNAL_DIRECT_REPLACE,
+    SIGNAL_MIGRATE,
+    SIGNAL_WIRE_SUBSCRIBER,
+    SIGNAL_REFACTOR_TO_PRIMITIVE,
+)
+
+# Regex keywords used by scan source #5 — FR-body mentions that hint at
+# adoption opportunities. Case-insensitive; bounded to whole-word matches
+# so "adopted" doesn't match "adoptable" accidentally.
+_ADOPT_KEYWORDS = (
+    "todo",
+    "follow-up",
+    "follow up",
+    "adopt",
+    "future work",
+    "should migrate",
+)
+
+# Regex for parsing "owner/repo#123" or a full GH URL. Deliberately narrow —
+# MVP only handles merged PRs so caller-supplied IDs must be one of these two
+# exact shapes (matches the behaviour the handler documents).
+_PR_SHORTHAND_RE = re.compile(r"^([\w.-]+)/([\w.-]+)#(\d+)$")
+_PR_URL_RE = re.compile(
+    r"^https?://github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)(?:[/#?].*)?$"
+)
+
+# Small English stoplist — reused from _match_tokens in agent.py but kept
+# local so this module doesn't import from the agent module (which would
+# be a layering violation given the agent imports this module).
+_STOPWORDS = frozenset({
+    "the", "and", "for", "from", "into", "with", "this", "that",
+    "apply", "developer", "workflow", "via", "when", "then",
+    "have", "has", "its", "their", "these", "those", "new",
+    "use", "using", "used", "add", "adds", "added", "are", "was",
+    "were", "our", "your", "there", "here", "not", "but", "all",
+    "any", "can", "may", "will", "would", "should", "could",
+})
+
+# LLM budget cap for rationale generation — matches the MVP spec.
+MAX_LLM_RATIONALES = 20
+
+
+@dataclass
+class FeatureSurface:
+    """Normalized representation of a feature source (FR, PR, or skill).
+
+    Populated by :func:`extract_feature_surface` and consumed by every
+    scan source. Keeping this as a dataclass (not a dict) means typos in
+    field access surface as attribute errors instead of silent ``None``s.
+    """
+
+    kind: str
+    id: str
+    title: str = ""
+    description: str = ""
+    new_skills: list[str] = field(default_factory=list)
+    new_events: list[str] = field(default_factory=list)
+    new_types: list[str] = field(default_factory=list)
+    topic_concepts: list[str] = field(default_factory=list)
+    tokens: set[str] = field(default_factory=set)
+
+    def to_public_dict(self) -> dict[str, Any]:
+        """Serializable projection for the scan artifact + response echo."""
+        return {
+            "kind": self.kind,
+            "id": self.id,
+            "title": self.title,
+            "description": self.description,
+            "new_skills": list(self.new_skills),
+            "new_events": list(self.new_events),
+            "new_types": list(self.new_types),
+            "topic_concepts": list(self.topic_concepts),
+        }
+
+
+@dataclass
+class IntegrationCandidate:
+    """A single ranked adoption site.
+
+    ``target_id`` naming by kind:
+      - ``fr``: ``fr_<target>_<hex>``
+      - ``skill_callsite``: ``<agent_id>.<skill_name>``
+      - ``agent``: ``<agent_id>``
+      - ``event_broker_gap``: the topic string itself
+    """
+
+    kind: str
+    target_id: str
+    signal: str
+    score: float
+    rationale: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_brief(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "target_id": self.target_id,
+            "rationale": self.rationale,
+            "score": round(float(self.score), 3),
+            "signal": self.signal,
+        }
+
+    def to_full(self) -> dict[str, Any]:
+        brief = self.to_brief()
+        brief["metadata"] = dict(self.metadata)
+        return brief
+
+
+def tokens(text: str) -> set[str]:
+    """Lowercase alphanumeric tokens minus stopwords and very short tokens."""
+    return {
+        t
+        for t in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if len(t) > 2 and t not in _STOPWORDS
+    }
+
+
+def jaccard(a: Iterable[str], b: Iterable[str]) -> float:
+    """Set-similarity in [0, 1]. Returns 0 when both sides are empty.
+
+    Used as a cheap fallback for cosine similarity when the researcher's
+    relevance scorer isn't reachable through the bus.
+    """
+    sa, sb = set(a), set(b)
+    if not sa and not sb:
+        return 0.0
+    union = sa | sb
+    if not union:
+        return 0.0
+    return len(sa & sb) / len(union)
+
+
+def parse_pr_id(raw: str) -> Optional[tuple[str, str, int]]:
+    """Accept either ``owner/repo#N`` or a canonical PR URL.
+
+    Returns ``(owner, repo, pr_number)`` or ``None`` if the input doesn't
+    match either shape. The narrow grammar is deliberate — we don't want
+    to guess at malformed inputs silently.
+    """
+    if not raw:
+        return None
+    raw = raw.strip()
+    m = _PR_SHORTHAND_RE.match(raw)
+    if m:
+        return (m.group(1), m.group(2), int(m.group(3)))
+    m = _PR_URL_RE.match(raw)
+    if m:
+        return (m.group(1), m.group(2), int(m.group(3)))
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Feature-surface extraction
+# ---------------------------------------------------------------------------
+
+
+# Skill names mentioned in FR/PR/skill source text. The heuristic is
+# snake_case words that look like bus operations — three or more chars,
+# at least one underscore, all lowercase. Pure-prose words like
+# ``integration`` aren't matched because they lack the underscore.
+_SKILL_NAME_RE = re.compile(r"\b([a-z][a-z0-9_]*_[a-z0-9_]+)\b")
+
+# Event topics: dotted names with at least one dot, all lowercase or
+# lowercase with digits. Matches "pr.fleet_digest", "library.gap_identified".
+_EVENT_TOPIC_RE = re.compile(r"\b([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+)\b")
+
+
+def _extract_skill_names(text: str) -> list[str]:
+    seen: list[str] = []
+    added: set[str] = set()
+    for m in _SKILL_NAME_RE.finditer(text or ""):
+        name = m.group(1)
+        # Filter candidates that are obviously not skills: identifiers
+        # containing a dot belong to event extraction, not skill extraction.
+        if name in added:
+            continue
+        added.add(name)
+        seen.append(name)
+    return seen
+
+
+def _extract_event_topics(text: str) -> list[str]:
+    seen: list[str] = []
+    added: set[str] = set()
+    for m in _EVENT_TOPIC_RE.finditer(text or ""):
+        name = m.group(1)
+        if name in added:
+            continue
+        added.add(name)
+        seen.append(name)
+    return seen
+
+
+def _extract_type_names(text: str) -> list[str]:
+    """CamelCase type-like identifiers. Heuristic, MVP-only."""
+    seen: list[str] = []
+    added: set[str] = set()
+    for m in re.finditer(r"\b([A-Z][A-Za-z0-9]{2,})\b", text or ""):
+        name = m.group(1)
+        if name in added:
+            continue
+        added.add(name)
+        seen.append(name)
+    return seen
+
+
+def extract_feature_surface_from_fr(fr: Any) -> FeatureSurface:
+    """Build a surface from a developer FR record.
+
+    ``fr`` is a duck-typed object with ``id``, ``title``, ``description``,
+    and ``concept`` attributes (matching :class:`developer.fr_store.FR`).
+    Using duck typing instead of an isinstance check means this module
+    stays importable without pulling in the store module at import time.
+    """
+    title = getattr(fr, "title", "") or ""
+    description = getattr(fr, "description", "") or ""
+    concept = getattr(fr, "concept", "") or ""
+    combined = f"{title}\n{description}\n{concept}"
+    return FeatureSurface(
+        kind="fr",
+        id=getattr(fr, "id", "") or "",
+        title=title,
+        description=description,
+        new_skills=_extract_skill_names(combined),
+        new_events=_extract_event_topics(combined),
+        new_types=_extract_type_names(combined),
+        topic_concepts=[c.strip() for c in concept.split(",") if c.strip()],
+        tokens=tokens(combined),
+    )
+
+
+def extract_feature_surface_from_pr(
+    *, pr_id: str, title: str, body: str, owner: str = "", repo: str = "",
+) -> FeatureSurface:
+    combined = f"{title}\n{body}"
+    return FeatureSurface(
+        kind="pr",
+        id=pr_id,
+        title=title,
+        description=body,
+        new_skills=_extract_skill_names(combined),
+        new_events=_extract_event_topics(combined),
+        new_types=_extract_type_names(combined),
+        topic_concepts=[],
+        tokens=tokens(combined),
+    )
+
+
+def extract_feature_surface_from_skill(
+    *, skill_id: str, description: str = "", agent_type: str = "",
+    args_schema: Optional[dict] = None,
+) -> FeatureSurface:
+    combined = f"{skill_id}\n{description}\n{agent_type}"
+    # The skill name itself is the only *new skill* this surface contributes.
+    # Extract bare skill name (strip ``<agent>.`` prefix if present).
+    bare_name = skill_id.split(".")[-1] if "." in skill_id else skill_id
+    return FeatureSurface(
+        kind="skill",
+        id=skill_id,
+        title=bare_name,
+        description=description,
+        new_skills=[bare_name] if bare_name else [],
+        new_events=_extract_event_topics(combined),
+        new_types=_extract_type_names(combined),
+        topic_concepts=[],
+        tokens=tokens(combined),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scan sources
+# ---------------------------------------------------------------------------
+
+
+def scan_fr_store(
+    surface: FeatureSurface, existing: Iterable[Any],
+) -> list[IntegrationCandidate]:
+    """Scan sources #1 and #5 — FR semantic + regex-keyword mentions.
+
+    Combines two sub-scans that both iterate the FR corpus:
+
+    - Token-overlap → ``migrate`` (significant overlap) or
+      ``direct_replace`` (near-exact title match).
+    - Adoption-keyword co-occurrence (``TODO``/``follow-up``/``adopt``) →
+      ``refactor_to_primitive``.
+
+    One pass, two classifications — a single FR can legitimately surface
+    under both signals, but we de-duplicate by ``(target_id, signal)``.
+    """
+    surface_tokens = surface.tokens
+    surface_title = (surface.title or "").lower().strip()
+    surface_id = surface.id
+
+    candidates: list[IntegrationCandidate] = []
+    seen: set[tuple[str, str]] = set()
+
+    for fr in existing:
+        fr_id = getattr(fr, "id", "") or ""
+        if not fr_id or fr_id == surface_id:
+            # Skip the feature itself when it lives in the FR store.
+            continue
+        fr_title = getattr(fr, "title", "") or ""
+        fr_body = getattr(fr, "description", "") or ""
+        fr_concept = getattr(fr, "concept", "") or ""
+        haystack = f"{fr_title}\n{fr_body}\n{fr_concept}"
+        fr_tokens = tokens(haystack)
+
+        # --- direct_replace: exact-ish title match ------------------------
+        title_sim = jaccard(tokens(fr_title), tokens(surface.title))
+        if surface_title and fr_title.lower().strip() == surface_title:
+            key = (fr_id, SIGNAL_DIRECT_REPLACE)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(IntegrationCandidate(
+                    kind="fr", target_id=fr_id,
+                    signal=SIGNAL_DIRECT_REPLACE,
+                    score=1.0,
+                    rationale=f"FR title matches {surface.title!r} verbatim",
+                    metadata={
+                        "status": getattr(fr, "status", ""),
+                        "target": getattr(fr, "target", ""),
+                        "title_sim": round(title_sim, 3),
+                    },
+                ))
+                continue
+        elif title_sim >= 0.8:
+            key = (fr_id, SIGNAL_DIRECT_REPLACE)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(IntegrationCandidate(
+                    kind="fr", target_id=fr_id,
+                    signal=SIGNAL_DIRECT_REPLACE,
+                    score=0.85,
+                    rationale=f"FR title near-matches {surface.title!r}",
+                    metadata={
+                        "status": getattr(fr, "status", ""),
+                        "target": getattr(fr, "target", ""),
+                        "title_sim": round(title_sim, 3),
+                    },
+                ))
+                continue
+
+        # --- migrate: description cosine-fallback (jaccard) ---------------
+        body_sim = jaccard(surface_tokens, fr_tokens)
+        if body_sim >= 0.25:
+            # 0.25 is an intentionally low threshold — recall beats
+            # precision for a first pass, and the reviewer sees the score.
+            # Score is mapped linearly from [0.25, 1.0] → [0.5, 1.0] so
+            # migrate candidates stay below direct_replace's baseline.
+            score = 0.5 + (body_sim - 0.25) * (0.5 / 0.75)
+            key = (fr_id, SIGNAL_MIGRATE)
+            if key not in seen:
+                seen.add(key)
+                shared = sorted(surface_tokens & fr_tokens)[:8]
+                candidates.append(IntegrationCandidate(
+                    kind="fr", target_id=fr_id,
+                    signal=SIGNAL_MIGRATE,
+                    score=min(0.99, score),
+                    rationale=(
+                        f"FR overlaps on {len(shared)} tokens "
+                        f"(e.g. {', '.join(shared[:4])})"
+                    ),
+                    metadata={
+                        "status": getattr(fr, "status", ""),
+                        "target": getattr(fr, "target", ""),
+                        "body_sim": round(body_sim, 3),
+                        "shared_tokens": shared,
+                    },
+                ))
+
+        # --- refactor_to_primitive: adoption-keyword co-occurrence --------
+        lower = haystack.lower()
+        hit_kw: list[str] = []
+        for kw in _ADOPT_KEYWORDS:
+            if kw in lower:
+                hit_kw.append(kw)
+        if hit_kw:
+            # Require some thematic link before flagging — an FR that
+            # mentions "TODO" in an unrelated context shouldn't surface
+            # just because the string appears. Demand at least one shared
+            # token with the surface.
+            shared = surface_tokens & fr_tokens
+            if shared:
+                key = (fr_id, SIGNAL_REFACTOR_TO_PRIMITIVE)
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(IntegrationCandidate(
+                        kind="fr", target_id=fr_id,
+                        signal=SIGNAL_REFACTOR_TO_PRIMITIVE,
+                        score=0.5,
+                        rationale=(
+                            f"FR body mentions {', '.join(hit_kw[:2])!r} "
+                            f"alongside overlap on {len(shared)} token(s)"
+                        ),
+                        metadata={
+                            "status": getattr(fr, "status", ""),
+                            "target": getattr(fr, "target", ""),
+                            "keywords": hit_kw,
+                            "shared_tokens": sorted(shared)[:8],
+                        },
+                    ))
+    return candidates
+
+
+def scan_agent_skills(
+    surface: FeatureSurface, skills: Iterable[dict],
+) -> list[IntegrationCandidate]:
+    """Scan source #2 — near-duplicate skills registered on other agents.
+
+    ``skills`` is the shape returned by the bus ``/v1/skills`` endpoint —
+    each row has ``agent_id``, ``name``, ``description`` at minimum.
+    """
+    # Surface's own agent (if we can identify it) is excluded so we don't
+    # recommend the agent re-implement its own skill. For FR/PR sources
+    # this is a no-op; for skill sources we extract the prefix.
+    self_agent = ""
+    self_skill = ""
+    if surface.kind == "skill" and "." in surface.id:
+        self_agent, self_skill = surface.id.split(".", 1)
+
+    candidates: list[IntegrationCandidate] = []
+    seen: set[tuple[str, str]] = set()
+    surface_skill_names = {s.lower() for s in surface.new_skills}
+    surface_tokens = surface.tokens
+
+    for row in skills:
+        agent_id = str(row.get("agent_id") or "")
+        skill_name = str(row.get("name") or "")
+        desc = str(row.get("description") or "")
+        if not agent_id or not skill_name:
+            continue
+        if agent_id == self_agent and skill_name == self_skill:
+            continue
+        target_id = f"{agent_id}.{skill_name}"
+
+        # Exact name match → direct_replace with score 1.0.
+        if skill_name.lower() in surface_skill_names:
+            key = (target_id, SIGNAL_DIRECT_REPLACE)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(IntegrationCandidate(
+                    kind="skill_callsite", target_id=target_id,
+                    signal=SIGNAL_DIRECT_REPLACE,
+                    score=1.0,
+                    rationale=(
+                        f"Agent {agent_id!r} already exposes skill "
+                        f"{skill_name!r} — collapse or delegate"
+                    ),
+                    metadata={
+                        "agent_id": agent_id,
+                        "skill_name": skill_name,
+                        "description": desc,
+                    },
+                ))
+                continue
+
+        # Description overlap → migrate with jaccard-scaled score. Gate
+        # on a minimum so very short skills don't flood the results.
+        skill_tokens = tokens(f"{skill_name} {desc}")
+        sim = jaccard(surface_tokens, skill_tokens)
+        if sim >= 0.2:
+            score = 0.4 + (sim - 0.2) * (0.4 / 0.8)
+            key = (target_id, SIGNAL_MIGRATE)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(IntegrationCandidate(
+                    kind="skill_callsite", target_id=target_id,
+                    signal=SIGNAL_MIGRATE,
+                    score=min(0.79, score),
+                    rationale=(
+                        f"{target_id} description overlaps "
+                        f"(jaccard={sim:.2f}) — candidate migration site"
+                    ),
+                    metadata={
+                        "agent_id": agent_id,
+                        "skill_name": skill_name,
+                        "description": desc,
+                        "similarity": round(sim, 3),
+                    },
+                ))
+    return candidates
+
+
+def scan_event_subscribers(
+    surface: FeatureSurface,
+    subscriber_counts: dict[str, int],
+    expected_consumers: Optional[dict[str, int]] = None,
+) -> list[IntegrationCandidate]:
+    """Scan source #3 — topics published with no subscribers.
+
+    ``subscriber_counts`` maps topic → int. ``expected_consumers``
+    (optional) gives the expected fan-out per topic; when provided, a
+    topic with *some* subscribers but fewer than expected is flagged
+    with a proportionally lower score.
+    """
+    expected_consumers = expected_consumers or {}
+    candidates: list[IntegrationCandidate] = []
+    for topic in surface.new_events:
+        count = int(subscriber_counts.get(topic, 0))
+        if count == 0:
+            candidates.append(IntegrationCandidate(
+                kind="event_broker_gap", target_id=topic,
+                signal=SIGNAL_WIRE_SUBSCRIBER,
+                score=1.0,
+                rationale=(
+                    f"Topic {topic!r} has no subscribers — adoption site"
+                ),
+                metadata={"subscriber_count": 0},
+            ))
+            continue
+        expected = expected_consumers.get(topic, 0)
+        if expected and count < expected:
+            # Fractional gap. A topic expecting 4 consumers with only 1
+            # registered is worth highlighting; a topic expecting 2 with
+            # 1 still scores, just lower.
+            score = 1.0 - (count / expected)
+            candidates.append(IntegrationCandidate(
+                kind="event_broker_gap", target_id=topic,
+                signal=SIGNAL_WIRE_SUBSCRIBER,
+                score=round(score, 3),
+                rationale=(
+                    f"Topic {topic!r} has {count}/{expected} expected "
+                    "subscribers — partial adoption"
+                ),
+                metadata={
+                    "subscriber_count": count,
+                    "expected": expected,
+                },
+            ))
+    return candidates
+
+
+# ---------------------------------------------------------------------------
+# Ranking + assembly
+# ---------------------------------------------------------------------------
+
+
+def rank_candidates(candidates: list[IntegrationCandidate]) -> list[IntegrationCandidate]:
+    """Sort by (signal priority, score desc, target_id).
+
+    Signal priority mirrors the MVP spec's relative ordering — direct
+    replacements are the most actionable, wire-subscriber gaps next,
+    migrations, then refactor hints.
+    """
+    priority = {
+        SIGNAL_DIRECT_REPLACE: 0,
+        SIGNAL_WIRE_SUBSCRIBER: 1,
+        SIGNAL_MIGRATE: 2,
+        SIGNAL_REFACTOR_TO_PRIMITIVE: 3,
+    }
+    return sorted(
+        candidates,
+        key=lambda c: (
+            priority.get(c.signal, 99),
+            -float(c.score),
+            c.target_id,
+        ),
+    )
+
+
+def compute_scan_id(source: dict[str, Any], *, seed: Optional[float] = None) -> str:
+    """Stable 8-hex identifier for a scan of ``source``.
+
+    ``seed`` defaults to the current epoch second so repeat scans don't
+    collide; callers with a fixed timestamp can pass one in for
+    deterministic fixtures.
+    """
+    if seed is None:
+        seed = time.time()
+    payload = json.dumps(
+        {"source": source, "ts": int(seed)},
+        sort_keys=True,
+    ).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()[:8]
+    return f"scan_integration_{digest}"
+
+
+# ---------------------------------------------------------------------------
+# LLM rationale budget helper
+# ---------------------------------------------------------------------------
+
+
+RationaleFn = Callable[[IntegrationCandidate, FeatureSurface], Awaitable[str]]
+
+
+async def apply_llm_rationales(
+    candidates: list[IntegrationCandidate],
+    surface: FeatureSurface,
+    rationale_fn: Optional[RationaleFn],
+    *,
+    top_n: int = MAX_LLM_RATIONALES,
+) -> int:
+    """Invoke ``rationale_fn`` for the first ``top_n`` candidates only.
+
+    Returns the number of calls made. Template rationales (set by the
+    scan sources) remain on everything past the cap. Exceptions from
+    ``rationale_fn`` are swallowed per-candidate so one failure doesn't
+    poison the whole pass — the candidate keeps its template rationale.
+    """
+    if rationale_fn is None or top_n <= 0:
+        return 0
+    calls = 0
+    for c in candidates[:top_n]:
+        try:
+            generated = await rationale_fn(c, surface)
+        except Exception:
+            continue
+        calls += 1
+        if generated:
+            c.rationale = generated
+    return calls

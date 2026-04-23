@@ -19,9 +19,13 @@ import json
 import logging
 import re
 import sys
+import time
 from pathlib import Path
+from typing import Any, Optional
 
 from khonliang_bus import BaseAgent, Skill, Collaboration, handler
+
+from developer import integration_scan
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +229,32 @@ class DeveloperAgent(BaseAgent):
                    "detail": {"type": "string", "default": "brief"},
                    "timeout_s": {"type": "number", "default": 90}},
                   since="0.9.0"),
+            # Symmetric partner to fr_candidates_from_concepts — turns a
+            # merged feature into ranked ecosystem-adoption proposals.
+            # MVP covers 4 of 5 scan sources; source-code grep across
+            # dev repos is deferred until a `dev_repos` registry lands
+            # (fr_developer_82fe7309).
+            Skill("suggest_integration_points",
+                  "Scan the ecosystem for adoption sites of a merged feature "
+                  "(FR / PR / skill). Returns ranked candidates by signal.",
+                  {"source": {"type": "object", "required": True,
+                              "description": "{'kind':'fr'|'pr'|'skill','id':str}"},
+                   "detail": {"type": "string", "default": "brief",
+                              "description": "brief / compact / full"},
+                   "audience": {"type": "string", "default": "",
+                                "description": "optional filter, e.g. 'builder'"},
+                   "top_n": {"type": "integer", "default": 20,
+                             "description": "max candidates returned in brief"}},
+                  since="0.17.0"),
+            Skill("distill_integration_points",
+                  "Re-project a prior suggest_integration_points scan artifact "
+                  "without rescanning. Filter by signal / top_n / detail.",
+                  {"scan_id": {"type": "string", "required": True},
+                   "top_n": {"type": "integer", "default": 20},
+                   "signal": {"type": "string", "default": "",
+                              "description": "optional signal filter"},
+                   "detail": {"type": "string", "default": "brief"}},
+                  since="0.17.0"),
             # Developer-owned FR work planning
             Skill("next_work_unit", "Get the highest-ranked developer FR work unit",
                   {"target": {"type": "string", "default": ""},
@@ -832,6 +862,368 @@ class DeveloperAgent(BaseAgent):
             "existing_match_count": sum(1 for c in candidates if c["existing_matches"]),
             "candidates": candidates,
         }
+
+    # -- integration-point scanning (fr_developer_82fe7309) --
+
+    @handler("suggest_integration_points")
+    async def handle_suggest_integration_points(self, args):
+        """Scan the ecosystem for adoption sites of a merged feature.
+
+        Symmetric partner to ``fr_candidates_from_concepts`` — that skill
+        turns concept bundles into new-FR proposals; this one turns merged
+        features into integration proposals. MVP covers 4 of 5 documented
+        scan sources (FR store, agent-registered skills, bus events without
+        subscribers, FR-body keyword mentions). Source-code grep across dev
+        repos is deferred.
+        """
+        source = args.get("source")
+        if not isinstance(source, dict):
+            msg = f"source must be an object with 'kind' and 'id', got {type(source).__name__}"
+            await self._safe_report_gap("suggest_integration_points", msg)
+            return {"error": msg}
+
+        kind = str(source.get("kind") or "").strip().lower()
+        source_id = str(source.get("id") or "").strip()
+        if kind not in ("fr", "pr", "skill"):
+            msg = f"source.kind must be 'fr', 'pr', or 'skill', got {kind!r}"
+            await self._safe_report_gap("suggest_integration_points", msg)
+            return {"error": msg}
+        if not source_id:
+            msg = "source.id is required"
+            await self._safe_report_gap("suggest_integration_points", msg)
+            return {"error": msg}
+
+        detail = str(args.get("detail") or "brief").strip() or "brief"
+        audience = str(args.get("audience") or "").strip()
+        try:
+            top_n = int(args.get("top_n") or 20)
+        except (TypeError, ValueError):
+            top_n = 20
+        top_n = max(1, top_n)
+
+        # Resolve the feature surface. Each branch raises a descriptive
+        # error that we surface verbatim rather than mapping to a generic
+        # "invalid source" — callers want to know which field broke.
+        try:
+            surface = await self._resolve_feature_surface(kind, source_id)
+        except (ValueError, LookupError) as e:
+            msg = str(e)
+            await self._safe_report_gap("suggest_integration_points", msg)
+            return {"error": msg}
+
+        # Gather candidates from the four active scan sources. Each scan
+        # is independent — a failure in the bus-skills lookup mustn't
+        # stop FR-store scanning. We accumulate and rank the survivors.
+        candidates: list[integration_scan.IntegrationCandidate] = []
+
+        try:
+            existing = self.pipeline.frs.list(include_all=True)
+        except Exception as e:
+            logger.warning("suggest_integration_points: fr_store.list failed: %s", e)
+            existing = []
+        candidates.extend(integration_scan.scan_fr_store(surface, existing))
+
+        try:
+            remote_skills = await self._fetch_remote_skills()
+        except Exception as e:
+            logger.warning("suggest_integration_points: bus skill fetch failed: %s", e)
+            remote_skills = []
+        candidates.extend(integration_scan.scan_agent_skills(surface, remote_skills))
+
+        try:
+            subscribers = await self._fetch_subscriber_counts(surface.new_events)
+        except Exception as e:
+            logger.warning("suggest_integration_points: subscriber fetch failed: %s", e)
+            subscribers = {}
+        candidates.extend(integration_scan.scan_event_subscribers(surface, subscribers))
+
+        # Audience filter is applied post-scan: the metadata on each
+        # candidate may carry an 'audience' hint (e.g. from FR tags).
+        # MVP keeps this simple — filter out candidates whose metadata
+        # carries an explicit audience that doesn't match. Candidates
+        # without an audience tag pass through unfiltered.
+        if audience:
+            candidates = [
+                c for c in candidates
+                if not c.metadata.get("audience")
+                or c.metadata.get("audience") == audience
+            ]
+
+        ranked = integration_scan.rank_candidates(candidates)
+
+        # Best-effort LLM rationales for the top slice — cap at the
+        # module's MAX_LLM_RATIONALES to keep the budget bounded even
+        # if a caller passes a huge top_n.
+        rationale_cap = min(top_n, integration_scan.MAX_LLM_RATIONALES)
+        rationale_fn = getattr(self, "_llm_rationale", None)
+        llm_calls = await integration_scan.apply_llm_rationales(
+            ranked, surface, rationale_fn, top_n=rationale_cap,
+        )
+
+        # Persist the full scan artifact so distill_integration_points
+        # can re-project without rescanning. Storage uses the local
+        # knowledge store with a 'scan_integration' tag — keeps the
+        # pattern consistent with FR / milestone storage.
+        scan_id = integration_scan.compute_scan_id({"kind": kind, "id": source_id})
+        try:
+            self._store_integration_scan(
+                scan_id=scan_id,
+                source={"kind": kind, "id": source_id},
+                surface=surface,
+                ranked=ranked,
+                audience=audience,
+            )
+        except Exception as e:
+            logger.warning("suggest_integration_points: artifact write failed: %s", e)
+
+        return self._project_scan_response(
+            scan_id=scan_id,
+            source={"kind": kind, "id": source_id, "surface": surface.to_public_dict()},
+            ranked=ranked,
+            top_n=top_n,
+            detail=detail,
+            extra={"llm_rationale_calls": llm_calls},
+        )
+
+    @handler("distill_integration_points")
+    async def handle_distill_integration_points(self, args):
+        """Re-project a stored scan artifact without rescanning.
+
+        ``scan_id`` is the id returned by ``suggest_integration_points``.
+        Filtering is pure re-ranking — no new scan, no bus requests,
+        no LLM calls. The same artifact id is echoed back unchanged.
+        """
+        scan_id = str(args.get("scan_id") or "").strip()
+        if not scan_id:
+            return {"error": "scan_id is required"}
+        try:
+            top_n = int(args.get("top_n") or 20)
+        except (TypeError, ValueError):
+            top_n = 20
+        top_n = max(1, top_n)
+        signal = str(args.get("signal") or "").strip()
+        detail = str(args.get("detail") or "brief").strip() or "brief"
+
+        entry = self.pipeline.knowledge.get(scan_id)
+        if entry is None:
+            msg = f"scan artifact not found: {scan_id!r}"
+            await self._safe_report_gap("distill_integration_points", msg)
+            return {"error": msg}
+        try:
+            payload = json.loads(entry.content)
+        except (ValueError, TypeError) as e:
+            msg = f"scan artifact {scan_id!r} is malformed: {e}"
+            await self._safe_report_gap("distill_integration_points", msg)
+            return {"error": msg}
+
+        raw_candidates = payload.get("candidates") or []
+        if signal:
+            raw_candidates = [c for c in raw_candidates if c.get("signal") == signal]
+        # The stored shape matches IntegrationCandidate.to_full(); rehydrate
+        # into objects for uniform ranking with the live-scan path.
+        rehydrated = [
+            integration_scan.IntegrationCandidate(
+                kind=c.get("kind", ""),
+                target_id=c.get("target_id", ""),
+                signal=c.get("signal", ""),
+                score=float(c.get("score") or 0.0),
+                rationale=c.get("rationale", ""),
+                metadata=dict(c.get("metadata") or {}),
+            )
+            for c in raw_candidates
+        ]
+        ranked = integration_scan.rank_candidates(rehydrated)
+        return self._project_scan_response(
+            scan_id=scan_id,
+            source=payload.get("source") or {},
+            ranked=ranked,
+            top_n=top_n,
+            detail=detail,
+            extra={"from_artifact": True, "signal_filter": signal},
+        )
+
+    # -- integration scan helpers --
+
+    async def _resolve_feature_surface(
+        self, kind: str, source_id: str,
+    ) -> integration_scan.FeatureSurface:
+        """Load the underlying feature and extract a scan surface.
+
+        Raises ``LookupError`` when the source can't be found and
+        ``ValueError`` when the id shape is unparseable. Callers convert
+        both into an error-dict response.
+        """
+        if kind == "fr":
+            fr = self.pipeline.frs.get(source_id)
+            if fr is None:
+                raise LookupError(f"FR {source_id!r} not found in developer store")
+            return integration_scan.extract_feature_surface_from_fr(fr)
+
+        if kind == "pr":
+            parsed = integration_scan.parse_pr_id(source_id)
+            if parsed is None:
+                raise ValueError(
+                    f"PR id must be 'owner/repo#N' or a canonical GitHub URL, got {source_id!r}"
+                )
+            owner, repo_name, pr_number = parsed
+            gh = self._github_client()
+            repo_slug = f"{owner}/{repo_name}"
+            pr_data = await gh.get_pr(repo_slug, pr_number)
+            if not pr_data.get("merged"):
+                raise ValueError(
+                    f"PR {source_id!r} is not merged (state={pr_data.get('state')!r}); "
+                    "MVP accepts merged PRs only"
+                )
+            # Body isn't returned by GithubClient.get_pr's default projection;
+            # title covers most of the signal for MVP extraction.
+            return integration_scan.extract_feature_surface_from_pr(
+                pr_id=source_id,
+                title=pr_data.get("title", ""),
+                body=pr_data.get("body", "") or "",
+                owner=owner, repo=repo_name,
+            )
+
+        if kind == "skill":
+            # source_id is '<agent>.<skill>'; resolve via the bus skill
+            # registry to pull the description + args schema.
+            skills = await self._fetch_remote_skills()
+            target_name = source_id
+            if "." in source_id:
+                agent_id, skill_name = source_id.split(".", 1)
+            else:
+                agent_id, skill_name = "", source_id
+            match = next(
+                (
+                    row for row in skills
+                    if row.get("name") == skill_name
+                    and (not agent_id or row.get("agent_id") == agent_id)
+                ),
+                None,
+            )
+            if match is None:
+                raise LookupError(
+                    f"skill {target_name!r} not found in bus registry"
+                )
+            return integration_scan.extract_feature_surface_from_skill(
+                skill_id=source_id,
+                description=match.get("description", ""),
+                agent_type=match.get("agent_id", ""),
+                args_schema=match.get("parameters"),
+            )
+
+        # Unreachable — validated at handler entry, but belt-and-braces.
+        raise ValueError(f"unknown feature kind: {kind!r}")
+
+    async def _fetch_remote_skills(self) -> list[dict]:
+        """Return the bus-side skill registry as a list of dicts.
+
+        Uses the agent's own :attr:`_http` client + ``self.bus_url`` so
+        tests can monkeypatch the attribute directly. A failing fetch
+        falls through to ``[]`` and is logged by the caller.
+        """
+        # _http is set by BaseAgent.__init__. If we somehow got constructed
+        # without it (older base class), degrade to empty list.
+        client = getattr(self, "_http", None)
+        if client is None:
+            return []
+        response = await client.get(f"{self.bus_url}/v1/skills")
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, list) else []
+
+    async def _fetch_subscriber_counts(self, topics: list[str]) -> dict[str, int]:
+        """Per-topic subscriber counts.
+
+        No canonical bus endpoint exposes per-topic subscribers yet — the
+        relevant data lives in bus-side ``subscriptions`` table but isn't
+        surfaced via HTTP. For MVP we treat the map as empty (every
+        listed topic counts as having zero subscribers, which is what
+        wire_subscriber is meant to flag). Tests inject a real map by
+        monkeypatching this method. When the bus grows a proper endpoint
+        (tracked as follow-up), this method picks it up without touching
+        the handler.
+        """
+        if not topics:
+            return {}
+        return {}
+
+    def _store_integration_scan(
+        self, *, scan_id: str,
+        source: dict[str, Any],
+        surface: integration_scan.FeatureSurface,
+        ranked: list[integration_scan.IntegrationCandidate],
+        audience: str,
+    ) -> None:
+        """Persist the scan as a derived KnowledgeEntry.
+
+        Matches the ``identify_gaps`` precedent in librarian_agent in
+        spirit — a single JSON-serialized artifact indexed by a stable
+        id — but uses the developer-owned KnowledgeStore rather than the
+        bus artifact service so the distill path is a pure local read
+        with no round-trip.
+        """
+        from khonliang.knowledge.store import (
+            EntryStatus, KnowledgeEntry, Tier,
+        )
+        payload = {
+            "source": source,
+            "surface": surface.to_public_dict(),
+            "candidates": [c.to_full() for c in ranked],
+            "audience": audience,
+            "generated_at": time.time(),
+        }
+        entry = KnowledgeEntry(
+            id=scan_id,
+            tier=Tier.DERIVED,
+            title=f"Integration scan for {source.get('kind')}:{source.get('id')}",
+            content=json.dumps(payload, indent=2, default=str),
+            source="developer.integration_scan",
+            scope="development",
+            confidence=1.0,
+            status=EntryStatus.DISTILLED,
+            tags=["scan_integration", f"kind:{source.get('kind', '')}"],
+            metadata={
+                "source_kind": source.get("kind", ""),
+                "source_id": source.get("id", ""),
+                "candidate_count": len(ranked),
+                "audience": audience,
+            },
+        )
+        self.pipeline.knowledge.add(entry)
+
+    def _project_scan_response(
+        self, *, scan_id: str, source: dict[str, Any],
+        ranked: list[integration_scan.IntegrationCandidate],
+        top_n: int, detail: str, extra: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        top = ranked[:top_n]
+        if detail == "full":
+            projected = [c.to_full() for c in top]
+        else:
+            projected = [c.to_brief() for c in top]
+        response = {
+            "scan_id": scan_id,
+            "source": source,
+            "total_candidates": len(ranked),
+            "top_candidates": projected,
+            "hint": (
+                "Use distill_integration_points(scan_id, top_n=..., signal=...) "
+                "to filter without rescanning"
+            ),
+        }
+        if extra:
+            response.update(extra)
+        return response
+
+    def _github_client(self):
+        """Lazy GithubClient factory, overridable for tests.
+
+        Kept as a method (not a property) so tests can monkeypatch it
+        with a plain function returning a stub without worrying about
+        descriptor semantics.
+        """
+        from developer.github_client import GithubClient
+        return GithubClient()
 
     # -- developer-owned FR work planning --
 
