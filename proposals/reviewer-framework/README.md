@@ -21,6 +21,13 @@ Drafted by session Claude on 2026-04-21 during reviewer-dogfood work.
 The review JSONs are kept as audit trail for the proposal's iteration and as
 seed corpus candidates for Milestone D's benchmark suite.
 
+The review JSONs are preserved **verbatim** as captured from the reviewer
+LLMs — including any hedging, contradictions, or self-corrections in
+individual `suggestion` / `body` fields. Treat them as raw reviewer output,
+not vetted advice. This fidelity is intentional: Milestone D's benchmark
+corpus needs the artifact exactly as produced so the reviewer-quality
+signal is not curated away.
+
 ## FRs authored
 
 **Milestone A** (versioning primitives):
