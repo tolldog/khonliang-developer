@@ -48,7 +48,7 @@ Reviewer-primary review of v1 (claude-sonnet-4-6, 15 findings) is addressed belo
 ## Milestone A: Versioning primitives in `khonliang-bus-lib`
 
 **Ships:** immediately — standalone, no dependencies on later milestones.
-**Supersedes:** `tolldog/khonliang-bus-lib#12` (same resolver surface, extended with pyproject walk).
+**Builds on:** `tolldog/khonliang-bus-lib#12` (merge #12 first; Milestone A extends its resolver surface additively with a pyproject walk and a `--version` argparse helper).
 
 ### Scope
 - New `khonliang_bus.versioning` module:

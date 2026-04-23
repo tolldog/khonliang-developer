@@ -35,9 +35,9 @@ Private sibling apps built **on** the platform. They depend on platform primitiv
 
 ## Capability map (current state)
 
-Three agents, 102 non-deprecated skills (105 total including the deprecated researcher `synergize` group), 1 collaborative flow.
+Three agents, 99 non-deprecated skills (102 total including the deprecated researcher `synergize` group), 1 collaborative flow.
 
-Skill counts reconcile against the per-agent tables below: reviewer 5 (1+3+1) + developer 47 + researcher 53 (including the 3-skill deprecated `synergize` group) = 105 total; excluding the deprecated group yields 102.
+Skill counts reconcile against the per-agent tables below: reviewer 5 (1+3+1) + developer 47 (1+1+12+8+3+15+1+2+2+1+1) + researcher 50 (2+4+4+7+3+6+3+3+3+3+4+1+7, including the 3-skill deprecated `synergize` group) = 102 total; excluding the deprecated group yields 99.
 
 ### reviewer-primary — LLM-based review (narrow)
 
