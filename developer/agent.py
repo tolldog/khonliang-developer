@@ -482,6 +482,17 @@ class DeveloperAgent(BaseAgent):
                   "Stop a PR watcher by id and clean its persistent state",
                   {"watcher_id": {"type": "string", "required": True}},
                   since="0.14.0"),
+            # fr_developer_fafb36f1: one-shot snapshot of the fleet
+            # (every active watcher's PRs in the compact shape used by
+            # the pr.fleet_digest event). No polling, no subscription —
+            # just a read. Distinct from list_pr_watchers in that the
+            # response also projects every PR's current state, not just
+            # the watcher metadata.
+            Skill("pr_fleet_status",
+                  "One-shot snapshot of every active PR watcher's fleet",
+                  {"watcher_id": {"type": "string", "default": "",
+                                  "description": "optional — scope to a single watcher"}},
+                  since="0.15.0"),
         ]
 
     def register_collaborations(self):
@@ -1387,6 +1398,34 @@ class DeveloperAgent(BaseAgent):
             await self._safe_report_gap("stop_pr_watcher", str(e))
             return {"error": str(e)}
         return {"watcher_id": watcher_id, "stopped": stopped}
+
+    @handler("pr_fleet_status")
+    async def handle_pr_fleet_status(self, args):
+        """Return a one-shot fleet snapshot without polling GitHub.
+
+        Delegates to :meth:`PRWatcherRegistry.fleet_snapshot`. An empty
+        / omitted ``watcher_id`` means "every live watcher"; a concrete
+        id scopes the response to that watcher. Unknown ids return an
+        empty ``watchers`` + ``fleet`` rather than an error — the
+        caller learns about the typo without our side having to model
+        "missing watcher" as an error state.
+        """
+        raw_id = args.get("watcher_id", "")
+        watcher_id: str | None
+        if raw_id in (None, "", 0):
+            watcher_id = None
+        else:
+            watcher_id = str(raw_id)
+        try:
+            return self.pr_watcher_registry.fleet_snapshot(watcher_id=watcher_id)
+        except asyncio.CancelledError:
+            # CancelledError subclasses Exception; don't let the
+            # catch-Exception fallback below convert cooperative
+            # cancellation into a returned error dict.
+            raise
+        except Exception as e:
+            await self._safe_report_gap("pr_fleet_status", str(e))
+            return {"error": str(e)}
 
     async def _optional_pr_ready(self, args):
         repo = args.get("repo", "")
