@@ -62,11 +62,23 @@ ALL_MILESTONE_STATUSES = ACTIVE_MILESTONE_STATUSES | TERMINAL_MILESTONE_STATUSES
 
 # Allowed forward transitions. The lifecycle is monotonic-forward:
 # proposed → planned → in_progress → (completed | abandoned). Terminal
-# states have no outgoing edges. ``superseded`` is reachable only via
-# :meth:`MilestoneStore.supersede` (which takes the required
-# ``superseded_by`` back-pointer); :meth:`MilestoneStore.update_status`
-# rejects ``status="superseded"``. ``archived`` is a legacy synonym for
-# ``abandoned`` and is normalized to ``abandoned`` on write.
+# states have no outgoing edges.
+#
+# ``superseded`` is deliberately NOT listed as a reachable target here
+# — it's reachable only via :meth:`MilestoneStore.supersede` (which
+# takes the required ``superseded_by`` back-pointer), and
+# :meth:`MilestoneStore.update_status` rejects ``status="superseded"``
+# before reaching this table. Listing it as a target would make the
+# error messages / inline docs lie about reachability.
+#
+# ``archived`` is the legacy synonym for ``abandoned`` and is likewise
+# NOT listed as a target: incoming ``status="archived"`` is normalized
+# to ``abandoned`` in :meth:`update_status` BEFORE the transition check
+# runs, so the archived value is never compared against this table. On
+# read, a milestone whose stored status is ``archived`` is treated as
+# ``abandoned`` during the current-state lookup (see ``update_status``
+# below), so legacy on-disk rows still behave correctly. PR #43 Copilot
+# R7 finding 1.
 #
 # Forward shortcuts (allowed without force):
 #   * proposed → in_progress — skip the ``planned`` step when the caller
@@ -76,33 +88,27 @@ ALL_MILESTONE_STATUSES = ACTIVE_MILESTONE_STATUSES | TERMINAL_MILESTONE_STATUSES
 #
 # Sideways jumps to the terminal ``abandoned`` state from any active
 # status are allowed without force since they do not reopen work.
-# ``superseded`` is excluded from this shortcut set — callers must go
-# through :meth:`MilestoneStore.supersede` so the back-pointer is always
-# set.
 #
-# ANY backward edge (completed → in_progress, in_progress → planned,
-# planned → proposed, etc.) requires the caller to pass ``force=True``
-# to :meth:`MilestoneStore.update_status` (and is recorded in
-# ``notes_history`` with a ``force_rollback`` marker).
+# ANY edge not in this table — backward rollbacks (completed →
+# in_progress, in_progress → planned, planned → proposed) AND forward
+# jumps that skip intermediate states (planned → completed) — requires
+# the caller to pass ``force=True`` to
+# :meth:`MilestoneStore.update_status` (and is recorded in
+# ``notes_history`` with a ``force_override=True`` marker — "override"
+# rather than "rollback" since not every forced transition is backward).
 ALLOWED_MILESTONE_TRANSITIONS: dict[str, set[str]] = {
     MILESTONE_STATUS_PROPOSED: {
         MILESTONE_STATUS_PLANNED,
         MILESTONE_STATUS_IN_PROGRESS,
         MILESTONE_STATUS_ABANDONED,
-        MILESTONE_STATUS_SUPERSEDED,
-        MILESTONE_STATUS_ARCHIVED,
     },
     MILESTONE_STATUS_PLANNED: {
         MILESTONE_STATUS_IN_PROGRESS,
         MILESTONE_STATUS_ABANDONED,
-        MILESTONE_STATUS_SUPERSEDED,
-        MILESTONE_STATUS_ARCHIVED,
     },
     MILESTONE_STATUS_IN_PROGRESS: {
         MILESTONE_STATUS_COMPLETED,
         MILESTONE_STATUS_ABANDONED,
-        MILESTONE_STATUS_SUPERSEDED,
-        MILESTONE_STATUS_ARCHIVED,
     },
     MILESTONE_STATUS_COMPLETED: set(),
     MILESTONE_STATUS_ABANDONED: set(),
@@ -332,10 +338,14 @@ class MilestoneStore:
         ``abandoned`` on write with a ``normalized_from`` audit marker;
         see module-level notes on the archived/abandoned synonym.
 
-        Any backward edge (e.g. completed → in_progress, in_progress →
-        planned, planned → proposed) requires ``force=True``; the
-        audit entry records the force via ``force_rollback=True`` so
-        the history makes it obvious.
+        Any edge not in the forward table (backward rollbacks like
+        completed → in_progress, in_progress → planned, planned →
+        proposed, as well as forward jumps like planned → completed
+        that skip in_progress) requires ``force=True``; the audit
+        entry records the force via ``force_override=True`` so the
+        history makes it obvious. The name is "override" rather than
+        "rollback" because not every forced transition is a rollback
+        — some are forward shortcuts.
 
         The idempotent case (``status`` already matches) still appends
         an audit note when ``notes`` is provided, so "confirmed in-
@@ -369,9 +379,21 @@ class MilestoneStore:
         if milestone is None:
             raise MilestoneError(f"unknown milestone id: {milestone_id}")
 
+        # Legacy on-disk rows may carry ``status='archived'`` (the
+        # historical synonym for ``abandoned``). Treat them as
+        # ``abandoned`` for the current-state comparison and the
+        # transition-table lookup so the same update_status call that
+        # works on a fresh ``abandoned`` milestone also works on a
+        # legacy ``archived`` one. No write-back — the stored row stays
+        # intact; this is a read-time alias only. PR #43 Copilot R7
+        # finding 2 (Option A).
+        current_status = milestone.status
+        if current_status == MILESTONE_STATUS_ARCHIVED:
+            current_status = MILESTONE_STATUS_ABANDONED
+
         now = time.time()
 
-        if milestone.status == status:
+        if current_status == status:
             if notes or normalized_from:
                 entry: dict[str, Any] = {
                     "at": now, "status": status, "notes": notes,
@@ -384,15 +406,15 @@ class MilestoneStore:
                 self._store(milestone)
             return milestone
 
-        allowed = ALLOWED_MILESTONE_TRANSITIONS.get(milestone.status, set())
+        allowed = ALLOWED_MILESTONE_TRANSITIONS.get(current_status, set())
         forced = False
         if status not in allowed:
             if not force:
                 raise MilestoneError(
-                    f"illegal transition {milestone.status!r} -> {status!r} "
-                    f"for {milestone_id}. Allowed from {milestone.status!r}: "
+                    f"illegal transition {current_status!r} -> {status!r} "
+                    f"for {milestone_id}. Allowed from {current_status!r}: "
                     f"{sorted(allowed)}. Pass force=True to override "
-                    "(rollback not in the forward transition graph)."
+                    "(transition not in the forward graph)."
                 )
             forced = True
 
@@ -400,10 +422,10 @@ class MilestoneStore:
             "at": now,
             "status": status,
             "notes": notes,
-            "from_status": milestone.status,
+            "from_status": current_status,
         }
         if forced:
-            entry["force_rollback"] = True
+            entry["force_override"] = True
         if normalized_from:
             entry["normalized_from"] = normalized_from
         milestone.notes_history.append(entry)

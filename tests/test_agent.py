@@ -900,7 +900,7 @@ async def test_update_milestone_status_and_supersede_via_agent(harness):
     assert result["milestone"]["status"] == "superseded"
     assert result["milestone"]["superseded_by"] == replacement_id
 
-    # Read surfaces surface the pointer.
+    # Read surfaces expose the pointer.
     fetched = await harness.call("get_milestone", {"milestone_id": stale_id})
     assert fetched["milestone"]["superseded_by"] == replacement_id
 

@@ -268,7 +268,7 @@ def test_update_milestone_status_force_allows_rollback(pipeline):
         force=True,
     )
     assert rolled_back.status == MILESTONE_STATUS_IN_PROGRESS
-    assert rolled_back.notes_history[-1].get("force_rollback") is True
+    assert rolled_back.notes_history[-1].get("force_override") is True
     assert rolled_back.notes_history[-1]["from_status"] == MILESTONE_STATUS_COMPLETED
 
 
@@ -444,7 +444,7 @@ def test_update_milestone_status_rejects_backward_transition_without_force(pipel
         milestone.id, "planned", notes="reopen for rescoping", force=True,
     )
     assert rolled_back.status == "planned"
-    assert rolled_back.notes_history[-1].get("force_rollback") is True
+    assert rolled_back.notes_history[-1].get("force_override") is True
 
 
 def test_delete_milestone_refuses_when_fr_store_lookup_raises(pipeline):
@@ -654,9 +654,89 @@ def test_update_status_force_out_of_superseded_clears_pointer(pipeline):
     )
     assert rolled_out.status == MILESTONE_STATUS_IN_PROGRESS
     assert rolled_out.superseded_by == ""
-    assert rolled_out.notes_history[-1].get("force_rollback") is True
+    assert rolled_out.notes_history[-1].get("force_override") is True
 
     # Confirm persistence too.
     reloaded = pipeline.milestones.get(stale.id)
     assert reloaded.status == MILESTONE_STATUS_IN_PROGRESS
     assert reloaded.superseded_by == ""
+
+
+def test_update_status_on_legacy_archived_milestone_accepts_abandoned(pipeline):
+    """Legacy ``archived`` rows must accept update_status without a migration.
+
+    Before R7, update_status normalized the *incoming* ``archived`` to
+    ``abandoned`` but compared it against the milestone's raw stored
+    status, which could still be ``archived``. The transition
+    ``archived → abandoned`` isn't in ALLOWED_MILESTONE_TRANSITIONS, so
+    legacy rows raised ``illegal transition``. R7's fix (Option A)
+    treats stored ``archived`` as ``abandoned`` at read time, without
+    writing back. PR #43 Copilot R7 finding 2.
+    """
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+    # Manually rewrite the stored status to the legacy ``archived`` value
+    # — simulates a row persisted before R6's normalization landed.
+    milestone.status = MILESTONE_STATUS_ARCHIVED
+    pipeline.milestones._store(milestone)
+
+    reloaded = pipeline.milestones.get(milestone.id)
+    assert reloaded.status == MILESTONE_STATUS_ARCHIVED
+
+    # Incoming 'archived' → normalized to 'abandoned' → current (archived)
+    # also treated as 'abandoned' → same-status no-op with a normalized_from
+    # audit row. Stored status stays archived (no write-back).
+    result = pipeline.milestones.update_status(
+        milestone.id, MILESTONE_STATUS_ARCHIVED, notes="touch legacy row",
+    )
+    assert result.status == MILESTONE_STATUS_ARCHIVED
+    last = result.notes_history[-1]
+    assert last["notes"] == "touch legacy row"
+    assert last.get("normalized_from") == MILESTONE_STATUS_ARCHIVED
+
+    # Incoming 'abandoned' — current (archived) aliased to abandoned →
+    # also same-status no-op (with the caller's note recorded).
+    result = pipeline.milestones.update_status(
+        milestone.id, MILESTONE_STATUS_ABANDONED, notes="treat as abandoned",
+    )
+    assert result.status == MILESTONE_STATUS_ARCHIVED
+    assert result.notes_history[-1]["notes"] == "treat as abandoned"
+
+    # Force-override lets callers jump back to a live status even from
+    # legacy-archived — the transition table lookup aliases current to
+    # abandoned (terminal, no outgoing edges), so any target requires
+    # force. The force_override marker is recorded.
+    result = pipeline.milestones.update_status(
+        milestone.id,
+        MILESTONE_STATUS_COMPLETED,
+        notes="archived was wrong; mark complete",
+        force=True,
+    )
+    assert result.status == MILESTONE_STATUS_COMPLETED
+    last = result.notes_history[-1]
+    assert last.get("force_override") is True
+    # from_status records the aliased value, not the stored ``archived``,
+    # so the audit row reflects the lifecycle-meaningful source state.
+    assert last["from_status"] == MILESTONE_STATUS_ABANDONED
+
+
+def test_audit_flag_named_force_override_not_force_rollback(pipeline):
+    """Forced transitions record ``force_override``, not ``force_rollback``.
+
+    Some forced transitions are forward jumps (planned → completed
+    skipping in_progress), not rollbacks; "override" is the accurate
+    name. PR #43 Copilot R7 finding 3.
+    """
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+    pipeline.milestones.update_status(milestone.id, "planned")
+
+    # Forward jump that skips in_progress — requires force, not a rollback.
+    jumped = pipeline.milestones.update_status(
+        milestone.id,
+        MILESTONE_STATUS_COMPLETED,
+        notes="skip straight to done",
+        force=True,
+    )
+    assert jumped.status == MILESTONE_STATUS_COMPLETED
+    last = jumped.notes_history[-1]
+    assert last.get("force_override") is True
+    assert "force_rollback" not in last
