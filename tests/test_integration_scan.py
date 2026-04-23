@@ -966,3 +966,161 @@ def test_scan_fr_store_migrate_rationale_reports_full_overlap_count():
     assert len(cand.metadata["shared_tokens"]) == 8
     # Full count lives in its own field.
     assert cand.metadata["shared_token_count"] == 12
+
+
+# ---------------------------------------------------------------------------
+# Copilot R3 — distill tolerates per-item malformed fields
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_distill_integration_points_tolerates_malformed_per_item_fields(
+    harness,
+):
+    """Per-item fields that would crash coercion (non-numeric score,
+    list-shaped metadata) must be skipped with a warning; valid rows in
+    the same artifact still survive and are distilled. A summary
+    ``skipped_items`` field in the response signals the partial result
+    so callers know the artifact wasn't clean.
+
+    Regression for Copilot R3 finding #3: pre-fix, the rehydration loop
+    wrapped non-dict items only; ``float(c.get('score'))`` on a string
+    and ``dict(c.get('metadata'))`` on a list both blew up the whole
+    handler.
+    """
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+
+    _install_empty_bus(harness)
+
+    scan_id = "scan_integration_r3malformed"
+    payload = {
+        "source": {"kind": "fr", "id": "fr_developer_abc"},
+        "surface": {"kind": "fr", "id": "fr_developer_abc"},
+        "candidates": [
+            # Score is a non-numeric string — must be skipped.
+            {
+                "kind": "fr",
+                "target_id": "fr_developer_badscore",
+                "signal": integration_scan.SIGNAL_MIGRATE,
+                "score": "not-a-number",
+                "rationale": "bad score",
+                "metadata": {"status": "open"},
+            },
+            # Metadata is a list — must be skipped.
+            {
+                "kind": "fr",
+                "target_id": "fr_developer_badmeta",
+                "signal": integration_scan.SIGNAL_MIGRATE,
+                "score": 0.8,
+                "rationale": "bad metadata",
+                "metadata": ["not", "a", "dict"],
+            },
+            # Metadata is a string — must be skipped.
+            {
+                "kind": "fr",
+                "target_id": "fr_developer_strmeta",
+                "signal": integration_scan.SIGNAL_MIGRATE,
+                "score": 0.6,
+                "rationale": "string metadata",
+                "metadata": "oops",
+            },
+            # Valid row — must survive.
+            {
+                "kind": "fr",
+                "target_id": "fr_developer_good",
+                "signal": integration_scan.SIGNAL_MIGRATE,
+                "score": 0.9,
+                "rationale": "valid",
+                "metadata": {"status": "open"},
+            },
+            # Metadata omitted entirely — must also survive (None is fine).
+            {
+                "kind": "fr",
+                "target_id": "fr_developer_nometa",
+                "signal": integration_scan.SIGNAL_MIGRATE,
+                "score": 0.5,
+                "rationale": "no metadata field",
+            },
+        ],
+        "audience": "",
+    }
+    entry = KnowledgeEntry(
+        id=scan_id,
+        tier=Tier.DERIVED,
+        title=f"malformed per-item {scan_id}",
+        content=json.dumps(payload),
+        source="developer.integration_scan",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["scan_integration"],
+        metadata={},
+    )
+    harness.agent.pipeline.knowledge.add(entry)
+
+    result = await harness.call(
+        "distill_integration_points",
+        {"scan_id": scan_id, "top_n": 10},
+    )
+    assert "error" not in result, f"valid rows should survive: {result!r}"
+    # 3 skipped (bad score + list metadata + string metadata), 2 good rows.
+    ids = [c["target_id"] for c in result["top_candidates"]]
+    assert "fr_developer_good" in ids
+    assert "fr_developer_nometa" in ids
+    assert "fr_developer_badscore" not in ids
+    assert "fr_developer_badmeta" not in ids
+    assert "fr_developer_strmeta" not in ids
+    assert result["total_candidates"] == 2
+    # Summary line in the response notes the skip count.
+    assert result.get("skipped_items") == 3
+
+
+# ---------------------------------------------------------------------------
+# Copilot R3 — suggest_integration_points signals persistence failure
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_suggest_integration_points_returns_error_on_persistence_failure(
+    harness,
+):
+    """If the artifact write fails, the response must signal the failure
+    explicitly — ``persistence_error`` carries the reason and ``scan_id``
+    is empty so a naive caller that pipes ``scan_id`` straight into
+    ``distill_integration_points`` will get an explicit "scan_id is
+    required" error rather than a "not found" after-the-fact. The
+    unpersisted id is preserved as ``scan_id_unpersisted`` for logging.
+
+    Regression for Copilot R3 finding #4: pre-fix the handler swallowed
+    the exception and returned a scan_id that silently wouldn't distil.
+    """
+    _install_empty_bus(harness)
+    feature = harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Persistence failure feature",
+        description="Persistence failure feature for testing.",
+        priority="high",
+        concept="testing",
+    )
+
+    # Force _store_integration_scan to raise.
+    def _boom(*args, **kwargs):
+        raise RuntimeError("knowledge store backend offline")
+    harness.agent._store_integration_scan = _boom
+
+    result = await harness.call(
+        "suggest_integration_points",
+        {"source": {"kind": "fr", "id": feature.id}},
+    )
+    # Live scan still returned candidates; only the persist path failed.
+    assert "top_candidates" in result
+    # Persistence failure is explicit in the response.
+    assert result.get("persistence_error"), (
+        f"expected persistence_error key; got {result!r}"
+    )
+    assert "knowledge store backend offline" in result["persistence_error"]
+    # scan_id is intentionally blank so a caller can't distill on it.
+    assert result.get("scan_id") == ""
+    # The computed id is still surfaced for observability, just under a
+    # name that won't accidentally be passed to distill.
+    assert result.get("scan_id_unpersisted", "").startswith("scan_integration_")

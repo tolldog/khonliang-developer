@@ -341,10 +341,13 @@ def extract_feature_surface_from_pr(
 
 
 def extract_feature_surface_from_skill(
-    *, skill_id: str, description: str = "", agent_type: str = "",
+    *, skill_id: str, description: str = "", agent_id: str = "",
     args_schema: Optional[dict] = None,
 ) -> FeatureSurface:
-    combined = f"{skill_id}\n{description}\n{agent_type}"
+    # ``agent_id`` is the agent that hosts the skill (e.g. ``developer-primary``).
+    # Earlier revisions called this ``agent_type``; the value was always an
+    # agent id, not a type. Renamed for accuracy (PR #46 Copilot R3).
+    combined = f"{skill_id}\n{description}\n{agent_id}"
     # The skill name itself is the only *new skill* this surface contributes.
     # Extract bare skill name (strip ``<agent>.`` prefix if present).
     bare_name = skill_id.split(".")[-1] if "." in skill_id else skill_id
@@ -617,11 +620,15 @@ def scan_event_subscribers(
             # Fractional gap. A topic expecting 4 consumers with only 1
             # registered is worth highlighting; a topic expecting 2 with
             # 1 still scores, just lower.
+            # Score is stored unrounded so persist+rehydrate preserves the
+            # full-precision ranking (``to_full`` also stores unrounded).
+            # Display rounding happens in ``to_brief`` / ``to_compact``.
+            # PR #46 Copilot R3 finding #6.
             score = 1.0 - (count / expected)
             candidates.append(IntegrationCandidate(
                 kind="event_broker_gap", target_id=topic,
                 signal=SIGNAL_WIRE_SUBSCRIBER,
-                score=round(score, 3),
+                score=score,
                 rationale=(
                     f"Topic {topic!r} has {count}/{expected} expected "
                     "subscribers — partial adoption"
@@ -663,12 +670,17 @@ def rank_candidates(candidates: list[IntegrationCandidate]) -> list[IntegrationC
 
 
 def compute_scan_id(source: dict[str, Any], *, seed: Optional[int] = None) -> str:
-    """Stable 8-hex identifier for a scan of ``source``.
+    """Stable 16-hex identifier for a scan of ``source``.
 
     ``seed`` is a nanosecond epoch timestamp. Defaults to
     ``time.time_ns()`` so two scans of the same source in the same wall-clock
     second still produce distinct ids — matches the PR #29 snapshot_id fix.
     Callers with a fixed timestamp can pass one in for deterministic fixtures.
+
+    The hex prefix is 16 chars (64 bits) rather than the original 8 (32 bits)
+    so the birthday-bound collision probability stays negligible at scale:
+    at 10M scans the collision probability is ~2.7e-7, vs ~1.2% at 8 hex.
+    PR #46 Copilot R3 finding #5.
     """
     if seed is None:
         seed = time.time_ns()
@@ -676,7 +688,7 @@ def compute_scan_id(source: dict[str, Any], *, seed: Optional[int] = None) -> st
         {"source": source, "ts": int(seed)},
         sort_keys=True,
     ).encode("utf-8")
-    digest = hashlib.sha256(payload).hexdigest()[:8]
+    digest = hashlib.sha256(payload).hexdigest()[:16]
     return f"scan_integration_{digest}"
 
 

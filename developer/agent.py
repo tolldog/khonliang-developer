@@ -965,6 +965,7 @@ class DeveloperAgent(BaseAgent):
         # knowledge store with a 'scan_integration' tag — keeps the
         # pattern consistent with FR / milestone storage.
         scan_id = integration_scan.compute_scan_id({"kind": kind, "id": source_id})
+        persistence_error: Optional[str] = None
         try:
             self._store_integration_scan(
                 scan_id=scan_id,
@@ -975,6 +976,28 @@ class DeveloperAgent(BaseAgent):
             )
         except Exception as e:
             logger.warning("suggest_integration_points: artifact write failed: %s", e)
+            persistence_error = str(e)
+
+        extra: dict[str, Any] = {"llm_rationale_calls": llm_calls}
+        # Signal persistence failure explicitly so callers can't accidentally
+        # call ``distill_integration_points`` on an id that won't resolve.
+        # We still return the computed scan id (as ``scan_id_unpersisted``)
+        # so the value isn't lost, but ``scan_id`` itself is nulled — the
+        # live-scan result is still fully available in ``top_candidates``.
+        # PR #46 Copilot R3 finding #4.
+        if persistence_error is not None:
+            return self._project_scan_response(
+                scan_id="",  # distill will not resolve — signal via explicit empty
+                source={"kind": kind, "id": source_id, "surface": surface.to_public_dict()},
+                ranked=ranked,
+                top_n=top_n,
+                detail=detail,
+                extra={
+                    **extra,
+                    "persistence_error": persistence_error,
+                    "scan_id_unpersisted": scan_id,
+                },
+            )
 
         return self._project_scan_response(
             scan_id=scan_id,
@@ -982,7 +1005,7 @@ class DeveloperAgent(BaseAgent):
             ranked=ranked,
             top_n=top_n,
             detail=detail,
-            extra={"llm_rationale_calls": llm_calls},
+            extra=extra,
         )
 
     @handler("distill_integration_points")
@@ -1044,34 +1067,71 @@ class DeveloperAgent(BaseAgent):
             ]
         # The stored shape matches IntegrationCandidate.to_full(); rehydrate
         # into objects for uniform ranking with the live-scan path.
-        # Non-dict entries are skipped with a warning rather than crashing
-        # the handler — an artifact full of bad rows still returns whatever
-        # good rows survived.
+        # Non-dict entries and individual items with non-coercible fields
+        # (e.g. a non-numeric score string, a metadata value that's a list
+        # instead of a mapping) are skipped with a warning rather than
+        # crashing the handler — an artifact full of bad rows still returns
+        # whatever good rows survived. The response carries a
+        # ``skipped_items`` counter so callers can tell the artifact was
+        # partial without diffing against a fresh scan.
         rehydrated: list[integration_scan.IntegrationCandidate] = []
+        skipped = 0
         for c in raw_candidates:
             if not isinstance(c, dict):
+                skipped += 1
                 logger.warning(
                     "distill_integration_points: skipping non-dict candidate "
                     "in scan %s: %r",
                     scan_id, type(c).__name__,
                 )
                 continue
+            # Per-item type gates: score must coerce to float; metadata
+            # must be mapping-shaped (accept a missing/None field, reject
+            # lists/strings which would raise in ``dict(...)``). PR #46
+            # Copilot R3 finding #3.
+            raw_score = c.get("score")
+            try:
+                score = float(raw_score) if raw_score is not None else 0.0
+            except (TypeError, ValueError):
+                skipped += 1
+                logger.warning(
+                    "distill_integration_points: skipping candidate with "
+                    "non-numeric score in scan %s: %r (score=%r)",
+                    scan_id, c.get("target_id"), raw_score,
+                )
+                continue
+            raw_meta = c.get("metadata")
+            if raw_meta is None:
+                meta: dict[str, Any] = {}
+            elif isinstance(raw_meta, dict):
+                meta = dict(raw_meta)
+            else:
+                skipped += 1
+                logger.warning(
+                    "distill_integration_points: skipping candidate with "
+                    "non-dict metadata in scan %s: %r (metadata type=%s)",
+                    scan_id, c.get("target_id"), type(raw_meta).__name__,
+                )
+                continue
             rehydrated.append(integration_scan.IntegrationCandidate(
-                kind=c.get("kind", ""),
-                target_id=c.get("target_id", ""),
-                signal=c.get("signal", ""),
-                score=float(c.get("score") or 0.0),
-                rationale=c.get("rationale", ""),
-                metadata=dict(c.get("metadata") or {}),
+                kind=str(c.get("kind", "")),
+                target_id=str(c.get("target_id", "")),
+                signal=str(c.get("signal", "")),
+                score=score,
+                rationale=str(c.get("rationale", "")),
+                metadata=meta,
             ))
         ranked = integration_scan.rank_candidates(rehydrated)
+        extra: dict[str, Any] = {"from_artifact": True, "signal_filter": signal}
+        if skipped:
+            extra["skipped_items"] = skipped
         return self._project_scan_response(
             scan_id=scan_id,
             source=payload.get("source") or {},
             ranked=ranked,
             top_n=top_n,
             detail=detail,
-            extra={"from_artifact": True, "signal_filter": signal},
+            extra=extra,
         )
 
     # -- integration scan helpers --
@@ -1102,7 +1162,25 @@ class DeveloperAgent(BaseAgent):
             owner, repo_name, pr_number = parsed
             gh = self._github_client()
             repo_slug = f"{owner}/{repo_name}"
-            pr_data = await gh.get_pr(repo_slug, pr_number)
+            # ``gh.get_pr`` raises ``GithubClientError`` for HTTP/network
+            # faults and 404s; the handler's caller only handles
+            # ``(ValueError, LookupError)`` so we normalise GitHub faults
+            # into ``LookupError`` here (the PR can't be resolved without
+            # a reachable API — semantically a lookup miss). Same shape
+            # as the ``_fetch_remote_skills`` wrap (PR #46 Copilot R2).
+            from developer.github_client import GithubClientError
+            try:
+                pr_data = await gh.get_pr(repo_slug, pr_number)
+            except (ValueError, LookupError):
+                raise
+            except GithubClientError as e:
+                raise LookupError(
+                    f"GitHub API unavailable while resolving PR {source_id!r}: {e}"
+                ) from e
+            except Exception as e:  # noqa: BLE001 — any httpx/network error
+                raise LookupError(
+                    f"GitHub API unavailable while resolving PR {source_id!r}: {e}"
+                ) from e
             if not pr_data.get("merged"):
                 raise ValueError(
                     f"PR {source_id!r} is not merged (state={pr_data.get('state')!r}); "
@@ -1154,7 +1232,7 @@ class DeveloperAgent(BaseAgent):
             return integration_scan.extract_feature_surface_from_skill(
                 skill_id=source_id,
                 description=match.get("description", ""),
-                agent_type=match.get("agent_id", ""),
+                agent_id=match.get("agent_id", ""),
                 args_schema=match.get("parameters"),
             )
 
