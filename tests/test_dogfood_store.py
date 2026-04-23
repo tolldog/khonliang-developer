@@ -823,14 +823,19 @@ def test_triage_dogfood_unknown_id(pipeline):
 
 
 def test_triage_dogfood_rejects_promote_to_bug_on_terminal_dogfood(pipeline):
-    """promote_to_bug on dismissed / duplicate / broken-promoted dogfood is refused.
+    """promote_to_bug on dismissed / duplicate dogfood is refused.
 
     Without the up-front guard, file_bug would create the bug first and
     record_promotion would then refuse the terminal status — stranding
     an orphan bug. Verify the rejection keeps bugs table unchanged for
-    dismissed and duplicate states. The ``promoted`` state has its own
-    idempotent reuse path for the matching downstream kind, so test
-    the corrupted sub-case (promoted but no bug_* entry) too.
+    both dismissed and duplicate states. The ``promoted`` status is
+    NOT a full-terminal refuse here — cross-kind double-promotion is
+    allowed (see test_triage_dogfood_cross_kind_promotion_allowed) and
+    same-kind re-promotion is idempotent-reuse
+    (test_triage_dogfood_promote_to_bug_idempotent_reuse). The only
+    promoted-state refusal is the genuine-corruption case (status
+    promoted + empty promoted_to), covered by
+    test_triage_dogfood_promote_refuses_only_on_genuine_corruption.
     """
     agent = _make_agent(pipeline)
 
@@ -904,6 +909,134 @@ def test_triage_dogfood_rejects_promote_to_fr_on_terminal_dogfood(pipeline):
     }))
     assert "error" in result
     assert "terminal" in result["error"].lower()
+    assert len(pipeline.frs.list(include_all=True)) == frs_before
+
+
+def test_triage_dogfood_cross_kind_promotion_allowed(pipeline):
+    """Cross-kind double promotion is valid — dog can go to FR then bug.
+
+    The R2 promoted-state guard refused whenever no TARGET-kind entry
+    was in promoted_to; that falsely blocked cross-kind flows (promoted
+    to fr_*, now asked to promote to bug_*). R3 narrows the guard to
+    fire only on genuine corruption (status=promoted + empty list).
+    Here: promote_to_fr first, then promote_to_bug on the same dog.
+    Both must succeed; promoted_to must end with both kinds.
+    """
+    agent = _make_agent(pipeline)
+    dog = pipeline.dogfood.log_dogfood(
+        "cross-kind friction", kind=DOGFOOD_KIND_FRICTION, target="developer",
+        observed_at=9_999_999_995.0,
+    )
+    # First: promote to FR.
+    first = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_fr",
+    }))
+    assert "error" not in first, first
+    assert first["fr_id"].startswith("fr_developer_")
+    assert first["promotion_reused"] is False
+    assert first["status"] == DOGFOOD_STATUS_PROMOTED
+
+    # Second: promote same dog to bug — cross-kind, must be allowed.
+    second = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_bug",
+    }))
+    assert "error" not in second, second
+    assert second["bug_id"].startswith("bug_developer_")
+    assert second["promotion_reused"] is False
+    assert second["status"] == DOGFOOD_STATUS_PROMOTED
+
+    # promoted_to has BOTH the fr_* and bug_* entries.
+    dog_after = pipeline.dogfood.get_dogfood(dog.id)
+    assert first["fr_id"] in dog_after.promoted_to
+    assert second["bug_id"] in dog_after.promoted_to
+    assert any(t.startswith("fr_") for t in dog_after.promoted_to)
+    assert any(t.startswith("bug_") for t in dog_after.promoted_to)
+
+    # Same-kind reuse still works after the cross-kind split: re-calling
+    # promote_to_fr returns the original fr_id (idempotent-reuse).
+    third = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_fr",
+    }))
+    assert "error" not in third
+    assert third["fr_id"] == first["fr_id"]
+    assert third["promotion_reused"] is True
+
+
+def test_triage_dogfood_same_kind_re_promotion_returns_existing(pipeline):
+    """R1 behavior preserved: same-kind re-promotion reuses the existing id.
+
+    Complementary to the cross-kind test — verifies that narrowing the
+    R2 guard did not break the R1 idempotent-reuse path. First
+    promote_to_bug creates a fresh bug_id; second promote_to_bug
+    returns the same id with promotion_reused=True and no new bug row.
+    """
+    agent = _make_agent(pipeline)
+    dog = pipeline.dogfood.log_dogfood(
+        "same-kind replay bug", kind=DOGFOOD_KIND_FRICTION, target="developer",
+        observed_at=9_999_999_994.0,
+    )
+    first = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_bug",
+    }))
+    assert "error" not in first
+    assert first["promotion_reused"] is False
+    bugs_before = len(pipeline.bugs.list_bugs(status="all"))
+
+    second = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_bug",
+    }))
+    assert "error" not in second
+    assert second["bug_id"] == first["bug_id"]
+    assert second["promotion_reused"] is True
+    # No new bug created.
+    assert len(pipeline.bugs.list_bugs(status="all")) == bugs_before
+
+
+def test_triage_dogfood_promote_refuses_only_on_genuine_corruption(pipeline):
+    """status=promoted + empty promoted_to is the sole promoted-state refusal.
+
+    Manually inject the corrupted state (status lies about reality:
+    promoted flag set, promoted_to list empty). Both promote_to_bug
+    and promote_to_fr must refuse with a corruption message and must
+    NOT create a downstream record.
+    """
+    agent = _make_agent(pipeline)
+
+    # Inject genuine corruption directly via the store's internal
+    # mutation path. Using log_dogfood + private-state edit is the
+    # cleanest way to simulate a corrupted DB row without exercising
+    # record_promotion's protections.
+    dog = pipeline.dogfood.log_dogfood(
+        "corruption bait", kind=DOGFOOD_KIND_FRICTION, target="developer",
+        observed_at=9_999_999_993.0,
+    )
+    # Flip status to promoted without adding an entry to promoted_to.
+    dog.status = DOGFOOD_STATUS_PROMOTED
+    dog.promoted_to = []
+    pipeline.dogfood._store(dog)
+
+    bugs_before = len(pipeline.bugs.list_bugs(status="all"))
+    frs_before = len(pipeline.frs.list(include_all=True))
+
+    bug_result = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_bug",
+    }))
+    assert "error" in bug_result
+    assert "corrupt" in bug_result["error"].lower()
+    assert len(pipeline.bugs.list_bugs(status="all")) == bugs_before
+
+    fr_result = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_fr",
+    }))
+    assert "error" in fr_result
+    assert "corrupt" in fr_result["error"].lower()
     assert len(pipeline.frs.list(include_all=True)) == frs_before
 
 

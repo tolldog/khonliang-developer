@@ -2274,24 +2274,24 @@ class DeveloperAgent(BaseAgent):
                 )
                 await self._safe_report_gap("triage_dogfood", msg)
                 return {"error": msg, "dog_id": dog_id}
-            # status=promoted + no matching promoted_to entry is a
-            # corrupted state that shouldn't normally occur, but guard
-            # anyway: refuse rather than create an orphan. The
-            # idempotent reuse path below handles the common case
-            # where the matching entry is present.
-            if dog.status == DOGFOOD_STATUS_PROMOTED:
-                kind_prefix = "bug_" if action == "promote_to_bug" else "fr_"
-                has_matching = any(
-                    tid.startswith(kind_prefix) for tid in dog.promoted_to
+            # status=promoted + empty promoted_to is a corrupted state
+            # (status lies about reality), so refuse rather than create
+            # an orphan. Cross-kind double-promotion is a legitimate
+            # workflow: a dog already promoted to an FR may later be
+            # promoted to a bug (and vice-versa), in which case
+            # record_promotion appends the new id to promoted_to and
+            # keeps status='promoted'. So the guard fires ONLY when
+            # promoted_to is entirely empty. Same-kind re-promotion is
+            # handled below by the idempotent-reuse paths which return
+            # the existing id without re-creating the downstream record.
+            if dog.status == DOGFOOD_STATUS_PROMOTED and not dog.promoted_to:
+                msg = (
+                    f"dogfood {dog_id} is in status promoted but "
+                    f"promoted_to is empty — refusing {action} to avoid "
+                    "orphan downstream record (corrupted state)"
                 )
-                if not has_matching:
-                    msg = (
-                        f"dogfood {dog_id} is in status promoted but has no "
-                        f"{kind_prefix}* entry in promoted_to — refusing "
-                        f"{action} to avoid orphan downstream record"
-                    )
-                    await self._safe_report_gap("triage_dogfood", msg)
-                    return {"error": msg, "dog_id": dog_id}
+                await self._safe_report_gap("triage_dogfood", msg)
+                return {"error": msg, "dog_id": dog_id}
 
         if action == "dismiss":
             try:
