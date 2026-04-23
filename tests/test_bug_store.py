@@ -612,3 +612,359 @@ def test_mcp_close_bug_happy_path(pipeline):
     assert result["status"] == BUG_STATUS_FIXED
 
 
+# ---------------------------------------------------------------------------
+# Phase 2A: escalate_to_fr / update_severity / triage handlers
+# ---------------------------------------------------------------------------
+
+
+def test_escalate_to_fr_appends_to_linked_frs(store):
+    bug = store.file_bug(target="developer", title="T", description="d")
+    out = store.escalate_to_fr(bug.id, "fr_developer_abc12345")
+    assert out.linked_frs == ["fr_developer_abc12345"]
+    # notes_history records the escalation with caller-facing action text
+    assert any("escalated to fr_developer_abc12345" in entry["notes"]
+               for entry in out.notes_history)
+
+
+def test_escalate_to_fr_is_idempotent(store):
+    """Re-linking the same pair is a no-op — no duplicate, no audit noise."""
+    bug = store.file_bug(target="developer", title="T", description="d")
+    store.escalate_to_fr(bug.id, "fr_x_1")
+    notes_before = len(store.get_bug(bug.id).notes_history)
+    out = store.escalate_to_fr(bug.id, "fr_x_1")
+    assert out.linked_frs == ["fr_x_1"]
+    assert len(out.notes_history) == notes_before
+
+
+def test_escalate_to_fr_supports_multiple_distinct_frs(store):
+    bug = store.file_bug(target="developer", title="T", description="d")
+    store.escalate_to_fr(bug.id, "fr_x_1")
+    out = store.escalate_to_fr(bug.id, "fr_x_2")
+    assert out.linked_frs == ["fr_x_1", "fr_x_2"]
+
+
+def test_escalate_to_fr_refuses_terminal(store):
+    bug = store.file_bug(target="developer", title="T", description="d")
+    store.close_bug(bug.id, "fixed")
+    with pytest.raises(BugError, match="terminal"):
+        store.escalate_to_fr(bug.id, "fr_x_1")
+
+
+def test_escalate_to_fr_requires_non_empty_fr_id(store):
+    bug = store.file_bug(target="developer", title="T", description="d")
+    with pytest.raises(BugError, match="non-empty"):
+        store.escalate_to_fr(bug.id, "")
+
+
+def test_update_severity_happy_path(store):
+    bug = store.file_bug(
+        target="developer", title="T", description="d",
+        severity=BUG_SEVERITY_LOW,
+    )
+    out = store.update_severity(bug.id, BUG_SEVERITY_HIGH)
+    assert out.severity == BUG_SEVERITY_HIGH
+    assert any("severity low->high" in e["notes"] for e in out.notes_history)
+
+
+def test_update_severity_no_change_is_noop_unless_noted(store):
+    bug = store.file_bug(
+        target="developer", title="T", description="d",
+        severity=BUG_SEVERITY_MEDIUM,
+    )
+    before = len(store.get_bug(bug.id).notes_history)
+    out = store.update_severity(bug.id, BUG_SEVERITY_MEDIUM)
+    assert len(out.notes_history) == before
+
+
+def test_update_severity_refuses_terminal(store):
+    bug = store.file_bug(target="developer", title="T", description="d")
+    store.close_bug(bug.id, "wontfix")
+    with pytest.raises(BugError, match="terminal"):
+        store.update_severity(bug.id, BUG_SEVERITY_HIGH)
+
+
+# -- triage_bug handler --
+
+
+def test_triage_bug_escalate_round_trip(pipeline):
+    """Bug filed → triaged → FR created → bug.linked_frs populated → FR description references bug."""
+    agent = _make_agent(pipeline)
+    filed = _run(agent.handle_file_bug({
+        "target": "developer",
+        "title": "escalation title",
+        "description": "body of the bug",
+        "reproduction": "steps A then B",
+        "severity": "high",
+    }))
+    result = _run(agent.handle_triage_bug({
+        "bug_id": filed["bug_id"],
+        "status": BUG_STATUS_TRIAGED,
+        "escalate_to_fr": True,
+    }))
+    assert result["bug_id"] == filed["bug_id"]
+    assert result["escalated_fr_id"].startswith("fr_developer_")
+    assert result["escalation_reused"] is False
+    assert result["linked_frs"] == [result["escalated_fr_id"]]
+
+    fr = pipeline.frs.get(result["escalated_fr_id"])
+    assert fr is not None
+    # FR description seeded from the bug — must reference the bug id
+    # so provenance survives a reader of the FR alone.
+    assert filed["bug_id"] in fr.description
+    assert "body of the bug" in fr.description
+
+
+def test_triage_bug_idempotent_re_escalation(pipeline):
+    """Second triage_bug(escalate_to_fr=True) returns existing, doesn't double-create."""
+    agent = _make_agent(pipeline)
+    filed = _run(agent.handle_file_bug({
+        "target": "developer",
+        "title": "idem",
+        "description": "body",
+    }))
+    first = _run(agent.handle_triage_bug({
+        "bug_id": filed["bug_id"],
+        "escalate_to_fr": True,
+    }))
+    # All developer FRs before the second call
+    frs_before = len(pipeline.frs.list(include_all=True))
+    second = _run(agent.handle_triage_bug({
+        "bug_id": filed["bug_id"],
+        "escalate_to_fr": True,
+    }))
+    assert second["escalated_fr_id"] == first["escalated_fr_id"]
+    assert second["escalation_reused"] is True
+    assert len(pipeline.frs.list(include_all=True)) == frs_before
+
+
+def test_triage_bug_rejects_terminal_status_with_escalate(pipeline):
+    """status=<terminal> + escalate_to_fr=true must be refused up-front.
+
+    Without this guard the handler would close the bug first (making it
+    terminal), then call escalate_to_fr which refuses terminal bugs —
+    but the FR has already been created, leaving an orphan FR and an
+    inconsistent state. The up-front rejection must keep the FR count
+    unchanged AND leave the bug status un-mutated.
+    """
+    agent = _make_agent(pipeline)
+    filed = _run(agent.handle_file_bug({
+        "target": "developer",
+        "title": "terminal race",
+        "description": "would orphan an FR",
+    }))
+    frs_before = len(pipeline.frs.list(include_all=True))
+    status_before = pipeline.bugs.get_bug(filed["bug_id"]).status
+
+    for terminal in (BUG_STATUS_FIXED, BUG_STATUS_WONTFIX):
+        result = _run(agent.handle_triage_bug({
+            "bug_id": filed["bug_id"],
+            "status": terminal,
+            "escalate_to_fr": True,
+        }))
+        assert "error" in result
+        assert "escalate" in result["error"].lower()
+        assert "terminal" in result["error"].lower()
+
+    # No FR was created, and the bug's status was not advanced to the
+    # rejected terminal target.
+    assert len(pipeline.frs.list(include_all=True)) == frs_before
+    assert pipeline.bugs.get_bug(filed["bug_id"]).status == status_before
+
+
+def test_triage_bug_rejects_escalate_when_bug_already_terminal(pipeline):
+    """escalate_to_fr=True on an already-terminal bug must be refused up-front.
+
+    Covers the gap left by the R1 fix: when status="" (no status change
+    requested) and the bug is ALREADY in a terminal status with no
+    linked_frs, promote() would create the FR but
+    BugStore.escalate_to_fr() refuses terminal bugs — leaving an orphan
+    FR. Up-front rejection keeps the FR count unchanged.
+    """
+    agent = _make_agent(pipeline)
+    filed = _run(agent.handle_file_bug({
+        "target": "developer",
+        "title": "already closed",
+        "description": "this bug was closed before escalation was tried",
+    }))
+    # Close the bug first (two-step legit flow).
+    _run(agent.handle_update_bug_status({
+        "bug_id": filed["bug_id"],
+        "status": BUG_STATUS_FIXED,
+    }))
+    frs_before = len(pipeline.frs.list(include_all=True))
+
+    result = _run(agent.handle_triage_bug({
+        "bug_id": filed["bug_id"],
+        "escalate_to_fr": True,
+        # status intentionally omitted — the R1 guard only trips when
+        # status is set to a terminal value. This path must ALSO be
+        # rejected when the bug is already terminal.
+    }))
+    assert "error" in result
+    assert "terminal" in result["error"].lower()
+    # No orphan FR created — count unchanged.
+    assert len(pipeline.frs.list(include_all=True)) == frs_before
+    # Bug still terminal (unchanged by the rejected call).
+    assert pipeline.bugs.get_bug(filed["bug_id"]).status == BUG_STATUS_FIXED
+    # linked_frs still empty — no stray attachment.
+    assert pipeline.bugs.get_bug(filed["bug_id"]).linked_frs == []
+
+
+def test_triage_bug_without_escalation_updates_severity_and_status(pipeline):
+    agent = _make_agent(pipeline)
+    filed = _run(agent.handle_file_bug({
+        "target": "developer",
+        "title": "raw",
+        "description": "body",
+        "severity": "low",
+    }))
+    result = _run(agent.handle_triage_bug({
+        "bug_id": filed["bug_id"],
+        "severity": "high",
+        "status": BUG_STATUS_TRIAGED,
+        "notes": "raised after repro",
+    }))
+    assert result["severity"] == "high"
+    assert result["status"] == BUG_STATUS_TRIAGED
+    assert result["linked_frs"] == []
+    # No escalation key when escalate_to_fr is false
+    assert "escalated_fr_id" not in result
+
+
+def test_triage_bug_unknown_id_returns_error(pipeline):
+    agent = _make_agent(pipeline)
+    result = _run(agent.handle_triage_bug({"bug_id": "bug_nope_12345678"}))
+    assert "error" in result
+
+
+# -- link_bug_fr handler --
+
+
+def test_link_bug_fr_manual_attach(pipeline):
+    agent = _make_agent(pipeline)
+    filed = _run(agent.handle_file_bug({
+        "target": "developer",
+        "title": "manual link",
+        "description": "body",
+    }))
+    fr = pipeline.frs.promote(
+        target="developer", title="Existing FR", description="pre-existing"
+    )
+    result = _run(agent.handle_link_bug_fr({
+        "bug_id": filed["bug_id"],
+        "fr_id": fr.id,
+    }))
+    assert result["linked_frs"] == [fr.id]
+
+
+def test_link_bug_fr_idempotent_reattach(pipeline):
+    agent = _make_agent(pipeline)
+    filed = _run(agent.handle_file_bug({
+        "target": "developer",
+        "title": "t",
+        "description": "body",
+    }))
+    fr = pipeline.frs.promote(
+        target="developer", title="FR A", description="d"
+    )
+    _run(agent.handle_link_bug_fr({"bug_id": filed["bug_id"], "fr_id": fr.id}))
+    _run(agent.handle_link_bug_fr({"bug_id": filed["bug_id"], "fr_id": fr.id}))
+    bug = pipeline.bugs.get_bug(filed["bug_id"])
+    assert bug.linked_frs == [fr.id]
+
+
+def test_link_bug_fr_rejects_unknown_fr(pipeline):
+    agent = _make_agent(pipeline)
+    filed = _run(agent.handle_file_bug({
+        "target": "developer",
+        "title": "t",
+        "description": "body",
+    }))
+    result = _run(agent.handle_link_bug_fr({
+        "bug_id": filed["bug_id"],
+        "fr_id": "fr_developer_deadbeef",
+    }))
+    assert "error" in result
+
+
+# -- report_gap(bug=True) --
+
+
+def test_report_gap_bug_creates_bug_and_fires_event(pipeline):
+    """report_gap(bug=True) files a bug in BugStore AND returns telemetry ack.
+
+    Since the test harness runs the agent without a live bus, the
+    telemetry side falls through to ``gap.not_sent`` in the ack — but
+    the bug filing is unconditional and must succeed.
+    """
+    agent = _make_agent(pipeline)
+    result = _run(agent.handle_report_gap({
+        "operation": "promote_fr",
+        "reason": "backing_papers parse failure",
+        "bug": True,
+        "severity": "high",
+    }))
+    assert "bug_id" in result
+    bug = pipeline.bugs.get_bug(result["bug_id"])
+    assert bug is not None
+    assert bug.severity == "high"
+    assert "promote_fr" in bug.title
+    # event key present regardless of bus connectivity (gap.observed
+    # when connected, gap.not_sent when not). The test_harness doesn't
+    # connect, so gap.not_sent is expected.
+    assert result["event"] in ("gap.observed", "gap.not_sent")
+
+
+def test_report_gap_bug_false_is_legacy_behavior(pipeline):
+    """Default bug=False does NOT file a bug — Phase 1 callers unaffected."""
+    agent = _make_agent(pipeline)
+    before = len(pipeline.bugs.list_bugs(status="all"))
+    result = _run(agent.handle_report_gap({
+        "operation": "run_tests",
+        "reason": "timeout",
+    }))
+    after = len(pipeline.bugs.list_bugs(status="all"))
+    assert "bug_id" not in result
+    assert after == before
+
+
+def test_report_gap_requires_operation_and_reason(pipeline):
+    agent = _make_agent(pipeline)
+    result = _run(agent.handle_report_gap({"operation": "", "reason": ""}))
+    assert "error" in result
+
+
+def test_report_gap_bug_propagates_cancellation(pipeline):
+    """asyncio.CancelledError must NOT be swallowed by the bug-filing except.
+
+    Same async-cancellation pattern as PR #39 R4 for pr_watcher:
+    the broad ``except Exception`` around BugStore.file_bug must
+    re-raise CancelledError so the enclosing async task can terminate.
+    If the bug path catches CancelledError (because it's a subclass of
+    BaseException in 3.8+ but of Exception in earlier versions, OR
+    because someone accidentally re-orders the clauses), cancellation
+    propagation breaks.
+    """
+    import asyncio
+
+    agent = _make_agent(pipeline)
+
+    # Monkeypatch BugStore.file_bug to raise CancelledError — this
+    # simulates what happens if the caller's enclosing task is
+    # cancelled while file_bug is awaiting (e.g. on a DB lock via
+    # future work). The report_gap handler must propagate, not
+    # swallow into bug_error.
+    def _raise_cancelled(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    pipeline.bugs.file_bug = _raise_cancelled  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.CancelledError):
+        _run(agent.report_gap(
+            operation="cancel_probe",
+            reason="task was cancelled mid-file_bug",
+            bug=True,
+            severity="high",
+        ))
+
+

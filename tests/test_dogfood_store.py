@@ -10,11 +10,14 @@ from khonliang.knowledge.store import KnowledgeStore
 
 from developer.dogfood_store import (
     DOGFOOD_KIND_BUG,
+    DOGFOOD_KIND_DOCS,
     DOGFOOD_KIND_FRICTION,
+    DOGFOOD_KIND_OTHER,
     DOGFOOD_KIND_UX,
     DOGFOOD_STATUS_DISMISSED,
     DOGFOOD_STATUS_DUPLICATE,
     DOGFOOD_STATUS_OBSERVED,
+    DOGFOOD_STATUS_PROMOTED,
     DOGFOOD_STATUS_TRIAGED,
     DogfoodError,
     DogfoodStore,
@@ -539,3 +542,530 @@ def test_handle_list_dogfood_preserves_explicit_none_for_no_cap(pipeline):
         "status": "all",
     }))
     assert result_default["count"] == 20
+
+
+# ---------------------------------------------------------------------------
+# Phase 2A: record_promotion / triage_queue / triage handlers
+# ---------------------------------------------------------------------------
+
+
+def test_record_promotion_preserves_observation_verbatim(store):
+    """Per-FR acceptance criterion: observation survives triage unchanged."""
+    dog = store.log_dogfood(
+        "the exact observation text",
+        kind=DOGFOOD_KIND_FRICTION,
+        target="researcher",
+        context="ctx",
+    )
+    original_observation = dog.observation
+    out = store.record_promotion(dog.id, "bug_x_1", "bug")
+    assert out.observation == original_observation
+    # Status and promoted_to flip; everything else stays.
+    assert out.status == DOGFOOD_STATUS_PROMOTED
+    assert out.promoted_to == ["bug_x_1"]
+
+
+def test_record_promotion_idempotent(store):
+    dog = store.log_dogfood("obs", observed_at=1.0)
+    store.record_promotion(dog.id, "bug_x_1", "bug")
+    before_notes = len(store.get_dogfood(dog.id).notes_history)
+    out = store.record_promotion(dog.id, "bug_x_1", "bug")
+    assert out.promoted_to == ["bug_x_1"]
+    assert len(out.notes_history) == before_notes
+
+
+def test_record_promotion_supports_multiple_targets(store):
+    dog = store.log_dogfood("obs", observed_at=1.0)
+    store.record_promotion(dog.id, "bug_a_1", "bug")
+    out = store.record_promotion(dog.id, "fr_a_2", "fr")
+    assert out.promoted_to == ["bug_a_1", "fr_a_2"]
+    assert out.status == DOGFOOD_STATUS_PROMOTED
+
+
+def test_record_promotion_refuses_dismissed(store):
+    dog = store.log_dogfood("obs", observed_at=1.0)
+    store.mark_dismissed(dog.id)
+    with pytest.raises(DogfoodError, match="terminal"):
+        store.record_promotion(dog.id, "bug_x_1", "bug")
+
+
+def test_record_promotion_rejects_bad_kind(store):
+    dog = store.log_dogfood("obs", observed_at=1.0)
+    with pytest.raises(DogfoodError, match="target_kind"):
+        store.record_promotion(dog.id, "xxx", "epic")
+
+
+def test_record_promotion_requires_non_empty_target(store):
+    dog = store.log_dogfood("obs", observed_at=1.0)
+    with pytest.raises(DogfoodError, match="target_id"):
+        store.record_promotion(dog.id, "", "bug")
+
+
+def test_triage_queue_observed_only(store):
+    # Observed (eligible)
+    obs1 = store.log_dogfood("obs1", kind=DOGFOOD_KIND_FRICTION, observed_at=10.0)
+    # Dismissed (not eligible)
+    obs2 = store.log_dogfood("obs2", observed_at=20.0)
+    store.mark_dismissed(obs2.id)
+    # Promoted (not eligible)
+    obs3 = store.log_dogfood("obs3", observed_at=30.0)
+    store.record_promotion(obs3.id, "bug_a_1", "bug")
+    queue = store.triage_queue(limit=10)
+    ids = [d.id for d in queue]
+    assert obs1.id in ids
+    assert obs2.id not in ids
+    assert obs3.id not in ids
+
+
+def test_triage_queue_orders_by_kind_priority_then_recency(store):
+    # Oldest docs entry — low kind priority.
+    d_docs_old = store.log_dogfood("docs old", kind=DOGFOOD_KIND_DOCS, observed_at=1.0)
+    # Newer bug entry — highest kind priority, newer recency.
+    d_bug_new = store.log_dogfood("bug new", kind=DOGFOOD_KIND_BUG, observed_at=100.0)
+    # Older bug entry — highest kind priority, older recency.
+    d_bug_old = store.log_dogfood("bug old", kind=DOGFOOD_KIND_BUG, observed_at=50.0)
+    # ux entry — middle priority.
+    d_ux = store.log_dogfood("ux", kind=DOGFOOD_KIND_UX, observed_at=200.0)
+    queue = store.triage_queue(limit=10)
+    ids = [d.id for d in queue]
+    # bugs come first (by kind priority), oldest-first within tier.
+    assert ids[0] == d_bug_old.id
+    assert ids[1] == d_bug_new.id
+    # then ux/friction tier (ux here).
+    assert d_ux.id in ids[2:]
+    # docs is lowest priority, comes after ux.
+    assert ids.index(d_ux.id) < ids.index(d_docs_old.id)
+
+
+def test_triage_queue_respects_limit(store):
+    for i in range(15):
+        store.log_dogfood(f"o{i}", observed_at=float(i))
+    queue = store.triage_queue(limit=5)
+    assert len(queue) == 5
+
+
+# -- triage_dogfood handler --
+
+
+def _make_agent(pipeline):
+    from developer.agent import DeveloperAgent
+    agent = DeveloperAgent(
+        agent_id="test-developer",
+        bus_url="http://localhost:8787",
+        config_path="unused",
+    )
+    agent._pipeline = pipeline
+    return agent
+
+
+def test_triage_dogfood_promote_to_bug_round_trip(pipeline):
+    """observation → promoted → bug exists → dog.promoted_to has bug_id."""
+    agent = _make_agent(pipeline)
+    dog = pipeline.dogfood.log_dogfood(
+        "captured friction", kind=DOGFOOD_KIND_FRICTION, target="developer",
+        observed_at=9_999_999_999.0,
+    )
+    original_observation = dog.observation
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_bug",
+    }))
+    assert result["status"] == DOGFOOD_STATUS_PROMOTED
+    assert result["bug_id"].startswith("bug_developer_")
+    bug = pipeline.bugs.get_bug(result["bug_id"])
+    assert bug is not None
+    assert "captured friction" in bug.description
+    # Observation must survive verbatim in the source dogfood row.
+    dog_after = pipeline.dogfood.get_dogfood(dog.id)
+    assert dog_after.observation == original_observation
+    assert result["bug_id"] in dog_after.promoted_to
+
+
+def test_triage_dogfood_promote_to_fr_round_trip(pipeline):
+    agent = _make_agent(pipeline)
+    dog = pipeline.dogfood.log_dogfood(
+        "friction worth an FR", kind=DOGFOOD_KIND_UX, target="developer",
+        observed_at=9_999_999_998.0,
+    )
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_fr",
+    }))
+    assert result["status"] == DOGFOOD_STATUS_PROMOTED
+    assert result["fr_id"].startswith("fr_developer_")
+    fr = pipeline.frs.get(result["fr_id"])
+    assert fr is not None
+    # FR description references the source dog id (provenance).
+    assert dog.id in fr.description
+    dog_after = pipeline.dogfood.get_dogfood(dog.id)
+    assert result["fr_id"] in dog_after.promoted_to
+    # Observation survives triage verbatim.
+    assert dog_after.observation == "friction worth an FR"
+
+
+def test_triage_dogfood_promote_to_bug_idempotent_reuse(pipeline):
+    """Re-promoting a dog to a bug reuses the existing bug_id.
+
+    Without the handler-level idempotency check, the retry would call
+    file_bug again, which raises on the deterministic id collision
+    BEFORE record_promotion can no-op. Verify the second call returns
+    the same bug_id with promotion_reused=True and does not raise or
+    create a second bug.
+    """
+    agent = _make_agent(pipeline)
+    dog = pipeline.dogfood.log_dogfood(
+        "retry friction bug", kind=DOGFOOD_KIND_FRICTION, target="developer",
+        observed_at=9_999_999_997.0,
+    )
+    first = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_bug",
+    }))
+    assert first["bug_id"].startswith("bug_developer_")
+    assert first["promotion_reused"] is False
+    bugs_before = len(pipeline.bugs.list_bugs(status="all"))
+
+    second = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_bug",
+    }))
+    assert "error" not in second
+    assert second["bug_id"] == first["bug_id"]
+    assert second["promotion_reused"] is True
+    assert second["status"] == DOGFOOD_STATUS_PROMOTED
+    # No duplicate bug row was created.
+    assert len(pipeline.bugs.list_bugs(status="all")) == bugs_before
+
+
+def test_triage_dogfood_promote_to_fr_idempotent_reuse(pipeline):
+    """Re-promoting a dog to an FR reuses the existing fr_id.
+
+    Mirror of the promote_to_bug idempotency test — FR promote() raises
+    on the deterministic id collision, so the handler must short-circuit
+    on already-promoted rows and return the existing fr_id.
+    """
+    agent = _make_agent(pipeline)
+    dog = pipeline.dogfood.log_dogfood(
+        "retry friction fr", kind=DOGFOOD_KIND_UX, target="developer",
+        observed_at=9_999_999_996.0,
+    )
+    first = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_fr",
+    }))
+    assert first["fr_id"].startswith("fr_developer_")
+    assert first["promotion_reused"] is False
+    frs_before = len(pipeline.frs.list(include_all=True))
+
+    second = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_fr",
+    }))
+    assert "error" not in second
+    assert second["fr_id"] == first["fr_id"]
+    assert second["promotion_reused"] is True
+    assert second["status"] == DOGFOOD_STATUS_PROMOTED
+    # No duplicate FR row was created.
+    assert len(pipeline.frs.list(include_all=True)) == frs_before
+
+
+def test_triage_dogfood_dismiss(pipeline):
+    agent = _make_agent(pipeline)
+    dog = pipeline.dogfood.log_dogfood("meh", observed_at=1.0)
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "dismiss",
+        "notes": "out of scope",
+    }))
+    assert result["status"] == DOGFOOD_STATUS_DISMISSED
+
+
+def test_triage_dogfood_mark_duplicate(pipeline):
+    agent = _make_agent(pipeline)
+    original = pipeline.dogfood.log_dogfood("o1", observed_at=1.0)
+    dup = pipeline.dogfood.log_dogfood("o2", observed_at=2.0)
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dup.id,
+        "action": "mark_duplicate",
+        "target_id": original.id,
+    }))
+    assert result["status"] == DOGFOOD_STATUS_DUPLICATE
+    assert result["duplicate_of"] == original.id
+
+
+def test_triage_dogfood_mark_duplicate_requires_target(pipeline):
+    agent = _make_agent(pipeline)
+    dog = pipeline.dogfood.log_dogfood("o", observed_at=1.0)
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "mark_duplicate",
+    }))
+    assert "error" in result
+
+
+def test_triage_dogfood_unknown_action(pipeline):
+    agent = _make_agent(pipeline)
+    dog = pipeline.dogfood.log_dogfood("o", observed_at=1.0)
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "explode",
+    }))
+    assert "error" in result
+
+
+def test_triage_dogfood_unknown_id(pipeline):
+    agent = _make_agent(pipeline)
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": "dog_nope12",
+        "action": "dismiss",
+    }))
+    assert "error" in result
+
+
+def test_triage_dogfood_rejects_promote_to_bug_on_terminal_dogfood(pipeline):
+    """promote_to_bug on dismissed / duplicate dogfood is refused.
+
+    Without the up-front guard, file_bug would create the bug first and
+    record_promotion would then refuse the terminal status — stranding
+    an orphan bug. Verify the rejection keeps bugs table unchanged for
+    both dismissed and duplicate states. The ``promoted`` status is
+    NOT a full-terminal refuse here — cross-kind double-promotion is
+    allowed (see test_triage_dogfood_cross_kind_promotion_allowed) and
+    same-kind re-promotion is idempotent-reuse
+    (test_triage_dogfood_promote_to_bug_idempotent_reuse). The only
+    promoted-state refusal is the genuine-corruption case (status
+    promoted + empty promoted_to), covered by
+    test_triage_dogfood_promote_refuses_only_on_genuine_corruption.
+    """
+    agent = _make_agent(pipeline)
+
+    # Case 1: dismissed dogfood rejects promote_to_bug.
+    dismissed = pipeline.dogfood.log_dogfood(
+        "dismissed friction", kind=DOGFOOD_KIND_FRICTION, observed_at=1.0,
+    )
+    pipeline.dogfood.mark_dismissed(dismissed.id)
+    bugs_before = len(pipeline.bugs.list_bugs(status="all"))
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dismissed.id,
+        "action": "promote_to_bug",
+    }))
+    assert "error" in result
+    assert "terminal" in result["error"].lower()
+    assert len(pipeline.bugs.list_bugs(status="all")) == bugs_before
+
+    # Case 2: duplicate dogfood rejects promote_to_bug.
+    original = pipeline.dogfood.log_dogfood(
+        "orig", kind=DOGFOOD_KIND_FRICTION, observed_at=2.0,
+    )
+    dup = pipeline.dogfood.log_dogfood(
+        "dup", kind=DOGFOOD_KIND_FRICTION, observed_at=3.0,
+    )
+    pipeline.dogfood.mark_duplicate(dup.id, original.id)
+    bugs_before = len(pipeline.bugs.list_bugs(status="all"))
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dup.id,
+        "action": "promote_to_bug",
+    }))
+    assert "error" in result
+    assert "terminal" in result["error"].lower()
+    assert len(pipeline.bugs.list_bugs(status="all")) == bugs_before
+
+
+def test_triage_dogfood_rejects_promote_to_fr_on_terminal_dogfood(pipeline):
+    """Symmetric fix — promote_to_fr on terminal dogfood refused up-front.
+
+    Without the guard, promote() would create the FR and then
+    record_promotion would refuse the terminal status, stranding an
+    orphan FR. Verify the rejection keeps FR count unchanged.
+    """
+    agent = _make_agent(pipeline)
+
+    # Case 1: dismissed dogfood rejects promote_to_fr.
+    dismissed = pipeline.dogfood.log_dogfood(
+        "dismissed UX", kind=DOGFOOD_KIND_UX, observed_at=1.0,
+    )
+    pipeline.dogfood.mark_dismissed(dismissed.id)
+    frs_before = len(pipeline.frs.list(include_all=True))
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dismissed.id,
+        "action": "promote_to_fr",
+    }))
+    assert "error" in result
+    assert "terminal" in result["error"].lower()
+    assert len(pipeline.frs.list(include_all=True)) == frs_before
+
+    # Case 2: duplicate dogfood rejects promote_to_fr.
+    original = pipeline.dogfood.log_dogfood(
+        "o", kind=DOGFOOD_KIND_UX, observed_at=2.0,
+    )
+    dup = pipeline.dogfood.log_dogfood(
+        "d", kind=DOGFOOD_KIND_UX, observed_at=3.0,
+    )
+    pipeline.dogfood.mark_duplicate(dup.id, original.id)
+    frs_before = len(pipeline.frs.list(include_all=True))
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dup.id,
+        "action": "promote_to_fr",
+    }))
+    assert "error" in result
+    assert "terminal" in result["error"].lower()
+    assert len(pipeline.frs.list(include_all=True)) == frs_before
+
+
+def test_triage_dogfood_cross_kind_promotion_allowed(pipeline):
+    """Cross-kind double promotion is valid — dog can go to FR then bug.
+
+    The R2 promoted-state guard refused whenever no TARGET-kind entry
+    was in promoted_to; that falsely blocked cross-kind flows (promoted
+    to fr_*, now asked to promote to bug_*). R3 narrows the guard to
+    fire only on genuine corruption (status=promoted + empty list).
+    Here: promote_to_fr first, then promote_to_bug on the same dog.
+    Both must succeed; promoted_to must end with both kinds.
+    """
+    agent = _make_agent(pipeline)
+    dog = pipeline.dogfood.log_dogfood(
+        "cross-kind friction", kind=DOGFOOD_KIND_FRICTION, target="developer",
+        observed_at=9_999_999_995.0,
+    )
+    # First: promote to FR.
+    first = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_fr",
+    }))
+    assert "error" not in first, first
+    assert first["fr_id"].startswith("fr_developer_")
+    assert first["promotion_reused"] is False
+    assert first["status"] == DOGFOOD_STATUS_PROMOTED
+
+    # Second: promote same dog to bug — cross-kind, must be allowed.
+    second = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_bug",
+    }))
+    assert "error" not in second, second
+    assert second["bug_id"].startswith("bug_developer_")
+    assert second["promotion_reused"] is False
+    assert second["status"] == DOGFOOD_STATUS_PROMOTED
+
+    # promoted_to has BOTH the fr_* and bug_* entries.
+    dog_after = pipeline.dogfood.get_dogfood(dog.id)
+    assert first["fr_id"] in dog_after.promoted_to
+    assert second["bug_id"] in dog_after.promoted_to
+    assert any(t.startswith("fr_") for t in dog_after.promoted_to)
+    assert any(t.startswith("bug_") for t in dog_after.promoted_to)
+
+    # Same-kind reuse still works after the cross-kind split: re-calling
+    # promote_to_fr returns the original fr_id (idempotent-reuse).
+    third = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_fr",
+    }))
+    assert "error" not in third
+    assert third["fr_id"] == first["fr_id"]
+    assert third["promotion_reused"] is True
+
+
+def test_triage_dogfood_same_kind_re_promotion_returns_existing(pipeline):
+    """R1 behavior preserved: same-kind re-promotion reuses the existing id.
+
+    Complementary to the cross-kind test — verifies that narrowing the
+    R2 guard did not break the R1 idempotent-reuse path. First
+    promote_to_bug creates a fresh bug_id; second promote_to_bug
+    returns the same id with promotion_reused=True and no new bug row.
+    """
+    agent = _make_agent(pipeline)
+    dog = pipeline.dogfood.log_dogfood(
+        "same-kind replay bug", kind=DOGFOOD_KIND_FRICTION, target="developer",
+        observed_at=9_999_999_994.0,
+    )
+    first = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_bug",
+    }))
+    assert "error" not in first
+    assert first["promotion_reused"] is False
+    bugs_before = len(pipeline.bugs.list_bugs(status="all"))
+
+    second = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_bug",
+    }))
+    assert "error" not in second
+    assert second["bug_id"] == first["bug_id"]
+    assert second["promotion_reused"] is True
+    # No new bug created.
+    assert len(pipeline.bugs.list_bugs(status="all")) == bugs_before
+
+
+def test_triage_dogfood_promote_refuses_only_on_genuine_corruption(pipeline):
+    """status=promoted + empty promoted_to is the sole promoted-state refusal.
+
+    Manually inject the corrupted state (status lies about reality:
+    promoted flag set, promoted_to list empty). Both promote_to_bug
+    and promote_to_fr must refuse with a corruption message and must
+    NOT create a downstream record.
+    """
+    agent = _make_agent(pipeline)
+
+    # Inject genuine corruption directly via the store's internal
+    # mutation path. Using log_dogfood + private-state edit is the
+    # cleanest way to simulate a corrupted DB row without exercising
+    # record_promotion's protections.
+    dog = pipeline.dogfood.log_dogfood(
+        "corruption bait", kind=DOGFOOD_KIND_FRICTION, target="developer",
+        observed_at=9_999_999_993.0,
+    )
+    # Flip status to promoted without adding an entry to promoted_to.
+    dog.status = DOGFOOD_STATUS_PROMOTED
+    dog.promoted_to = []
+    pipeline.dogfood._store(dog)
+
+    bugs_before = len(pipeline.bugs.list_bugs(status="all"))
+    frs_before = len(pipeline.frs.list(include_all=True))
+
+    bug_result = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_bug",
+    }))
+    assert "error" in bug_result
+    assert "corrupt" in bug_result["error"].lower()
+    assert len(pipeline.bugs.list_bugs(status="all")) == bugs_before
+
+    fr_result = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_fr",
+    }))
+    assert "error" in fr_result
+    assert "corrupt" in fr_result["error"].lower()
+    assert len(pipeline.frs.list(include_all=True)) == frs_before
+
+
+# -- dogfood_triage_queue handler --
+
+
+def test_dogfood_triage_queue_handler_ordering(pipeline):
+    agent = _make_agent(pipeline)
+    # Seed a bug-kind and a docs-kind; bug outranks docs.
+    bug_kind = pipeline.dogfood.log_dogfood(
+        "latent bug", kind=DOGFOOD_KIND_BUG, observed_at=100.0,
+    )
+    pipeline.dogfood.log_dogfood(
+        "docs nit", kind=DOGFOOD_KIND_DOCS, observed_at=1_000.0,
+    )
+    result = _run(agent.handle_dogfood_triage_queue({"limit": 5}))
+    # First entry should be the bug-kind one.
+    first = result["dogfood"][0]
+    assert first["id"] == bug_kind.id
+
+
+def test_dogfood_triage_queue_default_detail_is_compact(pipeline):
+    agent = _make_agent(pipeline)
+    pipeline.dogfood.log_dogfood(
+        "x", kind=DOGFOOD_KIND_FRICTION, target="developer", observed_at=5.0,
+    )
+    result = _run(agent.handle_dogfood_triage_queue({}))
+    # compact_dict includes 'kind' and 'target'.
+    assert result["dogfood"]
+    first = result["dogfood"][0]
+    assert "kind" in first
+    assert "target" in first

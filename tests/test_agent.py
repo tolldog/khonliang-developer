@@ -21,7 +21,9 @@ def test_skill_count(harness):
     # + PR fleet watcher trio (watch/list/stop)
     # + pr_fleet_status snapshot (fr_developer_fafb36f1).
     # + tracking-infrastructure Phase 1 (BugStore 6 + DogfoodStore 3 = 9).
-    assert len(harness.skills) == 60
+    # + tracking-infrastructure Phase 2A (triage_bug / link_bug_fr /
+    #   triage_dogfood / dogfood_triage_queue / report_gap = 5).
+    assert len(harness.skills) == 65
 
 
 def test_skills_registered(harness):
@@ -56,11 +58,14 @@ def test_skills_registered(harness):
         # fleet-digest snapshot (fr_developer_fafb36f1)
         "pr_fleet_status",
         # tracking-infrastructure Phase 1 (fr_developer_f669bd33 +
-        # fr_developer_1324440c): BugStore + DogfoodStore CRUD. Phase 2
-        # adds triage_bug / triage_dogfood / report_gap hook / GH ingest.
+        # fr_developer_1324440c): BugStore + DogfoodStore CRUD.
         "file_bug", "list_bugs", "get_bug", "update_bug_status",
         "link_bug_pr", "close_bug",
         "log_dogfood", "list_dogfood", "get_dogfood",
+        # tracking-infrastructure Phase 2A: triage loop + report_gap hook.
+        # Phase 2B (GH issue ingest, fr_developer_47271f34) follows.
+        "triage_bug", "link_bug_fr", "triage_dogfood",
+        "dogfood_triage_queue", "report_gap",
     }
     assert harness.skill_names == expected
 
@@ -460,7 +465,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 60
+    assert len(reg.skills) == 65
     assert len(reg.collaborations) == 1
 
 
