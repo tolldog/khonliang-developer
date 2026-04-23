@@ -13,7 +13,7 @@ The khonliang ecosystem is a small, personally-maintained, local-first LLM engin
 ### Tier 1 — Core platform
 
 - **Services**: khonliang-bus (agent bus + service registry + MCP adapter + artifacts), khonliang-scheduler (LLM inference scheduling).
-- **Agents**: reviewer-primary, developer-primary, researcher-primary.
+- **Agents**: reviewer-primary, developer-primary, researcher-primary, librarian-primary.
 - **Libraries**: khonliang, khonliang-bus-lib, khonliang-reviewer-lib, khonliang-researcher-lib.
 
 Platform code. Changes here ripple everywhere. Maximum-scrutiny review.
@@ -35,11 +35,13 @@ Private sibling apps built **on** the platform. They depend on platform primitiv
 
 ## Capability map (current state)
 
-Three agents, 99 non-deprecated skills (102 total including the deprecated researcher `synergize` group), 1 collaborative flow.
+Four agents, 136 non-deprecated skills (139 total including the deprecated researcher `synergize` group), 1 collaborative flow. Counts are sourced from the live bus (`bus_services` + `bus_skills`) and verified against each agent's `register_skills()` at 2026-04-23.
 
-Skill counts reconcile against the per-agent tables below: reviewer 5 (1+3+1) + developer 47 (1+1+12+8+3+15+1+2+2+1+1) + researcher 50 (2+4+4+7+3+6+3+3+3+3+4+1+7, including the 3-skill deprecated `synergize` group) = 102 total; excluding the deprecated group yields 99.
+Skill counts reconcile against the per-agent tables below: reviewer 5 (1+3+1) + developer 69 (1+1+12+12+3+15+5+2+2+1+1+8+5+1) + researcher 57 (2+4+4+7+3+6+3+3+3+3+4+1+7+2+3+2, including the 3-skill deprecated `synergize` group) + librarian 8 = 139 total; excluding the deprecated group yields 136.
 
 ### reviewer-primary — LLM-based review (narrow)
+
+Subtotal: 5.
 
 | Group | Skills |
 |---|---|
@@ -47,23 +49,30 @@ Skill counts reconcile against the per-agent tables below: reviewer 5 (1+3+1) + 
 | Review work | `review_text`, `review_diff`, `review_pr` |
 | Observability | `usage_summary` |
 
-### developer-primary — dev lifecycle + git/GitHub
+### developer-primary — dev lifecycle + git/GitHub + bug/dogfood stores
+
+Subtotal: 69.
 
 | Group | Count |
 |---|---|
-| Agent-hygiene | 1 |
-| Guides | 1 |
-| FR lifecycle (promote/list/get/update/set_dependency/merge/next/migrate/candidates) | 12 |
-| Milestone + spec (get/list/propose/review/read/draft/traverse) | 8 |
-| Work units (list/next/handoff) | 3 |
-| Git local ops (14 standard + status) | 15 |
-| GitHub (`pr_ready`) | 1 |
+| Agent-hygiene (`health_check`) | 1 |
+| Guides (`developer_guide`) | 1 |
+| FR lifecycle (promote/list/get/update/set_dependency/merge/next/migrate/candidates/local variants) | 12 |
+| Milestone + spec (get/list/propose/review/read/draft/traverse/update_status/supersede/update_frs/delete) | 12 |
+| Work units (next/list/handoff) | 3 |
+| Git local ops (status/log/diff/branches/commit/stage/unstage/checkout/create_branch/delete_branch/fetch/pull/push/show/rev_parse) | 15 |
+| GitHub + PR fleet (`pr_ready`, `watch_pr_fleet`, `list_pr_watchers`, `stop_pr_watcher`, `pr_fleet_status`) | 5 |
 | Session (checkpoint/resume) | 2 |
 | Repo hygiene (audit/apply) | 2 |
 | Cross-agent proxy (`get_paper_context`) | 1 |
 | Testing (`run_tests`) | 1 |
+| Bug store (file/list/get/update_status/link_pr/close/triage/link_fr) | 8 |
+| Dogfood store (log/list/get/triage/queue) | 5 |
+| Telemetry (`report_gap`) | 1 |
 
 ### researcher-primary — corpus + distillation
+
+Subtotal: 57.
 
 | Group | Count |
 |---|---|
@@ -80,6 +89,21 @@ Skill counts reconcile against the per-agent tables below: reviewer 5 (1+3+1) + 
 | Idea workflow (brief/ingest/research/workspace) | 4 |
 | RSS (`browse_feeds`) | 1 |
 | Repo workflow (register/list/scan/ingest_github/research/project/landscape) | 7 |
+| Evidence-source aliases (`register_evidence_source`, `list_evidence_sources`) | 2 |
+| Ingest watchers (watch/list/stop) | 3 |
+| Research requests + briefs (`consume_research_request`, `brief_on`) | 2 |
+
+### librarian-primary — durable library taxonomy + classification
+
+Subtotal: 8. New agent added 2026-04-22 under `fr_researcher_librarian_agent` to split long-lived library-graph ownership out of researcher. Researcher retains ingest + distill + investigation workspaces; librarian owns classification, taxonomy rebuilds, gap detection, and promotion of workspace artifacts into the durable library.
+
+| Group | Skills |
+|---|---|
+| Agent-hygiene | `health_check` |
+| Classification | `classify_paper` |
+| Taxonomy | `taxonomy_report`, `rebuild_neighborhoods` |
+| Coverage | `library_health`, `identify_gaps`, `suggest_missing_nodes` |
+| Promotion | `promote_investigation` |
 
 ### Overlaps + gaps
 
@@ -103,7 +127,7 @@ Skill counts reconcile against the per-agent tables below: reviewer 5 (1+3+1) + 
 
 Distinct from the agent-role axis. Mechanisms in use:
 
-- **Multi-agent bus** — 3 agents concurrent today.
+- **Multi-agent bus** — 4 agents concurrent today (reviewer, developer, researcher, librarian).
 - **Git worktrees** per branch — `git worktree add` for concurrent branches in one repo; not stash+switch.
 - **Multi-repo** — the 8 repos in the ecosystem are independent checkout surfaces.
 - **Split-iTerm / parallel-Claude** — two Claude sessions, one per repo, sharing state only via memory + bus.

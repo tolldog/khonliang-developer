@@ -68,7 +68,8 @@ is actually two concerns running at different cadences.
 - **Temporary investigation workspaces** —
   `investigation_workspace` (branchable exploratory surface; does not
   pollute the durable library graph).
-- **On-demand topic briefs** — `brief_on` (just merged 2026-04-22;
+- **On-demand topic briefs** — `brief_on` (shipped under
+  `fr_researcher_5ad96ffe` / `tolldog/khonliang-researcher#27`;
   composes multi-query search + distill pointers).
 - **Project landscape + capability tracking** —
   `project_landscape`, `project_capabilities`, `research_capabilities`.
