@@ -2006,19 +2006,21 @@ async def test_pr_fleet_status_returns_snapshot_for_all_watchers(tmp_path):
         await reg_a._watchers[wid_a].watcher.poll_once()
         await reg_b._watchers[wid_b].watcher.poll_once()
 
-        # Both registries share the same store, so fleet_snapshot called
-        # on either registry sees both watcher rows — the in-memory live
-        # handles differ though, so only one registry has the live
-        # snapshots for each watcher.
+        # Both registries share the same store, but ``pr_fleet_status``
+        # is a strictly-live view: each registry only reports watchers
+        # whose in-memory handle lives on *it*. Rows persisted by the
+        # sibling registry are filtered out (Copilot R1 on PR #41).
         snap_a = reg_a.fleet_snapshot()
         snap_b = reg_b.fleet_snapshot()
-        wid_set = {w["id"] for w in snap_a["watchers"]}
-        assert wid_a in wid_set and wid_b in wid_set
+        wids_a = {w["id"] for w in snap_a["watchers"]}
+        wids_b = {w["id"] for w in snap_b["watchers"]}
+        assert wids_a == {wid_a}
+        assert wids_b == {wid_b}
 
         keys_a = {item["k"] for item in snap_a["fleet"]}
         keys_b = {item["k"] for item in snap_b["fleet"]}
-        assert "alpha#1" in keys_a
-        assert "beta#5" in keys_b
+        assert keys_a == {"alpha#1"}
+        assert keys_b == {"beta#5"}
 
         # Compact shape: required fields present on every fleet item.
         for snap_view in (snap_a, snap_b):
@@ -2093,6 +2095,44 @@ def test_pr_fleet_status_empty_fleet(store):
     assert snap["watchers"] == []
     assert snap["fleet"] == []
     assert snap["t"].endswith("Z")
+
+
+def test_fleet_snapshot_excludes_persisted_without_live_watcher(store):
+    """A watcher row that exists in the registry table but has no live
+    in-memory handle must not appear in ``pr_fleet_status``.
+
+    Models the real-world cases where the bug surfaces: a fresh process
+    before rehydrate populates ``self._watchers``; a sibling registry
+    (another process / test harness) sharing the same DB; a stopped-but-
+    not-yet-cleaned row. ``pr_fleet_status`` is strictly a live-fleet
+    view — persisted-only rows belong to a separate history skill, not
+    this one. Caught in Copilot R1 on PR #41.
+    """
+    # Seed a persisted registry row directly; no live watcher backs it.
+    store.register_watcher(
+        watcher_id="prw_ghost",
+        repos=["owner/repo"],
+        pr_numbers=[42],
+        interval_s=60,
+        started_at=1_700_000_000.0,
+    )
+    registry = PRWatcherRegistry(
+        store=store,
+        publish=lambda t, p: None,  # type: ignore[arg-type]
+    )
+    # Sanity: the store still has the row (filter isn't mutating state).
+    assert {r["watcher_id"] for r in store.list_watchers()} == {"prw_ghost"}
+
+    snap = registry.fleet_snapshot()
+    # Registry has the row but no live handle → strictly empty response.
+    assert snap["watchers"] == []
+    assert snap["fleet"] == []
+    assert snap["t"].endswith("Z")
+
+    # Scoping to the ghost's id is also empty (same rule applies).
+    scoped = registry.fleet_snapshot(watcher_id="prw_ghost")
+    assert scoped["watchers"] == []
+    assert scoped["fleet"] == []
 
 
 async def test_pr_fleet_digest_aggregates_per_cycle_transitions(store):
@@ -2267,6 +2307,83 @@ async def test_pr_fleet_digest_body_truncated_to_500_chars(store):
         assert len(body) <= COMMENT_PREVIEW_CHARS, (
             f"{ev['kind']} body not truncated: {len(body)} chars"
         )
+
+
+async def test_pr_fleet_digest_review_body_populated_when_available(store):
+    """Review digest entries must carry the review's summary body so the
+    aggregate event is self-sufficient (no follow-up API call needed).
+
+    Catches a real bug caught in Copilot R1 on PR #41: the digest emitter
+    called ``_truncate_body(review.get("body", ""))`` but
+    ``_snapshot_from_github`` didn't project ``body`` onto the snapshot
+    ``reviews`` entries, so the truncation was dead and the event always
+    carried an empty body in production. Fix is Option A from the finding
+    — map ``r.body`` through in ``_snapshot_from_github`` (the GitHub API
+    already returns it via :meth:`GithubClient.list_pr_reviews`).
+    """
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published)
+
+    review_body = "Looks good overall, two nits inline."
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot_with_comments(
+        head_sha="body_sha",
+        reviews=[{
+            "id": 42,
+            "reviewer": "copilot-pull-request-reviewer[bot]",
+            "state": "COMMENTED",
+            "submitted_at": "2026-04-22T10:00:00Z",
+            "body": review_body,
+        }],
+    )
+    await watcher.poll_once()
+
+    digests = _digest_events(published)
+    assert len(digests) == 1
+    entry = digests[0]["changed"][0]
+    review_events = [e for e in entry["events"] if e["kind"] == "review"]
+    assert len(review_events) == 1
+    assert review_events[0]["body"] == review_body
+
+
+async def test_pr_fleet_digest_review_body_roundtrips_through_snapshot_builder():
+    """``_snapshot_from_github`` projects ``r.body`` onto each snapshot
+    review — verified against the real builder rather than the fixture
+    helper, so future regressions in the builder are caught by this
+    test (not only by end-to-end digest assertions).
+    """
+    from developer.github_client import GithubReview
+    from developer.pr_watcher import _snapshot_from_github
+
+    class _StubGH:
+        async def get_pr(self, repo, pr_number):
+            return {"head_sha": "abc", "state": "open", "mergeable": True,
+                    "mergeable_state": "clean"}
+
+        async def list_pr_reviews(self, repo, pr_number):
+            return [
+                GithubReview(
+                    id=1, pr_number=pr_number, repo=repo,
+                    reviewer="copilot[bot]", state="COMMENTED",
+                    body="Summary body here.",
+                    submitted_at="2026-04-22T10:00:00Z",
+                ),
+            ]
+
+        async def list_pr_issue_comments(self, repo, pr_number):
+            return []
+
+        async def list_pr_review_comments(self, repo, pr_number):
+            return []
+
+    snap = await _snapshot_from_github(_StubGH(), "owner/repo", 1)
+    assert snap.reviews == [{
+        "id": 1,
+        "reviewer": "copilot[bot]",
+        "state": "COMMENTED",
+        "body": "Summary body here.",
+        "submitted_at": "2026-04-22T10:00:00Z",
+    }]
 
 
 # ---------------------------------------------------------------------------

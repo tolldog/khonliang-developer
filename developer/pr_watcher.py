@@ -1278,7 +1278,19 @@ class PRWatcherRegistry:
         for row in rows:
             wid = row["watcher_id"]
             live = self._watchers.get(wid)
-            pr_count = live.watcher.pr_count if live else 0
+            # ``pr_fleet_status`` is strictly a live-fleet view: rows that
+            # exist in the registry table but have no in-memory watcher
+            # handle (startup before rehydrate, a stopped-but-not-yet-
+            # cleaned row, or a row owned by a sibling registry sharing
+            # the same store) must not appear. A previous revision
+            # surfaced persisted-only rows in ``watchers`` with an empty
+            # fleet, which made the response lie about what was actually
+            # live — bug caught in Copilot R1 on PR #41. Historical
+            # / stopped-watcher views, if ever wanted, belong on a
+            # separate skill with its own schema.
+            if live is None:
+                continue
+            pr_count = live.watcher.pr_count
             # ISO-format started_at alongside the float so downstream
             # consumers aren't forced to know which epoch base we used.
             started_at_raw = float(row.get("started_at", 0.0) or 0.0)
@@ -1292,8 +1304,6 @@ class PRWatcherRegistry:
                 "started_at": started_at_iso,
                 "pr_count": pr_count,
             })
-            if live is None:
-                continue
             for snapshot in live.watcher.latest_snapshots():
                 fleet_out.append(_fleet_item_from_snapshot(snapshot))
         return {
@@ -1398,11 +1408,18 @@ async def _snapshot_from_github(
     """
     pr = await gh.get_pr(repo, pr_number)
     reviews_raw = await gh.list_pr_reviews(repo, pr_number)
+    # ``body`` is populated here so ``pr.fleet_digest`` review entries can
+    # carry the review's summary text without a second API call — the
+    # underlying ``list_pr_reviews`` call already fetches it (see
+    # :class:`GithubReview`), so this is pure projection, no extra traffic.
+    # A previous revision left ``body`` unmapped and the digest emitter's
+    # ``_truncate_body`` call was dead — bug caught in Copilot R1 on PR #41.
     reviews = [
         {
             "id": r.id,
             "reviewer": r.reviewer,
             "state": r.state,
+            "body": r.body or "",
             "submitted_at": r.submitted_at or "",
         }
         for r in reviews_raw
