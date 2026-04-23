@@ -374,7 +374,7 @@ class GithubClient:
         ]
         effective_blocking_reviews = [
             r for r in blocking_reviews
-            if not (copilot_comment and _is_copilot_login(r.reviewer))
+            if not (copilot_comment and is_copilot_login(r.reviewer))
         ]
         actionable_comments = len(review_comments)
         merge_state = str(pr.get("mergeable_state") or "unknown").lower()
@@ -545,7 +545,7 @@ def _latest_copilot_clear_comment(comments: list[dict], *, head_sha: str = "") -
         user = str(comment.get("user", "")).lower()
         body = str(comment.get("body", ""))
         body_lower = body.lower()
-        if not _is_copilot_login(user):
+        if not is_copilot_login(user):
             continue
         if not any(marker in body_lower for marker in clear_markers):
             continue
@@ -555,9 +555,25 @@ def _latest_copilot_clear_comment(comments: list[dict], *, head_sha: str = "") -
     return ""
 
 
-def _is_copilot_login(login: str) -> bool:
+def is_copilot_login(login: str) -> bool:
+    """Does ``login`` match any known Copilot auth variant?
+
+    Public helper — the single source of truth for Copilot-identity
+    matching across developer. Callers include
+    :func:`_latest_copilot_clear_comment` (local), the readiness gate
+    in :meth:`GithubClient.pr_readiness` (local), and
+    :func:`developer.pr_watcher.comment_looks_like_bot_verdict`
+    (cross-module).
+
+    Keeping the set in one place means a new Copilot variant only needs
+    to be added once. The historical private name (``_is_copilot_login``)
+    was promoted per PR #39 Copilot R3 to remove the duplicated login
+    set that had drifted between this module and pr_watcher.py.
+    """
     return login.lower() in {
+        "copilot",
         "copilot-swe-agent",
+        "copilot-swe-agent[bot]",
         "copilot-pull-request-reviewer",
         "copilot-pull-request-reviewer[bot]",
     }

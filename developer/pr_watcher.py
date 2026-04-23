@@ -42,7 +42,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
-from developer.github_client import GithubClient, GithubClientError
+from developer.github_client import GithubClient, GithubClientError, is_copilot_login
 
 logger = logging.getLogger(__name__)
 
@@ -108,13 +108,19 @@ def comment_looks_like_bot_verdict(body: str, author: str = "") -> bool:
     """
     if not body:
         return False
-    author_l = str(author or "").lower()
-    copilot_logins = {
-        "copilot-pull-request-reviewer[bot]",
-        "copilot-pull-request-reviewer",
-        "copilot",
-    }
-    if author_l not in copilot_logins:
+    # Share the Copilot-identity set with github_client rather than
+    # duplicating it here: a new auth variant (e.g. ``copilot-swe-agent``)
+    # only has to land once. Historically this module kept its own
+    # narrower set (``copilot`` / ``copilot-pull-request-reviewer`` only)
+    # that drifted out of sync with github_client's broader set; PR #39
+    # Copilot R3 flagged the duplication and consolidated on
+    # :func:`is_copilot_login`, which now carries the union of what both
+    # sites used to accept (plus the ``-swe-agent`` variants).
+    #
+    # ``is_copilot_login`` treats an empty string as not-copilot (the
+    # set doesn't contain ``""``), so the empty-author case naturally
+    # returns False without a separate guard.
+    if not is_copilot_login(author or ""):
         return False
     # First non-empty line of the body should start with ">" (a quote)
     # and mention @copilot please re-review.
@@ -375,7 +381,7 @@ class PRSnapshot:
     latest_inline_by: Optional[str] = None
     latest_inline_path: Optional[str] = None
     latest_inline_line: Optional[int] = None
-    latest_inline_body: str = ""
+    latest_inline_preview: str = ""
 
     def merge_ready(self) -> bool:
         """Strictly conservative merge-ready check.
@@ -1179,7 +1185,7 @@ def _populate_comment_summaries(snapshot: PRSnapshot) -> None:
         snapshot.latest_inline_path = latest.get("path")
         snapshot.latest_inline_line = latest.get("line")
         body = latest.get("body") or ""
-        snapshot.latest_inline_body = body[:COMMENT_PREVIEW_CHARS]
+        snapshot.latest_inline_preview = body[:COMMENT_PREVIEW_CHARS]
 
 
 def _pr_was_merged(pr: dict) -> bool:

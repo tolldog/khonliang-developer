@@ -25,6 +25,7 @@ from developer.agent import DeveloperAgent
 from developer.github_client import GithubClientError
 from developer.pr_watcher import (
     ALL_PR_TOPICS,
+    COMMENT_PREVIEW_CHARS,
     PRFleetWatcher,
     PRSnapshot,
     PRWatcherConfig,
@@ -1292,14 +1293,19 @@ async def test_snapshot_summary_fields_reflect_latest_non_self_entry(store):
     assert snap.latest_inline_by == "bot2"
     assert snap.latest_inline_path == "b.py"
     assert snap.latest_inline_line == 2
-    assert snap.latest_inline_body == "inline two"
+    assert snap.latest_inline_preview == "inline two"
 
 
 def test_comment_preview_truncates_at_500_chars():
-    """Summary ``latest_issue_comment_preview`` / ``latest_inline_body``
+    """Summary ``latest_issue_comment_preview`` / ``latest_inline_preview``
     cap at 500 chars to keep the snapshot bounded for fleet-digest use.
-    Event payloads carry the full body — only the preview is capped."""
-    long = "x" * 1200
+    Event payloads carry the full body — only the preview is capped.
+
+    Uses the ``COMMENT_PREVIEW_CHARS`` constant rather than the literal
+    ``500`` so the assertion tracks the module-level cap if it ever
+    moves; the constant is the source of truth.
+    """
+    long = "x" * (COMMENT_PREVIEW_CHARS * 2 + 200)
     snap = _make_snapshot_with_comments(
         external_issue_comments=[
             {"id": 1, "author": "u", "body": long, "posted_at": "t"},
@@ -1309,8 +1315,14 @@ def test_comment_preview_truncates_at_500_chars():
              "path": "a.py", "line": 1, "review_id": None},
         ],
     )
-    assert len(snap.latest_issue_comment_preview) == 500
-    assert len(snap.latest_inline_body) == 500
+    assert len(snap.latest_issue_comment_preview) == COMMENT_PREVIEW_CHARS
+    assert snap.latest_issue_comment_preview == "x" * COMMENT_PREVIEW_CHARS
+    assert len(snap.latest_inline_preview) == COMMENT_PREVIEW_CHARS
+    assert snap.latest_inline_preview == "x" * COMMENT_PREVIEW_CHARS
+    # Explicit upper-bound check — preview must be ≤ COMMENT_PREVIEW_CHARS
+    # per the field contract (truncation semantic), not == for all inputs.
+    assert len(snap.latest_inline_preview) <= COMMENT_PREVIEW_CHARS
+    assert len(snap.latest_issue_comment_preview) <= COMMENT_PREVIEW_CHARS
 
 
 # ---------------------------------------------------------------------------
@@ -1350,6 +1362,43 @@ def test_comment_classifier_rejects_generic_user_comment():
     ) is False
     # Empty body → False.
     assert comment_looks_like_bot_verdict("", author="Copilot") is False
+
+
+def test_comment_looks_like_bot_verdict_recognizes_copilot_swe_agent():
+    """Post-consolidation regression guard (PR #39 Copilot R3).
+
+    Before the consolidation ``comment_looks_like_bot_verdict``
+    maintained its own narrow Copilot-login set (only
+    ``copilot-pull-request-reviewer`` and bare ``copilot``) while
+    ``github_client.is_copilot_login`` accepted the broader set
+    including ``copilot-swe-agent``. A verdict-shaped body authored by
+    ``copilot-swe-agent`` would therefore be misclassified as a
+    non-bot comment in one place and as a bot comment in the other.
+
+    After R3 both sites consult the same helper, so a
+    ``copilot-swe-agent`` author IS now recognized here. This test
+    exists specifically to catch a regression if the two sets ever
+    drift apart again.
+    """
+    body = (
+        "> @copilot please re-review\n\n"
+        "Verdict from the SWE agent after autonomous fixup."
+    )
+    assert comment_looks_like_bot_verdict(
+        body, author="copilot-swe-agent",
+    ) is True
+    # The ``[bot]``-suffixed variant should likewise match — the
+    # consolidated set covers both auth variants.
+    assert comment_looks_like_bot_verdict(
+        body, author="copilot-swe-agent[bot]",
+    ) is True
+    # Non-Copilot bot logins must still be rejected — the classifier's
+    # author guard only trusts Copilot-shaped identities even when the
+    # body looks verdict-like. Prevents a friendly bot from quoting the
+    # trigger phrase and getting treated as a Copilot verdict.
+    assert comment_looks_like_bot_verdict(
+        body, author="dependabot[bot]",
+    ) is False
 
 
 def test_comment_classifier_tolerates_leading_blank_lines():
