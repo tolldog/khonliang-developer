@@ -227,7 +227,7 @@ class DogfoodStore:
             dogs = dogs[:effective_limit]
         return dogs
 
-    def triage_queue(self, *, limit: int = 10) -> list[Dogfood]:
+    def triage_queue(self, *, limit: Optional[int] = 10) -> list[Dogfood]:
         """Return the next entries to triage, oldest-first, rank-scored.
 
         Picks ``observed``-status only (not yet triaged / promoted /

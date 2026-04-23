@@ -703,6 +703,72 @@ def test_triage_dogfood_promote_to_fr_round_trip(pipeline):
     assert dog_after.observation == "friction worth an FR"
 
 
+def test_triage_dogfood_promote_to_bug_idempotent_reuse(pipeline):
+    """Re-promoting a dog to a bug reuses the existing bug_id.
+
+    Without the handler-level idempotency check, the retry would call
+    file_bug again, which raises on the deterministic id collision
+    BEFORE record_promotion can no-op. Verify the second call returns
+    the same bug_id with promotion_reused=True and does not raise or
+    create a second bug.
+    """
+    agent = _make_agent(pipeline)
+    dog = pipeline.dogfood.log_dogfood(
+        "retry friction bug", kind=DOGFOOD_KIND_FRICTION, target="developer",
+        observed_at=9_999_999_997.0,
+    )
+    first = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_bug",
+    }))
+    assert first["bug_id"].startswith("bug_developer_")
+    assert first["promotion_reused"] is False
+    bugs_before = len(pipeline.bugs.list_bugs(status="all"))
+
+    second = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_bug",
+    }))
+    assert "error" not in second
+    assert second["bug_id"] == first["bug_id"]
+    assert second["promotion_reused"] is True
+    assert second["status"] == DOGFOOD_STATUS_PROMOTED
+    # No duplicate bug row was created.
+    assert len(pipeline.bugs.list_bugs(status="all")) == bugs_before
+
+
+def test_triage_dogfood_promote_to_fr_idempotent_reuse(pipeline):
+    """Re-promoting a dog to an FR reuses the existing fr_id.
+
+    Mirror of the promote_to_bug idempotency test — FR promote() raises
+    on the deterministic id collision, so the handler must short-circuit
+    on already-promoted rows and return the existing fr_id.
+    """
+    agent = _make_agent(pipeline)
+    dog = pipeline.dogfood.log_dogfood(
+        "retry friction fr", kind=DOGFOOD_KIND_UX, target="developer",
+        observed_at=9_999_999_996.0,
+    )
+    first = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_fr",
+    }))
+    assert first["fr_id"].startswith("fr_developer_")
+    assert first["promotion_reused"] is False
+    frs_before = len(pipeline.frs.list(include_all=True))
+
+    second = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_fr",
+    }))
+    assert "error" not in second
+    assert second["fr_id"] == first["fr_id"]
+    assert second["promotion_reused"] is True
+    assert second["status"] == DOGFOOD_STATUS_PROMOTED
+    # No duplicate FR row was created.
+    assert len(pipeline.frs.list(include_all=True)) == frs_before
+
+
 def test_triage_dogfood_dismiss(pipeline):
     agent = _make_agent(pipeline)
     dog = pipeline.dogfood.log_dogfood("meh", observed_at=1.0)

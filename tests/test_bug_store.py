@@ -737,6 +737,40 @@ def test_triage_bug_idempotent_re_escalation(pipeline):
     assert len(pipeline.frs.list(include_all=True)) == frs_before
 
 
+def test_triage_bug_rejects_terminal_status_with_escalate(pipeline):
+    """status=<terminal> + escalate_to_fr=true must be refused up-front.
+
+    Without this guard the handler would close the bug first (making it
+    terminal), then call escalate_to_fr which refuses terminal bugs —
+    but the FR has already been created, leaving an orphan FR and an
+    inconsistent state. The up-front rejection must keep the FR count
+    unchanged AND leave the bug status un-mutated.
+    """
+    agent = _make_agent(pipeline)
+    filed = _run(agent.handle_file_bug({
+        "target": "developer",
+        "title": "terminal race",
+        "description": "would orphan an FR",
+    }))
+    frs_before = len(pipeline.frs.list(include_all=True))
+    status_before = pipeline.bugs.get_bug(filed["bug_id"]).status
+
+    for terminal in (BUG_STATUS_FIXED, BUG_STATUS_WONTFIX):
+        result = _run(agent.handle_triage_bug({
+            "bug_id": filed["bug_id"],
+            "status": terminal,
+            "escalate_to_fr": True,
+        }))
+        assert "error" in result
+        assert "escalate" in result["error"].lower()
+        assert "terminal" in result["error"].lower()
+
+    # No FR was created, and the bug's status was not advanced to the
+    # rejected terminal target.
+    assert len(pipeline.frs.list(include_all=True)) == frs_before
+    assert pipeline.bugs.get_bug(filed["bug_id"]).status == status_before
+
+
 def test_triage_bug_without_escalation_updates_severity_and_status(pipeline):
     agent = _make_agent(pipeline)
     filed = _run(agent.handle_file_bug({

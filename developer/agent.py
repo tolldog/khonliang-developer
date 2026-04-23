@@ -2097,7 +2097,7 @@ class DeveloperAgent(BaseAgent):
         and ``escalate_to_fr`` is true, return the existing linkage
         rather than creating another FR.
         """
-        from developer.bug_store import BugError
+        from developer.bug_store import BugError, TERMINAL_STATUSES
         from developer.fr_store import FRError
 
         bug_id = args.get("bug_id", "")
@@ -2109,6 +2109,20 @@ class DeveloperAgent(BaseAgent):
         bug = self.pipeline.bugs.get_bug(bug_id)
         if bug is None:
             return {"error": f"unknown bug id: {bug_id}", "bug_id": bug_id}
+
+        # Reject terminal+escalate in the same call up-front: otherwise the
+        # status transition would land first, then escalate_to_fr refuses the
+        # now-terminal bug — but the FR was already created, leaving an
+        # orphan FR and an inconsistent state. Callers that want both must
+        # escalate first, then close separately.
+        if escalate and status and status in TERMINAL_STATUSES:
+            msg = (
+                f"cannot escalate_to_fr with status={status!r} in the same call "
+                "(terminal transition would strand the created FR); "
+                "escalate first, then close separately"
+            )
+            await self._safe_report_gap("triage_bug", msg)
+            return {"error": msg, "bug_id": bug_id}
 
         try:
             if severity:
@@ -2245,6 +2259,27 @@ class DeveloperAgent(BaseAgent):
             }
 
         if action == "promote_to_bug":
+            # Idempotent re-promotion: if this dog has already been
+            # promoted to a bug, return that existing bug_id instead of
+            # calling file_bug again. The downstream id is deterministic
+            # in (target, title, description, observed_entity), so a retry
+            # of the full path would raise a collision on file_bug BEFORE
+            # record_promotion could no-op — leaving the handler stuck.
+            # Mirror triage_bug's escalation_reused flag so callers can
+            # tell it was a replay.
+            existing_bug_id = next(
+                (tid for tid in dog.promoted_to if tid.startswith("bug_")),
+                "",
+            )
+            if existing_bug_id:
+                return {
+                    "dog_id": dog.id,
+                    "status": dog.status,
+                    "action": action,
+                    "promoted_to": list(dog.promoted_to),
+                    "bug_id": existing_bug_id,
+                    "promotion_reused": True,
+                }
             try:
                 bug = self.pipeline.bugs.file_bug(
                     target=dog.target or "developer",
@@ -2270,9 +2305,24 @@ class DeveloperAgent(BaseAgent):
                 "action": action,
                 "promoted_to": list(dog.promoted_to),
                 "bug_id": bug.id,
+                "promotion_reused": False,
             }
 
         if action == "promote_to_fr":
+            # See promote_to_bug above — mirrored idempotency guard.
+            existing_fr_id = next(
+                (tid for tid in dog.promoted_to if tid.startswith("fr_")),
+                "",
+            )
+            if existing_fr_id:
+                return {
+                    "dog_id": dog.id,
+                    "status": dog.status,
+                    "action": action,
+                    "promoted_to": list(dog.promoted_to),
+                    "fr_id": existing_fr_id,
+                    "promotion_reused": True,
+                }
             try:
                 fr = self.pipeline.frs.promote(
                     target=dog.target or "developer",
@@ -2299,6 +2349,7 @@ class DeveloperAgent(BaseAgent):
                 "action": action,
                 "promoted_to": list(dog.promoted_to),
                 "fr_id": fr.id,
+                "promotion_reused": False,
             }
 
         return {
