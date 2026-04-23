@@ -1124,6 +1124,15 @@ async def test_suggest_integration_points_returns_error_on_persistence_failure(
     # The computed id is still surfaced for observability, just under a
     # name that won't accidentally be passed to distill.
     assert result.get("scan_id_unpersisted", "").startswith("scan_integration_")
+    # Hint must reflect the persistence failure and steer callers toward
+    # a retry rather than into a guaranteed distill-error path. PR #46
+    # Copilot R5 finding #2.
+    hint = result.get("hint", "")
+    assert "scan persistence failed" in hint
+    assert "re-run suggest_integration_points" in hint
+    # And specifically must NOT recommend distill_integration_points on
+    # an empty scan_id.
+    assert "distill_integration_points(scan_id" not in hint
 
 
 # ---------------------------------------------------------------------------
@@ -1340,3 +1349,155 @@ async def test_apply_llm_rationales_counts_attempts_including_failures():
     assert rationales_replaced == 3, (
         f"expected 3 successes / 2 failures; got {rationales_replaced} replacements"
     )
+
+
+# ---------------------------------------------------------------------------
+# Copilot R5 — _resolve_feature_surface requires <agent>.<skill> form
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_feature_surface_requires_agent_prefix(harness):
+    """A bare skill name (no ``agent.`` prefix) is ambiguous when multiple
+    agents expose the same skill, and first-match-wins is non-deterministic.
+    ``_resolve_feature_surface`` must reject the bare form with a clear
+    ``LookupError`` rather than silently picking the first registry row.
+
+    Regression for Copilot R5 finding #1.
+    """
+    # Stub registry: two agents expose a skill called ``health_check`` —
+    # the canonical ambiguity case. Before the fix, _resolve_feature_surface
+    # would silently return the first row; after, it must refuse to guess.
+    async def fake_skills(self):
+        return [
+            {
+                "agent_id": "developer-primary",
+                "name": "health_check",
+                "description": "primary health_check",
+            },
+            {
+                "agent_id": "researcher-primary",
+                "name": "health_check",
+                "description": "researcher health_check",
+            },
+        ]
+    harness.agent._fetch_remote_skills = fake_skills.__get__(harness.agent)
+
+    with pytest.raises(LookupError) as exc_info:
+        await harness.agent._resolve_feature_surface("skill", "health_check")
+    msg = str(exc_info.value)
+    assert "agent.skill" in msg
+    assert "health_check" in msg
+
+    # End-to-end: handler surfaces the LookupError as a clean error-dict
+    # rather than leaking the exception.
+    result = await harness.call(
+        "suggest_integration_points",
+        {"source": {"kind": "skill", "id": "health_check"}},
+    )
+    assert "error" in result
+    assert "agent.skill" in result["error"]
+
+    # Sanity check: the fully-qualified form still resolves fine.
+    surface = await harness.agent._resolve_feature_surface(
+        "skill", "developer-primary.health_check",
+    )
+    assert surface.id == "developer-primary.health_check"
+
+
+# ---------------------------------------------------------------------------
+# Copilot R5 — suggest_integration_points filters self-reference
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_suggest_integration_points_filters_self_reference(harness):
+    """A skill source must not be recommended as a ``direct_replace``
+    candidate against itself. Plant the SAME skill name on both the
+    source's agent (same ``(agent_id, skill_name)`` as source — must be
+    filtered) AND a different agent (legitimate duplicate — must surface).
+
+    Regression for Copilot R5 finding #1.
+    """
+    async def fake_skills(self):
+        return [
+            # The source skill itself — must be filtered as self-reference.
+            {
+                "agent_id": "developer-primary",
+                "name": "bug_triage",
+                "description": "primary bug_triage — this IS the source",
+            },
+            # Same name on a different agent — legitimate duplicate that
+            # should surface as direct_replace.
+            {
+                "agent_id": "developer-secondary",
+                "name": "bug_triage",
+                "description": "secondary bug_triage — legitimate duplicate",
+            },
+        ]
+    harness.agent._fetch_remote_skills = fake_skills.__get__(harness.agent)
+
+    result = await harness.call(
+        "suggest_integration_points",
+        {"source": {"kind": "skill", "id": "developer-primary.bug_triage"}},
+    )
+    assert "error" not in result, result
+
+    skill_callsites = [
+        c for c in result["top_candidates"]
+        if c["kind"] == "skill_callsite"
+        and c["signal"] == integration_scan.SIGNAL_DIRECT_REPLACE
+    ]
+    target_ids = {c["target_id"] for c in skill_callsites}
+
+    # Self-reference must NOT appear as a recommendation.
+    assert "developer-primary.bug_triage" not in target_ids, (
+        f"self-reference leaked into candidates: {target_ids!r}"
+    )
+    # Different-agent duplicate MUST appear — filtering must not be
+    # over-eager.
+    assert "developer-secondary.bug_triage" in target_ids, (
+        f"legitimate cross-agent duplicate missing: {target_ids!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Copilot R5 — _project_scan_response omits distill hint on persistence fail
+# ---------------------------------------------------------------------------
+
+
+def test_project_scan_response_omits_distill_hint_when_scan_id_empty(
+    temp_config_file,
+):
+    """When ``scan_id`` is empty (persistence failed), the hint must not
+    point callers at ``distill_integration_points`` — that would send them
+    into a guaranteed "scan_id is required" error. The hint must instead
+    explain the persistence failure and recommend the retry path.
+
+    Regression for Copilot R5 finding #2.
+    """
+    harness = AgentTestHarness(DeveloperAgent, config_path=str(temp_config_file()))
+
+    # Non-empty scan_id → hint points at distill (happy path).
+    resp_ok = harness.agent._project_scan_response(
+        scan_id="scan_integration_abc123",
+        source={"kind": "fr", "id": "fr_developer_x"},
+        ranked=[],
+        top_n=5,
+        detail="brief",
+    )
+    assert "distill_integration_points(scan_id" in resp_ok["hint"]
+
+    # Empty scan_id → hint explains the persistence failure.
+    resp_empty = harness.agent._project_scan_response(
+        scan_id="",
+        source={"kind": "fr", "id": "fr_developer_x"},
+        ranked=[],
+        top_n=5,
+        detail="brief",
+    )
+    hint = resp_empty["hint"]
+    assert "scan persistence failed" in hint
+    assert "re-run suggest_integration_points" in hint
+    # Must NOT mention distill — callers would hit an error.
+    assert "distill_integration_points(scan_id" not in hint

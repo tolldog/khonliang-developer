@@ -928,7 +928,23 @@ class DeveloperAgent(BaseAgent):
         except Exception as e:
             logger.warning("suggest_integration_points: bus skill fetch failed: %s", e)
             remote_skills = []
-        candidates.extend(integration_scan.scan_agent_skills(surface, remote_skills))
+        skill_candidates = integration_scan.scan_agent_skills(surface, remote_skills)
+        # Defensive self-reference filter. ``scan_agent_skills`` already
+        # excludes the source's own ``(agent_id, skill_name)`` pair when
+        # the source is itself a skill, but any future scan source that
+        # emits skill_callsite candidates could miss this gate. Filter
+        # here against the authoritative source identity so a scan can
+        # never recommend the feature replace itself. PR #46 Copilot R5.
+        if kind == "skill" and "." in source_id:
+            src_agent, src_skill = source_id.split(".", 1)
+            skill_candidates = [
+                c for c in skill_candidates
+                if not (
+                    c.metadata.get("agent_id") == src_agent
+                    and c.metadata.get("skill_name") == src_skill
+                )
+            ]
+        candidates.extend(skill_candidates)
 
         try:
             subscribers = await self._fetch_subscriber_counts(surface.new_events)
@@ -1246,22 +1262,33 @@ class DeveloperAgent(BaseAgent):
                 raise LookupError(
                     f"skill registry unavailable while resolving {source_id!r}: {e}"
                 ) from e
-            target_name = source_id
-            if "." in source_id:
-                agent_id, skill_name = source_id.split(".", 1)
-            else:
-                agent_id, skill_name = "", source_id
+            # Require fully-qualified ``<agent>.<skill>`` form. A bare
+            # skill name is ambiguous — multiple agents commonly expose
+            # the same name (``health_check``, ``file_bug``, …) and
+            # first-match-wins is non-deterministic. Worse, the resolved
+            # skill would often match itself against the scan (see
+            # ``_filter_self_reference_skill_candidates``), producing a
+            # nonsensical self-direct_replace suggestion. PR #46 Copilot R5.
+            if "." not in source_id:
+                raise LookupError(
+                    f"source_id must be 'agent.skill', got {source_id!r}"
+                )
+            agent_id, skill_name = source_id.split(".", 1)
+            if not agent_id or not skill_name:
+                raise LookupError(
+                    f"source_id must be 'agent.skill', got {source_id!r}"
+                )
             match = next(
                 (
                     row for row in skills
                     if row.get("name") == skill_name
-                    and (not agent_id or row.get("agent_id") == agent_id)
+                    and row.get("agent_id") == agent_id
                 ),
                 None,
             )
             if match is None:
                 raise LookupError(
-                    f"skill {target_name!r} not found in bus registry"
+                    f"skill {source_id!r} not found in bus registry"
                 )
             return integration_scan.extract_feature_surface_from_skill(
                 skill_id=source_id,
@@ -1366,15 +1393,29 @@ class DeveloperAgent(BaseAgent):
             projected = [c.to_compact() for c in top]
         else:
             projected = [c.to_brief() for c in top]
+        # Hint selection depends on whether the scan actually persisted.
+        # When ``scan_id`` is empty the handler has signalled a persistence
+        # failure (see ``handle_suggest_integration_points``); pointing
+        # callers at ``distill_integration_points`` would send them into
+        # a guaranteed "scan_id is required" error. Explain the situation
+        # and recommend the retry path instead. PR #46 Copilot R5.
+        if scan_id:
+            hint = (
+                "Use distill_integration_points(scan_id, top_n=..., signal=...) "
+                "to filter without rescanning"
+            )
+        else:
+            hint = (
+                "scan persistence failed; re-run suggest_integration_points "
+                "to retry — distill_integration_points is unavailable without "
+                "a persisted scan_id"
+            )
         response = {
             "scan_id": scan_id,
             "source": source,
             "total_candidates": len(ranked),
             "top_candidates": projected,
-            "hint": (
-                "Use distill_integration_points(scan_id, top_n=..., signal=...) "
-                "to filter without rescanning"
-            ),
+            "hint": hint,
         }
         if extra:
             response.update(extra)
