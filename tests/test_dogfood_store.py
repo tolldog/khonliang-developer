@@ -10,11 +10,14 @@ from khonliang.knowledge.store import KnowledgeStore
 
 from developer.dogfood_store import (
     DOGFOOD_KIND_BUG,
+    DOGFOOD_KIND_DOCS,
     DOGFOOD_KIND_FRICTION,
+    DOGFOOD_KIND_OTHER,
     DOGFOOD_KIND_UX,
     DOGFOOD_STATUS_DISMISSED,
     DOGFOOD_STATUS_DUPLICATE,
     DOGFOOD_STATUS_OBSERVED,
+    DOGFOOD_STATUS_PROMOTED,
     DOGFOOD_STATUS_TRIAGED,
     DogfoodError,
     DogfoodStore,
@@ -539,3 +542,246 @@ def test_handle_list_dogfood_preserves_explicit_none_for_no_cap(pipeline):
         "status": "all",
     }))
     assert result_default["count"] == 20
+
+
+# ---------------------------------------------------------------------------
+# Phase 2A: record_promotion / triage_queue / triage handlers
+# ---------------------------------------------------------------------------
+
+
+def test_record_promotion_preserves_observation_verbatim(store):
+    """Per-FR acceptance criterion: observation survives triage unchanged."""
+    dog = store.log_dogfood(
+        "the exact observation text",
+        kind=DOGFOOD_KIND_FRICTION,
+        target="researcher",
+        context="ctx",
+    )
+    original_observation = dog.observation
+    out = store.record_promotion(dog.id, "bug_x_1", "bug")
+    assert out.observation == original_observation
+    # Status and promoted_to flip; everything else stays.
+    assert out.status == DOGFOOD_STATUS_PROMOTED
+    assert out.promoted_to == ["bug_x_1"]
+
+
+def test_record_promotion_idempotent(store):
+    dog = store.log_dogfood("obs", observed_at=1.0)
+    store.record_promotion(dog.id, "bug_x_1", "bug")
+    before_notes = len(store.get_dogfood(dog.id).notes_history)
+    out = store.record_promotion(dog.id, "bug_x_1", "bug")
+    assert out.promoted_to == ["bug_x_1"]
+    assert len(out.notes_history) == before_notes
+
+
+def test_record_promotion_supports_multiple_targets(store):
+    dog = store.log_dogfood("obs", observed_at=1.0)
+    store.record_promotion(dog.id, "bug_a_1", "bug")
+    out = store.record_promotion(dog.id, "fr_a_2", "fr")
+    assert out.promoted_to == ["bug_a_1", "fr_a_2"]
+    assert out.status == DOGFOOD_STATUS_PROMOTED
+
+
+def test_record_promotion_refuses_dismissed(store):
+    dog = store.log_dogfood("obs", observed_at=1.0)
+    store.mark_dismissed(dog.id)
+    with pytest.raises(DogfoodError, match="terminal"):
+        store.record_promotion(dog.id, "bug_x_1", "bug")
+
+
+def test_record_promotion_rejects_bad_kind(store):
+    dog = store.log_dogfood("obs", observed_at=1.0)
+    with pytest.raises(DogfoodError, match="target_kind"):
+        store.record_promotion(dog.id, "xxx", "epic")
+
+
+def test_record_promotion_requires_non_empty_target(store):
+    dog = store.log_dogfood("obs", observed_at=1.0)
+    with pytest.raises(DogfoodError, match="target_id"):
+        store.record_promotion(dog.id, "", "bug")
+
+
+def test_triage_queue_observed_only(store):
+    # Observed (eligible)
+    obs1 = store.log_dogfood("obs1", kind=DOGFOOD_KIND_FRICTION, observed_at=10.0)
+    # Dismissed (not eligible)
+    obs2 = store.log_dogfood("obs2", observed_at=20.0)
+    store.mark_dismissed(obs2.id)
+    # Promoted (not eligible)
+    obs3 = store.log_dogfood("obs3", observed_at=30.0)
+    store.record_promotion(obs3.id, "bug_a_1", "bug")
+    queue = store.triage_queue(limit=10)
+    ids = [d.id for d in queue]
+    assert obs1.id in ids
+    assert obs2.id not in ids
+    assert obs3.id not in ids
+
+
+def test_triage_queue_orders_by_kind_priority_then_recency(store):
+    # Oldest docs entry — low kind priority.
+    d_docs_old = store.log_dogfood("docs old", kind=DOGFOOD_KIND_DOCS, observed_at=1.0)
+    # Newer bug entry — highest kind priority, newer recency.
+    d_bug_new = store.log_dogfood("bug new", kind=DOGFOOD_KIND_BUG, observed_at=100.0)
+    # Older bug entry — highest kind priority, older recency.
+    d_bug_old = store.log_dogfood("bug old", kind=DOGFOOD_KIND_BUG, observed_at=50.0)
+    # ux entry — middle priority.
+    d_ux = store.log_dogfood("ux", kind=DOGFOOD_KIND_UX, observed_at=200.0)
+    queue = store.triage_queue(limit=10)
+    ids = [d.id for d in queue]
+    # bugs come first (by kind priority), oldest-first within tier.
+    assert ids[0] == d_bug_old.id
+    assert ids[1] == d_bug_new.id
+    # then ux/friction tier (ux here).
+    assert d_ux.id in ids[2:]
+    # docs is lowest priority, comes after ux.
+    assert ids.index(d_ux.id) < ids.index(d_docs_old.id)
+
+
+def test_triage_queue_respects_limit(store):
+    for i in range(15):
+        store.log_dogfood(f"o{i}", observed_at=float(i))
+    queue = store.triage_queue(limit=5)
+    assert len(queue) == 5
+
+
+# -- triage_dogfood handler --
+
+
+def _make_agent(pipeline):
+    from developer.agent import DeveloperAgent
+    agent = DeveloperAgent(
+        agent_id="test-developer",
+        bus_url="http://localhost:8787",
+        config_path="unused",
+    )
+    agent._pipeline = pipeline
+    return agent
+
+
+def test_triage_dogfood_promote_to_bug_round_trip(pipeline):
+    """observation → promoted → bug exists → dog.promoted_to has bug_id."""
+    agent = _make_agent(pipeline)
+    dog = pipeline.dogfood.log_dogfood(
+        "captured friction", kind=DOGFOOD_KIND_FRICTION, target="developer",
+        observed_at=9_999_999_999.0,
+    )
+    original_observation = dog.observation
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_bug",
+    }))
+    assert result["status"] == DOGFOOD_STATUS_PROMOTED
+    assert result["bug_id"].startswith("bug_developer_")
+    bug = pipeline.bugs.get_bug(result["bug_id"])
+    assert bug is not None
+    assert "captured friction" in bug.description
+    # Observation must survive verbatim in the source dogfood row.
+    dog_after = pipeline.dogfood.get_dogfood(dog.id)
+    assert dog_after.observation == original_observation
+    assert result["bug_id"] in dog_after.promoted_to
+
+
+def test_triage_dogfood_promote_to_fr_round_trip(pipeline):
+    agent = _make_agent(pipeline)
+    dog = pipeline.dogfood.log_dogfood(
+        "friction worth an FR", kind=DOGFOOD_KIND_UX, target="developer",
+        observed_at=9_999_999_998.0,
+    )
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "promote_to_fr",
+    }))
+    assert result["status"] == DOGFOOD_STATUS_PROMOTED
+    assert result["fr_id"].startswith("fr_developer_")
+    fr = pipeline.frs.get(result["fr_id"])
+    assert fr is not None
+    # FR description references the source dog id (provenance).
+    assert dog.id in fr.description
+    dog_after = pipeline.dogfood.get_dogfood(dog.id)
+    assert result["fr_id"] in dog_after.promoted_to
+    # Observation survives triage verbatim.
+    assert dog_after.observation == "friction worth an FR"
+
+
+def test_triage_dogfood_dismiss(pipeline):
+    agent = _make_agent(pipeline)
+    dog = pipeline.dogfood.log_dogfood("meh", observed_at=1.0)
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "dismiss",
+        "notes": "out of scope",
+    }))
+    assert result["status"] == DOGFOOD_STATUS_DISMISSED
+
+
+def test_triage_dogfood_mark_duplicate(pipeline):
+    agent = _make_agent(pipeline)
+    original = pipeline.dogfood.log_dogfood("o1", observed_at=1.0)
+    dup = pipeline.dogfood.log_dogfood("o2", observed_at=2.0)
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dup.id,
+        "action": "mark_duplicate",
+        "target_id": original.id,
+    }))
+    assert result["status"] == DOGFOOD_STATUS_DUPLICATE
+    assert result["duplicate_of"] == original.id
+
+
+def test_triage_dogfood_mark_duplicate_requires_target(pipeline):
+    agent = _make_agent(pipeline)
+    dog = pipeline.dogfood.log_dogfood("o", observed_at=1.0)
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "mark_duplicate",
+    }))
+    assert "error" in result
+
+
+def test_triage_dogfood_unknown_action(pipeline):
+    agent = _make_agent(pipeline)
+    dog = pipeline.dogfood.log_dogfood("o", observed_at=1.0)
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": dog.id,
+        "action": "explode",
+    }))
+    assert "error" in result
+
+
+def test_triage_dogfood_unknown_id(pipeline):
+    agent = _make_agent(pipeline)
+    result = _run(agent.handle_triage_dogfood({
+        "dog_id": "dog_nope12",
+        "action": "dismiss",
+    }))
+    assert "error" in result
+
+
+# -- dogfood_triage_queue handler --
+
+
+def test_dogfood_triage_queue_handler_ordering(pipeline):
+    agent = _make_agent(pipeline)
+    # Seed a bug-kind and a docs-kind; bug outranks docs.
+    bug_kind = pipeline.dogfood.log_dogfood(
+        "latent bug", kind=DOGFOOD_KIND_BUG, observed_at=100.0,
+    )
+    pipeline.dogfood.log_dogfood(
+        "docs nit", kind=DOGFOOD_KIND_DOCS, observed_at=1_000.0,
+    )
+    result = _run(agent.handle_dogfood_triage_queue({"limit": 5}))
+    # First entry should be the bug-kind one.
+    first = result["dogfood"][0]
+    assert first["id"] == bug_kind.id
+
+
+def test_dogfood_triage_queue_default_detail_is_compact(pipeline):
+    agent = _make_agent(pipeline)
+    pipeline.dogfood.log_dogfood(
+        "x", kind=DOGFOOD_KIND_FRICTION, target="developer", observed_at=5.0,
+    )
+    result = _run(agent.handle_dogfood_triage_queue({}))
+    # compact_dict includes 'kind' and 'target'.
+    assert result["dogfood"]
+    first = result["dogfood"][0]
+    assert "kind" in first
+    assert "target" in first

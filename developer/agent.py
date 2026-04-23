@@ -553,6 +553,54 @@ class DeveloperAgent(BaseAgent):
                   {"dog_id": {"type": "string", "required": True},
                    "detail": {"type": "string", "default": "brief"}},
                   since="0.15.0"),
+            # Tracking-infrastructure Phase 2A (fr_developer_f669bd33 +
+            # fr_developer_1324440c): triage loop. Phase 2B (GH issue
+            # ingest, fr_developer_47271f34) is a separate follow-up PR.
+            Skill("triage_bug", "Triage a bug: optionally update severity/status "
+                  "and optionally escalate to a new FR (idempotent).",
+                  {"bug_id": {"type": "string", "required": True},
+                   "severity": {"type": "string", "default": "",
+                                "description": "optional new severity"},
+                   "status": {"type": "string", "default": "",
+                              "description": "optional new status (non-terminal only)"},
+                   "escalate_to_fr": {"type": "boolean", "default": False,
+                                      "description": "if true, create a companion FR "
+                                      "via promote_fr and wire linked_frs"},
+                   "notes": {"type": "string", "default": ""}},
+                  since="0.16.0"),
+            Skill("link_bug_fr", "Manually attach an existing FR to a bug. "
+                  "Idempotent: re-linking the same pair is a no-op.",
+                  {"bug_id": {"type": "string", "required": True},
+                   "fr_id": {"type": "string", "required": True}},
+                  since="0.16.0"),
+            Skill("triage_dogfood", "Triage a dogfood observation. Promotion "
+                  "preserves the original observation verbatim.",
+                  {"dog_id": {"type": "string", "required": True},
+                   "action": {"type": "string", "required": True,
+                              "description": "'promote_to_bug' / 'promote_to_fr' / "
+                              "'dismiss' / 'mark_duplicate'"},
+                   "target_id": {"type": "string", "default": "",
+                                 "description": "required for mark_duplicate — "
+                                 "the dog_id to de-duplicate against"},
+                   "notes": {"type": "string", "default": ""}},
+                  since="0.16.0"),
+            Skill("dogfood_triage_queue", "Ranked queue of observed-status "
+                  "dogfood entries for a periodic triage session.",
+                  {"limit": {"type": "integer", "default": 10},
+                   "detail": {"type": "string", "default": "compact"}},
+                  since="0.16.0"),
+            Skill("report_gap", "Report a capability gap (bus telemetry). "
+                  "Pass bug=true to also file a BugStore entry for the same "
+                  "gap; returns the new bug_id alongside the telemetry ack.",
+                  {"operation": {"type": "string", "required": True},
+                   "reason": {"type": "string", "required": True},
+                   "bug": {"type": "boolean", "default": False},
+                   "severity": {"type": "string", "default": "medium",
+                                "description": "severity for the filed bug (when bug=true)"},
+                   "target": {"type": "string", "default": "",
+                              "description": "optional bug target override; defaults "
+                              "to the agent's own type"}},
+                  since="0.16.0"),
         ]
 
     def register_collaborations(self):
@@ -2038,6 +2086,476 @@ class DeveloperAgent(BaseAgent):
         if detail == "compact":
             return dog.to_compact_dict()
         return dog.to_brief_dict()
+
+    # -- tracking infrastructure (Phase 2A: triage loop) --
+
+    @handler("triage_bug")
+    async def handle_triage_bug(self, args):
+        """Triage a bug: optional severity/status update + optional FR escalation.
+
+        Idempotent re-escalation: if the bug already has ``linked_frs``
+        and ``escalate_to_fr`` is true, return the existing linkage
+        rather than creating another FR.
+        """
+        from developer.bug_store import BugError
+        from developer.fr_store import FRError
+
+        bug_id = args.get("bug_id", "")
+        severity = args.get("severity", "") or ""
+        status = args.get("status", "") or ""
+        escalate = _bool_arg(args, "escalate_to_fr", False)
+        notes = args.get("notes", "")
+
+        bug = self.pipeline.bugs.get_bug(bug_id)
+        if bug is None:
+            return {"error": f"unknown bug id: {bug_id}", "bug_id": bug_id}
+
+        try:
+            if severity:
+                bug = self.pipeline.bugs.update_severity(bug_id, severity, notes=notes)
+            if status:
+                bug = self.pipeline.bugs.update_bug_status(bug_id, status, notes=notes)
+        except BugError as e:
+            await self._safe_report_gap("triage_bug", str(e))
+            return {"error": str(e), "bug_id": bug_id}
+
+        created_fr_id = ""
+        escalation_reused = False
+        if escalate:
+            if bug.linked_frs:
+                # Idempotent: don't double-create. Return the first linked
+                # FR as the "existing" escalation target.
+                created_fr_id = bug.linked_frs[0]
+                escalation_reused = True
+            else:
+                try:
+                    fr = self.pipeline.frs.promote(
+                        target=bug.target,
+                        title=f"[bug] {bug.title}",
+                        description=_compose_fr_description_from_bug(bug),
+                        priority=_severity_to_priority(bug.severity),
+                        concept="triage",
+                        classification="app",
+                        backing_papers=[bug.id],
+                    )
+                    created_fr_id = fr.id
+                except FRError as e:
+                    await self._safe_report_gap("triage_bug", str(e))
+                    return {"error": str(e), "bug_id": bug_id}
+                try:
+                    bug = self.pipeline.bugs.escalate_to_fr(
+                        bug_id, created_fr_id,
+                        notes=notes or "triage_bug",
+                    )
+                except BugError as e:
+                    await self._safe_report_gap("triage_bug", str(e))
+                    return {"error": str(e), "bug_id": bug_id}
+
+        response = {
+            "bug_id": bug.id,
+            "severity": bug.severity,
+            "status": bug.status,
+            "linked_frs": list(bug.linked_frs),
+            "updated_at": bug.updated_at,
+        }
+        if escalate:
+            response["escalated_fr_id"] = created_fr_id
+            response["escalation_reused"] = escalation_reused
+        return response
+
+    @handler("link_bug_fr")
+    async def handle_link_bug_fr(self, args):
+        """Manually attach an FR to a bug's linked_frs (idempotent)."""
+        from developer.bug_store import BugError
+        from developer.fr_store import FRError
+
+        bug_id = args.get("bug_id", "")
+        fr_id = args.get("fr_id", "")
+
+        # Validate the FR exists before recording the link — a dangling
+        # linked_frs entry would mask typos/drift. Follow redirects so
+        # linking a merged FR lands on the terminal id.
+        try:
+            fr = self.pipeline.frs.get(fr_id, follow_redirect=True)
+        except FRError as e:
+            await self._safe_report_gap("link_bug_fr", str(e))
+            return {"error": str(e), "bug_id": bug_id, "fr_id": fr_id}
+        if fr is None:
+            return {"error": f"unknown fr id: {fr_id}", "bug_id": bug_id, "fr_id": fr_id}
+
+        try:
+            bug = self.pipeline.bugs.escalate_to_fr(
+                bug_id, fr.id, notes="link_bug_fr",
+            )
+        except BugError as e:
+            await self._safe_report_gap("link_bug_fr", str(e))
+            return {"error": str(e), "bug_id": bug_id, "fr_id": fr_id}
+        return {
+            "bug_id": bug.id,
+            "fr_id": fr.id,
+            "linked_frs": list(bug.linked_frs),
+        }
+
+    @handler("triage_dogfood")
+    async def handle_triage_dogfood(self, args):
+        """Triage a dogfood observation.
+
+        Promote paths preserve the observation row verbatim — only
+        status and promoted_to change. Dismiss / mark_duplicate route
+        straight through to the Phase-1 terminal methods.
+        """
+        from developer.bug_store import BugError
+        from developer.dogfood_store import DogfoodError
+        from developer.fr_store import FRError
+
+        dog_id = args.get("dog_id", "")
+        action = args.get("action", "")
+        target_id = args.get("target_id", "") or ""
+        notes = args.get("notes", "")
+
+        dog = self.pipeline.dogfood.get_dogfood(dog_id)
+        if dog is None:
+            return {"error": f"unknown dog id: {dog_id}", "dog_id": dog_id}
+
+        if action == "dismiss":
+            try:
+                dog = self.pipeline.dogfood.mark_dismissed(dog_id, notes=notes)
+            except DogfoodError as e:
+                await self._safe_report_gap("triage_dogfood", str(e))
+                return {"error": str(e), "dog_id": dog_id}
+            return {
+                "dog_id": dog.id,
+                "status": dog.status,
+                "action": action,
+            }
+
+        if action == "mark_duplicate":
+            if not target_id:
+                return {"error": "mark_duplicate requires target_id", "dog_id": dog_id}
+            try:
+                dog = self.pipeline.dogfood.mark_duplicate(dog_id, target_id)
+            except DogfoodError as e:
+                await self._safe_report_gap("triage_dogfood", str(e))
+                return {"error": str(e), "dog_id": dog_id}
+            return {
+                "dog_id": dog.id,
+                "status": dog.status,
+                "action": action,
+                "duplicate_of": dog.duplicate_of,
+            }
+
+        if action == "promote_to_bug":
+            try:
+                bug = self.pipeline.bugs.file_bug(
+                    target=dog.target or "developer",
+                    title=_title_from_observation(dog.observation),
+                    description=_compose_bug_description_from_dogfood(dog),
+                    observed_entity=dog.context,
+                    severity=_kind_to_severity(dog.kind),
+                    reporter=dog.reporter,
+                )
+            except BugError as e:
+                await self._safe_report_gap("triage_dogfood", str(e))
+                return {"error": str(e), "dog_id": dog_id}
+            try:
+                dog = self.pipeline.dogfood.record_promotion(
+                    dog_id, bug.id, "bug", notes=notes or "triage_dogfood",
+                )
+            except DogfoodError as e:
+                await self._safe_report_gap("triage_dogfood", str(e))
+                return {"error": str(e), "dog_id": dog_id}
+            return {
+                "dog_id": dog.id,
+                "status": dog.status,
+                "action": action,
+                "promoted_to": list(dog.promoted_to),
+                "bug_id": bug.id,
+            }
+
+        if action == "promote_to_fr":
+            try:
+                fr = self.pipeline.frs.promote(
+                    target=dog.target or "developer",
+                    title=f"[dogfood] {_title_from_observation(dog.observation)}",
+                    description=_compose_fr_description_from_dogfood(dog),
+                    priority=_kind_to_priority(dog.kind),
+                    concept="dogfood",
+                    classification="app",
+                    backing_papers=[dog.id],
+                )
+            except FRError as e:
+                await self._safe_report_gap("triage_dogfood", str(e))
+                return {"error": str(e), "dog_id": dog_id}
+            try:
+                dog = self.pipeline.dogfood.record_promotion(
+                    dog_id, fr.id, "fr", notes=notes or "triage_dogfood",
+                )
+            except DogfoodError as e:
+                await self._safe_report_gap("triage_dogfood", str(e))
+                return {"error": str(e), "dog_id": dog_id}
+            return {
+                "dog_id": dog.id,
+                "status": dog.status,
+                "action": action,
+                "promoted_to": list(dog.promoted_to),
+                "fr_id": fr.id,
+            }
+
+        return {
+            "error": f"unknown action: {action!r} "
+                     "(expected promote_to_bug / promote_to_fr / dismiss / mark_duplicate)",
+            "dog_id": dog_id,
+        }
+
+    @handler("dogfood_triage_queue")
+    async def handle_dogfood_triage_queue(self, args):
+        """Ranked queue of observed-status dogfood entries.
+
+        Designed as input to a periodic triage session — oldest urgent
+        items first. Rank is kind-priority × recency; see
+        :meth:`DogfoodStore.triage_queue`.
+        """
+        from developer.dogfood_store import DogfoodError
+
+        detail = args.get("detail", "compact")
+        _MISSING = object()
+        raw_limit = args.get("limit", _MISSING)
+        if raw_limit is _MISSING:
+            limit = 10
+        elif raw_limit is None:
+            limit = None
+        else:
+            try:
+                limit = int(raw_limit)
+            except (TypeError, ValueError):
+                limit = 10
+        if limit is not None and limit < 0:
+            limit = 0
+
+        try:
+            dogs = self.pipeline.dogfood.triage_queue(limit=limit)
+        except DogfoodError as e:
+            return {"error": str(e)}
+
+        if detail == "full":
+            serialized = [d.to_public_dict() for d in dogs]
+        elif detail == "brief":
+            serialized = [d.to_brief_dict() for d in dogs]
+        else:
+            serialized = [d.to_compact_dict() for d in dogs]
+        return {"count": len(dogs), "dogfood": serialized}
+
+    @handler("report_gap")
+    async def handle_report_gap(self, args):
+        """Bus-exposed report_gap with optional bug filing.
+
+        Thin wrapper around :meth:`report_gap`. Fires the normal
+        telemetry event (so subscribers see the gap), and when
+        ``bug=True`` also calls :meth:`BugStore.file_bug` so the gap
+        lands in the tracker alongside the bus event. Returns the
+        created bug_id when applicable.
+        """
+        operation = (args.get("operation", "") or "").strip()
+        reason = (args.get("reason", "") or "").strip()
+        if not operation or not reason:
+            return {"error": "report_gap requires non-empty operation and reason"}
+        file_bug = _bool_arg(args, "bug", False)
+        severity = (args.get("severity", "medium") or "medium").strip() or "medium"
+        target_override = (args.get("target", "") or "").strip()
+
+        result = await self.report_gap(operation, reason, bug=file_bug,
+                                       severity=severity, target=target_override)
+        # Always return the telemetry acknowledgement shape so callers
+        # can tell the event fired; ``result`` is a dict when the
+        # developer-level wrapper handled it (both True and False
+        # paths), and the shape matches ``{event, operation, reason,
+        # bug_id?}``.
+        return result
+
+    # ------------------------------------------------------------------
+    # report_gap override
+    # ------------------------------------------------------------------
+
+    async def report_gap(
+        self,
+        operation: str,
+        reason: str,
+        context: dict | None = None,
+        *,
+        bug: bool = False,
+        severity: str = "medium",
+        target: str = "",
+    ) -> dict:
+        """Developer-side override of :meth:`BaseAgent.report_gap`.
+
+        Fires the normal bus telemetry event (preserving Phase 1
+        behavior for every in-tree caller that uses the 3-arg form),
+        then optionally also files a BugStore entry when ``bug=True``.
+
+        Signature is backward-compatible: every existing caller
+        (``self.report_gap(op, reason)`` / ``self.report_gap(op, reason,
+        {context})``) keeps working because the new keyword arguments
+        default to ``bug=False``.
+
+        Returns a dict with the acknowledgement payload. The base
+        BaseAgent.report_gap returns None; returning a dict here is
+        additive — existing callers that ``await`` without consuming
+        the return value aren't affected. Callers that pass ``bug=True``
+        get the ``bug_id`` in the payload.
+
+        Best-effort bus send: if the bus isn't connected (tests / dry
+        runs) we swallow the ``RuntimeError`` so the bug-file path still
+        lands. Developer-triage loops need the bug tracker to stay
+        authoritative regardless of bus reachability.
+        """
+        bus_ack = {"event": "gap.observed", "operation": operation, "reason": reason}
+        try:
+            await super().report_gap(operation, reason, context)
+        except RuntimeError:
+            # Not bus-connected — the telemetry half is a no-op but the
+            # bug half still runs. Mark the ack so callers can tell.
+            bus_ack["event"] = "gap.not_sent"
+
+        if not bug:
+            return bus_ack
+
+        try:
+            filed = self.pipeline.bugs.file_bug(
+                target=target or self.agent_type,
+                title=_gap_bug_title(operation, reason),
+                description=_gap_bug_description(operation, reason, context),
+                observed_entity=operation,
+                severity=severity,
+                reporter=self.agent_id or self.agent_type,
+            )
+        except Exception as e:
+            # Filing the bug is best-effort; surface the failure in the
+            # ack but don't raise — report_gap callers use this from
+            # inside except-branches and raising here would mask the
+            # original problem.
+            bus_ack["bug_error"] = str(e)
+            return bus_ack
+
+        bus_ack["bug_id"] = filed.id
+        return bus_ack
+
+
+# ---------------------------------------------------------------------------
+# Phase 2A triage helpers
+#
+# Shared between ``triage_bug`` / ``triage_dogfood`` / ``report_gap``. Kept
+# module-level (not class methods) because they're pure — they transform
+# dogfood/bug fields into FR/bug seed fields without touching stores.
+# ---------------------------------------------------------------------------
+
+
+def _title_from_observation(observation: str, *, max_len: int = 72) -> str:
+    """Shorten an observation to a single-line title for a downstream record.
+
+    Keeps the first line; truncates at ``max_len`` with an ellipsis. The
+    bug/FR stores both have their own length constraints and prefer
+    one-line titles.
+    """
+    line = (observation or "").strip().splitlines()[0] if observation and observation.strip() else ""
+    if len(line) <= max_len:
+        return line or "(unnamed observation)"
+    return line[: max_len - 1].rstrip() + "…"
+
+
+def _compose_bug_description_from_dogfood(dog) -> str:
+    """Seed a BugStore description from a dogfood observation.
+
+    Preserves full observation text verbatim and records the source
+    dog_id for provenance. The downstream bug's own ``description``
+    field is what appears in the tracker; adding the dog_id into the
+    body (not just metadata) means a human reading the bug in isolation
+    still sees the chain-of-custody.
+    """
+    parts = [dog.observation.strip()]
+    if dog.context:
+        parts.append(f"Context: {dog.context.strip()}")
+    parts.append(f"Promoted from dogfood observation {dog.id}.")
+    return "\n\n".join(parts)
+
+
+def _compose_fr_description_from_dogfood(dog) -> str:
+    """Seed an FR description from a dogfood observation."""
+    parts = [dog.observation.strip()]
+    if dog.context:
+        parts.append(f"Context: {dog.context.strip()}")
+    parts.append(f"Promoted from dogfood observation {dog.id}.")
+    return "\n\n".join(parts)
+
+
+def _compose_fr_description_from_bug(bug) -> str:
+    """Seed an FR description from a bug escalation.
+
+    Per spec: "call the existing ``promote_fr`` skill with the bug's
+    title/description/reproduction as seed; backing reference points at
+    the bug id." The description in the FR body explicitly references
+    the bug id so a reader of the FR alone sees the provenance.
+    """
+    parts = [bug.description.strip()]
+    if bug.reproduction:
+        parts.append(f"Reproduction: {bug.reproduction.strip()}")
+    parts.append(f"Escalated from bug {bug.id} (severity={bug.severity}).")
+    return "\n\n".join(parts)
+
+
+def _severity_to_priority(severity: str) -> str:
+    """Map a bug severity to an FR priority for escalation.
+
+    ``blocker``/``high`` -> FR ``high``; ``medium`` -> ``medium``;
+    ``low`` -> ``low``. A blocker bug converts to a high-priority FR
+    because there's no ``blocker`` priority in FRStore.
+    """
+    mapping = {
+        "blocker": "high",
+        "high": "high",
+        "medium": "medium",
+        "low": "low",
+    }
+    return mapping.get(severity, "medium")
+
+
+def _kind_to_severity(kind: str) -> str:
+    """Map a dogfood kind to a bug severity for promote_to_bug.
+
+    ``bug`` kinds land at medium by default (they were logged as
+    friction-shaped bugs — real severity emerges in subsequent
+    triage); ux/friction/docs also default to medium so the tracker
+    doesn't silently downgrade unreviewed captures. Callers can pass a
+    triage override on a later ``triage_bug`` call.
+    """
+    return "medium"
+
+
+def _kind_to_priority(kind: str) -> str:
+    """Map a dogfood kind to an FR priority for promote_to_fr."""
+    return "medium"
+
+
+def _gap_bug_title(operation: str, reason: str, *, max_len: int = 72) -> str:
+    """Title for a gap-sourced bug.
+
+    Front-loads the operation name so the tracker reads well when
+    scanning: ``[gap] promote_fr: backing_papers parse failure``.
+    """
+    base = f"[gap] {operation}: {reason}"
+    if len(base) <= max_len:
+        return base
+    return base[: max_len - 1].rstrip() + "…"
+
+
+def _gap_bug_description(operation: str, reason: str, context: dict | None) -> str:
+    """Description body for a gap-sourced bug."""
+    parts = [f"Capability gap observed in {operation}: {reason}"]
+    if context:
+        try:
+            parts.append("Context: " + json.dumps(context, default=str, sort_keys=True))
+        except (TypeError, ValueError):
+            parts.append(f"Context: {context!r}")
+    return "\n\n".join(parts)
 
 
 def _parse_paths(value) -> list[str]:

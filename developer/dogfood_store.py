@@ -1,8 +1,14 @@
 """Developer-owned dogfood (friction/UX) store.
 
-Phase 1 of the tracking-infrastructure stack (``fr_developer_1324440c``).
-CRUD-only slice: log, list, get, mark dismissed, mark duplicate. Triage
-promotion (to BugStore and FRStore) is deferred to Phase 2.
+Phase 1 of the tracking-infrastructure stack (``fr_developer_1324440c``)
+defined the CRUD slice: log, list, get, mark dismissed, mark duplicate.
+Phase 2A layers the promotion path on top: :meth:`DogfoodStore.
+record_promotion` is the authoritative mutation for stamping an
+observation as promoted to a bug or FR while **preserving the original
+observation verbatim** — the spec's per-FR acceptance criterion for
+provenance. Cross-store orchestration (filing the downstream bug/FR)
+lives at the agent handler level; this module stays free of bug/FR
+knowledge.
 
 Mirrors :mod:`developer.fr_store` on storage: one ``Tier.DERIVED``
 ``KnowledgeEntry`` per observation, tagged ``dogfood``.
@@ -221,6 +227,61 @@ class DogfoodStore:
             dogs = dogs[:effective_limit]
         return dogs
 
+    def triage_queue(self, *, limit: int = 10) -> list[Dogfood]:
+        """Return the next entries to triage, oldest-first, rank-scored.
+
+        Picks ``observed``-status only (not yet triaged / promoted /
+        dismissed / duplicate), then ranks by a blend of recency and a
+        per-kind priority so the output is a useful periodic-triage
+        input rather than an insertion-ordered dump.
+
+        Scoring rationale:
+            - recency term (``observed_at``) is ascending — oldest
+              unresolved friction sinks to the top so stale captures
+              aren't forgotten.
+            - kind_priority nudges ``bug`` > ``ux`` / ``friction`` >
+              ``docs`` / ``other`` — a latent bug observation is more
+              urgent to convert than a docs nit.
+
+        The score is stable (pure function of stored fields), so the
+        order is deterministic across identical inputs. ``limit`` caps
+        the return size; pass ``None`` for no cap. Negative values are
+        normalized to ``0``.
+        """
+        # kind_priority: lower int means triage sooner. ``bug`` first
+        # because an un-triaged bug is a latent defect masquerading as
+        # friction; ``docs`` / ``other`` last because they rarely block
+        # real work.
+        kind_priority = {
+            DOGFOOD_KIND_BUG: 0,
+            DOGFOOD_KIND_UX: 1,
+            DOGFOOD_KIND_FRICTION: 1,
+            DOGFOOD_KIND_DOCS: 2,
+            DOGFOOD_KIND_OTHER: 3,
+        }
+
+        entries = self.knowledge.get_by_tier(Tier.DERIVED)
+        dogs: list[Dogfood] = []
+        for entry in entries:
+            if "dogfood" not in (entry.tags or []):
+                continue
+            d = _dogfood_from_entry(entry)
+            if d.status != DOGFOOD_STATUS_OBSERVED:
+                continue
+            dogs.append(d)
+
+        # Sort key: (kind_priority asc, observed_at asc) — oldest urgent
+        # items first. Tie-breaks on id for deterministic ordering.
+        dogs.sort(key=lambda d: (
+            kind_priority.get(d.kind, 99),
+            d.observed_at,
+            d.id,
+        ))
+        if limit is not None:
+            effective_limit = max(int(limit), 0)
+            dogs = dogs[:effective_limit]
+        return dogs
+
     # ------------------------------------------------------------------
     # Write paths
     # ------------------------------------------------------------------
@@ -303,6 +364,71 @@ class DogfoodStore:
             "at": now,
             "status": DOGFOOD_STATUS_DISMISSED,
             "notes": notes or "dismissed",
+        })
+        dog.updated_at = now
+        self._store(dog)
+        return dog
+
+    def record_promotion(
+        self,
+        dog_id: str,
+        target_id: str,
+        target_kind: str,
+        *,
+        notes: str = "",
+    ) -> Dogfood:
+        """Mark ``dog_id`` as promoted to a bug or FR.
+
+        Authoritative mutation path for Phase 2A's dogfood->(bug|FR)
+        wiring. The agent-layer ``triage_dogfood`` handler calls this
+        after creating (or identifying) the downstream record.
+
+        **Preserves the observation verbatim.** Only ``status``,
+        ``promoted_to``, and ``notes_history`` change; the observation
+        text stays intact. This is the spec's per-FR acceptance
+        criterion for provenance — the original friction report must
+        survive triage.
+
+        Idempotent: promoting to the same target twice is a no-op (no
+        duplicate entry in ``promoted_to``, no audit noise). Allows
+        promoting to multiple distinct targets (e.g. one bug + one FR)
+        — in that case ``promoted_to`` grows; ``status`` stays
+        ``promoted``.
+
+        ``target_kind`` must be ``bug`` or ``fr``. Promotion is terminal
+        for the observation's lifecycle as friction-triage input, but
+        the row itself remains readable.
+        """
+        target_id = (target_id or "").strip()
+        if not target_id:
+            raise DogfoodError("target_id must be non-empty")
+        if target_kind not in {"bug", "fr"}:
+            raise DogfoodError(
+                f"target_kind must be 'bug' or 'fr', got {target_kind!r}"
+            )
+        dog = self.get_dogfood(dog_id)
+        if dog is None:
+            raise DogfoodError(f"unknown dogfood id: {dog_id}")
+        # A dogfood entry that's already terminally dismissed or a
+        # duplicate shouldn't be promoted — the terminal transition is
+        # an explicit curation decision. A row already ``promoted`` can
+        # pick up additional downstream targets (see idempotent clause).
+        if dog.status in {DOGFOOD_STATUS_DISMISSED, DOGFOOD_STATUS_DUPLICATE}:
+            raise DogfoodError(
+                f"cannot promote {dog_id}: status is {dog.status!r} (terminal)"
+            )
+        if target_id in dog.promoted_to:
+            return dog  # idempotent
+        now = time.time()
+        dog.promoted_to.append(target_id)
+        dog.status = DOGFOOD_STATUS_PROMOTED
+        audit = f"promoted to {target_kind} {target_id}"
+        if notes:
+            audit = f"{audit} ({notes})"
+        dog.notes_history.append({
+            "at": now,
+            "status": DOGFOOD_STATUS_PROMOTED,
+            "notes": audit,
         })
         dog.updated_at = now
         self._store(dog)

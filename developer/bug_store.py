@@ -1,9 +1,13 @@
 """Developer-owned bug store.
 
-Phase 1 of the tracking-infrastructure stack (``fr_developer_f669bd33``).
-CRUD-only slice: creation, lookup, lifecycle status, PR linkage, closure,
-duplicate marking, and list/filter. Triage promotion (to FRs) and
-``report_gap`` integration are deferred to Phase 2.
+Phase 1 of the tracking-infrastructure stack (``fr_developer_f669bd33``)
+defined the CRUD slice: creation, lookup, lifecycle status, PR linkage,
+closure, duplicate marking, and list/filter. Phase 2A layers the triage
+path on top: :meth:`BugStore.escalate_to_fr` is the authoritative
+mutation for wiring a bug to an FR (idempotent, audit-tracked).
+Cross-store orchestration (calling ``promote_fr`` then escalating) lives
+at the agent handler level; this module stays free of FR-store
+knowledge.
 
 Mirrors :mod:`developer.fr_store` on storage: one ``Tier.DERIVED``
 ``KnowledgeEntry`` per bug, tagged ``bug``. Keeps the store independent
@@ -399,6 +403,89 @@ class BugStore:
         bug.status = resolution
         bug.notes_history.append({
             "at": now, "status": resolution, "notes": f"closed as {resolution}",
+        })
+        bug.updated_at = now
+        self._store(bug)
+        return bug
+
+    def update_severity(self, bug_id: str, severity: str, *, notes: str = "") -> Bug:
+        """Change a bug's severity (triage adjustment).
+
+        Non-terminal only: a ``fixed`` / ``wontfix`` / ``duplicate`` bug
+        keeps its severity for historical accuracy. Idempotent — setting
+        the same severity appends a note only if one was supplied.
+        """
+        if severity not in ALLOWED_SEVERITIES:
+            raise BugError(
+                f"severity must be one of {sorted(ALLOWED_SEVERITIES)}, got {severity!r}"
+            )
+        bug = self.get_bug(bug_id)
+        if bug is None:
+            raise BugError(f"unknown bug id: {bug_id}")
+        if bug.status in TERMINAL_STATUSES:
+            raise BugError(
+                f"cannot update severity on {bug_id}: status is {bug.status!r} (terminal)"
+            )
+        now = time.time()
+        if bug.severity == severity:
+            if notes:
+                bug.notes_history.append({
+                    "at": now, "status": bug.status, "notes": notes,
+                })
+                bug.updated_at = now
+                self._store(bug)
+            return bug
+        old = bug.severity
+        bug.severity = severity
+        audit = f"severity {old}->{severity}"
+        if notes:
+            audit = f"{audit} ({notes})"
+        bug.notes_history.append({
+            "at": now, "status": bug.status, "notes": audit,
+        })
+        bug.updated_at = now
+        self._store(bug)
+        return bug
+
+    def escalate_to_fr(self, bug_id: str, fr_id: str, *, notes: str = "") -> Bug:
+        """Attach ``fr_id`` to ``bug_id.linked_frs`` (idempotent).
+
+        Authoritative mutation path for Phase 2A's bug->FR wiring. The
+        agent-layer ``triage_bug`` and ``link_bug_fr`` handlers both call
+        this after deciding which FR to link.
+
+        Idempotent: linking an fr_id that's already in ``linked_frs`` is
+        a no-op (no duplicate entry, no audit noise). This is the
+        property the spec calls out — "calling twice with the same pair
+        is idempotent."
+
+        Terminal bugs refuse escalation; once a bug is fixed / wontfix /
+        duplicate the linkage graph is frozen.
+
+        Also tolerates the bug not being in an ``active`` status — a
+        ``triaged`` or ``in_progress`` bug can still pick up additional
+        linked FRs, and so can a still-``open`` one (the initial escalate
+        happens before status changes land).
+        """
+        fr_id = (fr_id or "").strip()
+        if not fr_id:
+            raise BugError("fr_id must be non-empty")
+        bug = self.get_bug(bug_id)
+        if bug is None:
+            raise BugError(f"unknown bug id: {bug_id}")
+        if bug.status in TERMINAL_STATUSES:
+            raise BugError(
+                f"cannot escalate {bug_id}: status is {bug.status!r} (terminal)"
+            )
+        if fr_id in bug.linked_frs:
+            return bug  # idempotent
+        now = time.time()
+        bug.linked_frs.append(fr_id)
+        audit = f"escalated to {fr_id}"
+        if notes:
+            audit = f"{audit} ({notes})"
+        bug.notes_history.append({
+            "at": now, "status": bug.status, "notes": audit,
         })
         bug.updated_at = now
         self._store(bug)
