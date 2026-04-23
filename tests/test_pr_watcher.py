@@ -32,6 +32,7 @@ from developer.pr_watcher import (
     PRWatcherRegistry,
     PRWatcherStore,
     TOPIC_COMMENT_POSTED,
+    TOPIC_FLEET_DIGEST,
     TOPIC_INLINE_FINDING,
     TOPIC_MERGED,
     TOPIC_MERGE_READY,
@@ -142,7 +143,29 @@ def _make_watcher(
 
 
 def _topics(events: list[tuple[str, dict]]) -> list[str]:
-    return [t for t, _ in events]
+    """Granular-only topic list.
+
+    Filters out :data:`TOPIC_FLEET_DIGEST` — existing tests pre-date
+    fr_developer_fafb36f1 and assert exact equality against the
+    granular event sequence. The digest event is additive (emitted once
+    per poll cycle in addition to the granular ones); keeping it out of
+    this helper preserves the historical invariants those assertions
+    capture. Tests that specifically exercise the digest opt in via
+    ``[t for t, _ in events if t == TOPIC_FLEET_DIGEST]``.
+    """
+    return [t for t, _ in events if t != TOPIC_FLEET_DIGEST]
+
+
+def _granular(events: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
+    """Granular-only event list (topic + payload).
+
+    Companion to :func:`_topics` for tests that positionally index into
+    ``published`` expecting only the granular ``pr.*`` events. Lets
+    those tests keep their original ``published[n]`` assertions without
+    having to reason about where in the interleaved stream the digest
+    lands.
+    """
+    return [(t, p) for t, p in events if t != TOPIC_FLEET_DIGEST]
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +186,7 @@ async def test_full_transition_cycle_emits_each_event_once(store):
     emitted = await watcher.poll_once()
     assert emitted == 1
     assert _topics(published) == [TOPIC_NEW_COMMIT]
-    assert published[0][1]["head_sha"] == "abc123"
+    assert _granular(published)[0][1]["head_sha"] == "abc123"
 
     # Cycle 2: first review lands (Copilot, APPROVED). Expect one
     # pr.review_landed with the review id and reviewer; no duplicate
@@ -180,7 +203,7 @@ async def test_full_transition_cycle_emits_each_event_once(store):
     emitted = await watcher.poll_once()
     assert emitted == 1
     assert _topics(published) == [TOPIC_NEW_COMMIT, TOPIC_REVIEW_LANDED]
-    payload = published[1][1]
+    payload = _granular(published)[1][1]
     assert payload["review_id"] == 111
     assert payload["reviewer"] == "copilot-pull-request-reviewer[bot]"
     assert payload["state"] == "APPROVED"
@@ -214,8 +237,8 @@ async def test_full_transition_cycle_emits_each_event_once(store):
     assert _topics(published) == [
         TOPIC_NEW_COMMIT, TOPIC_REVIEW_LANDED, TOPIC_REVIEW_LANDED,
     ]
-    assert published[2][1]["review_id"] == 222
-    assert published[2][1]["reviewer"] == "tolldog"
+    assert _granular(published)[2][1]["review_id"] == 222
+    assert _granular(published)[2][1]["reviewer"] == "tolldog"
 
 
 async def test_new_commit_fires_once_per_head_sha(store):
@@ -1894,3 +1917,550 @@ async def test_list_open_pr_numbers_propagates_cancellation():
 
     with pytest.raises(asyncio.CancelledError):
         await _list_open_pr_numbers(_GhStub(), "owner/repo")
+
+
+# ---------------------------------------------------------------------------
+# fr_developer_fafb36f1: pr_fleet_status snapshot + pr.fleet_digest event.
+#
+# pr_fleet_status is the one-shot read: walk every live watcher, project its
+# cached PR snapshots into a compact shape. pr.fleet_digest is the per-cycle
+# aggregate event that fires only when at least one transition fired in that
+# cycle.
+# ---------------------------------------------------------------------------
+
+
+def _digest_events(published: list[tuple[str, dict]]) -> list[dict]:
+    """Extract the ``pr.fleet_digest`` payloads from the captured stream."""
+    return [p for t, p in published if t == TOPIC_FLEET_DIGEST]
+
+
+async def _start_registry_watcher(
+    *,
+    store: PRWatcherStore,
+    gh: _FakeGithub,
+    publish,
+    pr_numbers: list[int],
+    repos: list[str] | None = None,
+) -> tuple[PRWatcherRegistry, str]:
+    """Spin up a :class:`PRWatcherRegistry` backed by ``_FakeGithub`` and
+    start a single watcher. Returns the registry + the watcher id.
+
+    Used by ``pr_fleet_status`` tests that need the registry walk path
+    rather than a bare ``PRFleetWatcher`` — the skill reads from
+    :meth:`PRWatcherRegistry.fleet_snapshot`, which consults
+    :meth:`PRFleetWatcher.latest_snapshots` via the live handle.
+    """
+    def factory(config: PRWatcherConfig) -> PRFleetWatcher:
+        return PRFleetWatcher(
+            config=config,
+            store=store,
+            publish=publish,
+            fetch_snapshot=gh.fetch_snapshot,
+            list_open_prs=gh.list_open_prs,
+            now_fn=lambda: 0.0,
+        )
+
+    registry = PRWatcherRegistry(store=store, publish=publish, factory=factory)
+    watcher_id = await registry.start(
+        repos=repos or ["owner/repo"], pr_numbers=pr_numbers, interval_s=60,
+    )
+    return registry, watcher_id
+
+
+async def test_pr_fleet_status_returns_snapshot_for_all_watchers(tmp_path):
+    """Two watchers + populated snapshots → both watchers + all their PRs
+    show up under ``fleet`` with the compact shape."""
+    db = str(tmp_path / "fleet.db")
+    store = PRWatcherStore(db)
+    gh = _FakeGithub()
+
+    snap1 = _make_snapshot_with_comments(
+        pr_number=1, head_sha="sha_1",
+        reviews=[{"id": 1, "reviewer": "copilot[bot]", "state": "APPROVED",
+                  "submitted_at": "2026-04-22T10:00:00Z"}],
+    )
+    # Pin the snapshot's ``repo`` to match the watcher key below so
+    # ``_repo_short`` projects the expected fleet key.
+    snap1.repo = "owner/alpha"
+    gh.snapshots[("owner/alpha", 1)] = snap1
+
+    snap5 = _make_snapshot_with_comments(pr_number=5, head_sha="sha_5")
+    snap5.repo = "owner/beta"
+    gh.snapshots[("owner/beta", 5)] = snap5
+
+    published: list[tuple[str, dict]] = []
+
+    async def publish(topic: str, payload: dict) -> None:
+        published.append((topic, dict(payload)))
+
+    reg_a, wid_a = await _start_registry_watcher(
+        store=store, gh=gh, publish=publish, pr_numbers=[1],
+        repos=["owner/alpha"],
+    )
+    reg_b, wid_b = await _start_registry_watcher(
+        store=store, gh=gh, publish=publish, pr_numbers=[5],
+        repos=["owner/beta"],
+    )
+    try:
+        # Drive a poll on each watcher so their snapshot caches populate.
+        await reg_a._watchers[wid_a].watcher.poll_once()
+        await reg_b._watchers[wid_b].watcher.poll_once()
+
+        # Both registries share the same store, but ``pr_fleet_status``
+        # is a strictly-live view: each registry only reports watchers
+        # whose in-memory handle lives on *it*. Rows persisted by the
+        # sibling registry are filtered out (Copilot R1 on PR #41).
+        snap_a = reg_a.fleet_snapshot()
+        snap_b = reg_b.fleet_snapshot()
+        wids_a = {w["id"] for w in snap_a["watchers"]}
+        wids_b = {w["id"] for w in snap_b["watchers"]}
+        assert wids_a == {wid_a}
+        assert wids_b == {wid_b}
+
+        keys_a = {item["k"] for item in snap_a["fleet"]}
+        keys_b = {item["k"] for item in snap_b["fleet"]}
+        assert keys_a == {"alpha#1"}
+        assert keys_b == {"beta#5"}
+
+        # Compact shape: required fields present on every fleet item.
+        for snap_view in (snap_a, snap_b):
+            for item in snap_view["fleet"]:
+                assert set(item.keys()) >= {
+                    "k", "reviews", "external_issue_comments",
+                    "inline_findings", "merged", "mergeable",
+                    "head_sha", "state",
+                }
+                assert set(item["reviews"].keys()) >= {
+                    "count", "latest_state", "latest_by", "latest_at",
+                }
+                assert set(item["inline_findings"].keys()) >= {
+                    "count", "latest_by", "latest_at",
+                    "latest_path", "latest_line",
+                }
+
+        # Top-level t is ISO-8601 with Z suffix.
+        assert snap_a["t"].endswith("Z")
+    finally:
+        await reg_a.stop(wid_a)
+        await reg_b.stop(wid_b)
+
+
+async def test_pr_fleet_status_scoped_by_watcher_id(tmp_path):
+    """Filter to one watcher id — only that watcher's PRs land in fleet."""
+    db = str(tmp_path / "fleet.db")
+    store = PRWatcherStore(db)
+    gh = _FakeGithub()
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot_with_comments(
+        pr_number=1, head_sha="sha_1",
+    )
+    gh.snapshots[("owner/repo", 2)] = _make_snapshot_with_comments(
+        pr_number=2, head_sha="sha_2",
+    )
+
+    published: list[tuple[str, dict]] = []
+
+    async def publish(topic: str, payload: dict) -> None:
+        published.append((topic, dict(payload)))
+
+    reg_a, wid_a = await _start_registry_watcher(
+        store=store, gh=gh, publish=publish, pr_numbers=[1],
+    )
+    reg_b, wid_b = await _start_registry_watcher(
+        store=store, gh=gh, publish=publish, pr_numbers=[2],
+    )
+    try:
+        await reg_a._watchers[wid_a].watcher.poll_once()
+        await reg_b._watchers[wid_b].watcher.poll_once()
+
+        snap_scoped = reg_a.fleet_snapshot(watcher_id=wid_a)
+        assert [w["id"] for w in snap_scoped["watchers"]] == [wid_a]
+        assert {item["k"] for item in snap_scoped["fleet"]} == {"repo#1"}
+
+        # Unknown watcher id → empty, not error.
+        snap_none = reg_a.fleet_snapshot(watcher_id="prw_bogus")
+        assert snap_none["watchers"] == []
+        assert snap_none["fleet"] == []
+    finally:
+        await reg_a.stop(wid_a)
+        await reg_b.stop(wid_b)
+
+
+def test_pr_fleet_status_empty_fleet(store):
+    """Zero watchers active → empty ``watchers`` + empty ``fleet``."""
+    registry = PRWatcherRegistry(
+        store=store,
+        publish=lambda t, p: None,  # type: ignore[arg-type]
+    )
+    snap = registry.fleet_snapshot()
+    assert snap["watchers"] == []
+    assert snap["fleet"] == []
+    assert snap["t"].endswith("Z")
+
+
+def test_fleet_snapshot_excludes_persisted_without_live_watcher(store):
+    """A watcher row that exists in the registry table but has no live
+    in-memory handle must not appear in ``pr_fleet_status``.
+
+    Models the real-world cases where the bug surfaces: a fresh process
+    before rehydrate populates ``self._watchers``; a sibling registry
+    (another process / test harness) sharing the same DB; a stopped-but-
+    not-yet-cleaned row. ``pr_fleet_status`` is strictly a live-fleet
+    view — persisted-only rows belong to a separate history skill, not
+    this one. Caught in Copilot R1 on PR #41.
+    """
+    # Seed a persisted registry row directly; no live watcher backs it.
+    store.register_watcher(
+        watcher_id="prw_ghost",
+        repos=["owner/repo"],
+        pr_numbers=[42],
+        interval_s=60,
+        started_at=1_700_000_000.0,
+    )
+    registry = PRWatcherRegistry(
+        store=store,
+        publish=lambda t, p: None,  # type: ignore[arg-type]
+    )
+    # Sanity: the store still has the row (filter isn't mutating state).
+    assert {r["watcher_id"] for r in store.list_watchers()} == {"prw_ghost"}
+
+    snap = registry.fleet_snapshot()
+    # Registry has the row but no live handle → strictly empty response.
+    assert snap["watchers"] == []
+    assert snap["fleet"] == []
+    assert snap["t"].endswith("Z")
+
+    # Scoping to the ghost's id is also empty (same rule applies).
+    scoped = registry.fleet_snapshot(watcher_id="prw_ghost")
+    assert scoped["watchers"] == []
+    assert scoped["fleet"] == []
+
+
+async def test_pr_fleet_digest_aggregates_per_cycle_transitions(store):
+    """Copilot posts 1 review with 4 inline findings in a single poll →
+    exactly 1 ``pr.fleet_digest`` event with 1 ``changed`` entry containing
+    1 review event + 4 inline_finding events, alongside the granular
+    1 ``pr.review_landed`` + 4 ``pr.inline_finding`` events. Granular
+    events must not be removed or reshaped by the digest being additive.
+    """
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published)
+
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot_with_comments(
+        head_sha="agg_sha",
+        reviews=[{
+            "id": 999,
+            "reviewer": "copilot-pull-request-reviewer[bot]",
+            "state": "COMMENTED",
+            "submitted_at": "2026-04-22T10:00:00Z",
+            "body": "Posted 4 concerns inline.",
+        }],
+        inline_findings=[
+            {
+                "id": 700 + i,
+                "author": "copilot-pull-request-reviewer[bot]",
+                "body": f"Finding {i}",
+                "posted_at": f"2026-04-22T10:0{i}:00Z",
+                "path": f"developer/mod_{i}.py",
+                "line": 10 * (i + 1),
+                "review_id": 999,
+            }
+            for i in range(4)
+        ],
+    )
+    await watcher.poll_once()
+
+    # Granular events unchanged: 1 new_commit + 1 review + 4 inline.
+    granular_topics = _topics(published)
+    assert granular_topics.count(TOPIC_NEW_COMMIT) == 1
+    assert granular_topics.count(TOPIC_REVIEW_LANDED) == 1
+    assert granular_topics.count(TOPIC_INLINE_FINDING) == 4
+
+    digests = _digest_events(published)
+    assert len(digests) == 1
+    digest = digests[0]
+    assert digest["watcher_id"] == "prw_test"
+    assert digest["t"].endswith("Z")
+    assert len(digest["changed"]) == 1
+    entry = digest["changed"][0]
+    assert entry["k"] == "repo#1"
+
+    kinds = [e["kind"] for e in entry["events"]]
+    # One review + four inline_findings + one new_commit, all in the
+    # same cycle digest. Order is emit order (new_commit → review →
+    # inline findings).
+    assert kinds.count("review") == 1
+    assert kinds.count("inline_finding") == 4
+    assert kinds.count("new_commit") == 1
+
+    # The per-entry ``state`` block is the compact fleet-item shape
+    # (matches pr_fleet_status projection).
+    state = entry["state"]
+    assert state["head_sha"] == "agg_sha"
+    assert state["reviews"]["count"] == 1
+    assert state["inline_findings"]["count"] == 4
+
+
+async def test_pr_fleet_digest_silent_cycle_emits_nothing(store):
+    """A poll that produces zero new transitions → zero digest events.
+
+    Drives two polls on a static snapshot: the first cycle fires
+    granular events (and therefore a digest); the second cycle observes
+    no transition diff → no digest.
+    """
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published)
+
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(head_sha="static_sha")
+    await watcher.poll_once()  # primes dedupe
+    digests_poll1 = _digest_events(published)
+    assert len(digests_poll1) == 1  # pr.new_commit fired → digest fired
+
+    # Poll 2: unchanged snapshot → zero granular events → zero digest.
+    before = len(published)
+    await watcher.poll_once()
+    after_events = published[before:]
+    assert after_events == [], (
+        f"silent poll cycle emitted events: {after_events}"
+    )
+
+
+async def test_pr_fleet_digest_inline_finding_body_included_inline(store):
+    """A subscriber consuming only ``pr.fleet_digest`` must see the finding
+    body + path + line without needing a follow-up API call — that's the
+    point of the aggregate event."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published)
+
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot_with_comments(
+        head_sha="body_sha",
+        inline_findings=[{
+            "id": 4242,
+            "author": "copilot-pull-request-reviewer[bot]",
+            "body": "This helper is load-bearing — please add a test.",
+            "posted_at": "2026-04-22T12:00:00Z",
+            "path": "developer/pr_watcher.py",
+            "line": 500,
+            "review_id": 77,
+        }],
+    )
+    await watcher.poll_once()
+
+    digests = _digest_events(published)
+    assert len(digests) == 1
+    entry = digests[0]["changed"][0]
+    inline_events = [e for e in entry["events"] if e["kind"] == "inline_finding"]
+    assert len(inline_events) == 1
+    ev = inline_events[0]
+    assert ev["body"] == "This helper is load-bearing — please add a test."
+    assert ev["path"] == "developer/pr_watcher.py"
+    assert ev["line"] == 500
+    assert ev["by"] == "copilot-pull-request-reviewer[bot]"
+    assert ev["review_id"] == 77
+
+
+async def test_pr_fleet_digest_body_truncated_to_500_chars(store):
+    """Bodies on review / comment / inline_finding digest events cap at
+    :data:`COMMENT_PREVIEW_CHARS` (500). Protects subscribers from
+    massive payloads dominating the bus stream."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published)
+
+    long = "y" * (COMMENT_PREVIEW_CHARS * 2 + 100)
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot_with_comments(
+        head_sha="trunc_sha",
+        reviews=[{
+            "id": 1,
+            "reviewer": "copilot[bot]",
+            "state": "COMMENTED",
+            "submitted_at": "t",
+            "body": long,
+        }],
+        external_issue_comments=[{
+            "id": 100,
+            "author": "copilot[bot]",
+            "body": long,
+            "posted_at": "t",
+        }],
+        inline_findings=[{
+            "id": 200,
+            "author": "copilot[bot]",
+            "body": long,
+            "posted_at": "t",
+            "path": "a.py",
+            "line": 1,
+            "review_id": None,
+        }],
+    )
+    await watcher.poll_once()
+
+    digests = _digest_events(published)
+    assert len(digests) == 1
+    entry = digests[0]["changed"][0]
+    for ev in entry["events"]:
+        body = ev.get("body")
+        if body is None:
+            continue
+        assert len(body) <= COMMENT_PREVIEW_CHARS, (
+            f"{ev['kind']} body not truncated: {len(body)} chars"
+        )
+
+
+async def test_pr_fleet_digest_review_body_populated_when_available(store):
+    """Review digest entries must carry the review's summary body so the
+    aggregate event is self-sufficient (no follow-up API call needed).
+
+    Catches a real bug caught in Copilot R1 on PR #41: the digest emitter
+    called ``_truncate_body(review.get("body", ""))`` but
+    ``_snapshot_from_github`` didn't project ``body`` onto the snapshot
+    ``reviews`` entries, so the truncation was dead and the event always
+    carried an empty body in production. Fix is Option A from the finding
+    — map ``r.body`` through in ``_snapshot_from_github`` (the GitHub API
+    already returns it via :meth:`GithubClient.list_pr_reviews`).
+    """
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published)
+
+    review_body = "Looks good overall, two nits inline."
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot_with_comments(
+        head_sha="body_sha",
+        reviews=[{
+            "id": 42,
+            "reviewer": "copilot-pull-request-reviewer[bot]",
+            "state": "COMMENTED",
+            "submitted_at": "2026-04-22T10:00:00Z",
+            "body": review_body,
+        }],
+    )
+    await watcher.poll_once()
+
+    digests = _digest_events(published)
+    assert len(digests) == 1
+    entry = digests[0]["changed"][0]
+    review_events = [e for e in entry["events"] if e["kind"] == "review"]
+    assert len(review_events) == 1
+    assert review_events[0]["body"] == review_body
+
+
+async def test_pr_fleet_digest_review_body_roundtrips_through_snapshot_builder():
+    """``_snapshot_from_github`` projects ``r.body`` onto each snapshot
+    review — verified against the real builder rather than the fixture
+    helper, so future regressions in the builder are caught by this
+    test (not only by end-to-end digest assertions).
+    """
+    from developer.github_client import GithubReview
+    from developer.pr_watcher import _snapshot_from_github
+
+    class _StubGH:
+        async def get_pr(self, repo, pr_number):
+            return {"head_sha": "abc", "state": "open", "mergeable": True,
+                    "mergeable_state": "clean"}
+
+        async def list_pr_reviews(self, repo, pr_number):
+            return [
+                GithubReview(
+                    id=1, pr_number=pr_number, repo=repo,
+                    reviewer="copilot[bot]", state="COMMENTED",
+                    body="Summary body here.",
+                    submitted_at="2026-04-22T10:00:00Z",
+                ),
+            ]
+
+        async def list_pr_issue_comments(self, repo, pr_number):
+            return []
+
+        async def list_pr_review_comments(self, repo, pr_number):
+            return []
+
+    snap = await _snapshot_from_github(_StubGH(), "owner/repo", 1)
+    assert snap.reviews == [{
+        "id": 1,
+        "reviewer": "copilot[bot]",
+        "state": "COMMENTED",
+        "body": "Summary body here.",
+        "submitted_at": "2026-04-22T10:00:00Z",
+    }]
+
+
+# ---------------------------------------------------------------------------
+# Skill-layer wiring for pr_fleet_status (fr_developer_fafb36f1).
+# ---------------------------------------------------------------------------
+
+
+def test_pr_fleet_status_skill_registered(harness):
+    harness.assert_skill_exists("pr_fleet_status", description="snapshot")
+
+
+async def test_pr_fleet_status_skill_returns_empty_when_no_watchers(harness):
+    result = await harness.call("pr_fleet_status", {})
+    assert result["watchers"] == []
+    assert result["fleet"] == []
+    assert result["t"].endswith("Z")
+
+
+async def test_pr_fleet_status_skill_scopes_by_watcher_id(harness, monkeypatch):
+    """End-to-end: start a watcher, poll once, then call pr_fleet_status
+    with + without the watcher id filter — both return the expected
+    shape; a bogus id returns empty."""
+    gh = _FakeGithub()
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot_with_comments(
+        pr_number=1, head_sha="skill_sha",
+    )
+    published: list[tuple[str, dict]] = []
+
+    async def publish(topic: str, payload: dict) -> None:
+        published.append((topic, dict(payload)))
+
+    monkeypatch.setattr(harness.agent, "publish", publish)
+    registry = harness.agent.pr_watcher_registry
+
+    def factory(config: PRWatcherConfig) -> PRFleetWatcher:
+        return PRFleetWatcher(
+            config=config,
+            store=registry.store,
+            publish=publish,
+            fetch_snapshot=gh.fetch_snapshot,
+            list_open_prs=gh.list_open_prs,
+            now_fn=lambda: 0.0,
+        )
+    registry._factory = factory
+
+    result = await harness.call(
+        "watch_pr_fleet",
+        {"repos": "owner/repo", "pr_numbers": "1", "interval_s": 60},
+    )
+    watcher_id = result["watcher_id"]
+    try:
+        # Force a poll so the snapshot cache is populated.
+        await registry._watchers[watcher_id].watcher.poll_once()
+
+        # Unscoped: one watcher + its one PR.
+        snap_all = await harness.call("pr_fleet_status", {})
+        assert [w["id"] for w in snap_all["watchers"]] == [watcher_id]
+        assert [item["k"] for item in snap_all["fleet"]] == ["repo#1"]
+
+        # Scoped to the known id — same result.
+        snap_scoped = await harness.call(
+            "pr_fleet_status", {"watcher_id": watcher_id},
+        )
+        assert [w["id"] for w in snap_scoped["watchers"]] == [watcher_id]
+
+        # Scoped to bogus id — empty, not error.
+        snap_bogus = await harness.call(
+            "pr_fleet_status", {"watcher_id": "prw_nope"},
+        )
+        assert snap_bogus["watchers"] == []
+        assert snap_bogus["fleet"] == []
+    finally:
+        await harness.call("stop_pr_watcher", {"watcher_id": watcher_id})
+
+
+def test_fleet_digest_topic_in_all_pr_topics():
+    """Subscribers filtering on ``pr.*`` via ``bus_wait_for_event`` must
+    see the digest topic in the registry of known topics."""
+    assert TOPIC_FLEET_DIGEST in ALL_PR_TOPICS
+    assert TOPIC_FLEET_DIGEST.startswith("pr.")

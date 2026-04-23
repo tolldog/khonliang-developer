@@ -40,6 +40,7 @@ import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
 from developer.github_client import GithubClient, GithubClientError, is_copilot_login
@@ -69,6 +70,12 @@ TOPIC_POLL_ERROR = "pr.poll_error"
 # to a ``(path, line)``).
 TOPIC_COMMENT_POSTED = "pr.comment_posted"
 TOPIC_INLINE_FINDING = "pr.inline_finding"
+# Added by fr_developer_fafb36f1: per-poll-cycle aggregate digest. Emits
+# only when at least one granular transition fired in the cycle — silent
+# windows stay silent. Companion to (not replacement for) the granular
+# ``pr.*`` topics above; subscribers that already react per-transition
+# keep their existing subscriptions unchanged.
+TOPIC_FLEET_DIGEST = "pr.fleet_digest"
 
 ALL_PR_TOPICS = (
     TOPIC_REVIEW_LANDED,
@@ -79,14 +86,102 @@ ALL_PR_TOPICS = (
     TOPIC_POLL_ERROR,
     TOPIC_COMMENT_POSTED,
     TOPIC_INLINE_FINDING,
+    TOPIC_FLEET_DIGEST,
 )
 
 
 # Truncation cap on comment body previews attached to snapshot fields.
 # Events emit the full body; the preview is for the compact snapshot
 # view used by ``pr_fleet_status`` / fleet-digest consumers where 500
-# chars is a reasonable first-glance tradeoff.
+# chars is a reasonable first-glance tradeoff. Also reused by
+# ``pr.fleet_digest`` event bodies (fr_developer_fafb36f1) so a
+# subscriber that takes only the digest never has to do a follow-up API
+# call just to learn a finding body.
 COMMENT_PREVIEW_CHARS = 500
+
+
+def _truncate_body(body: str) -> str:
+    """Cap a comment / review body at :data:`COMMENT_PREVIEW_CHARS`.
+
+    Used by the ``pr.fleet_digest`` payload builder so the aggregate
+    event stays bounded regardless of upstream body length. Returns the
+    input unchanged if it's under the cap; never raises.
+    """
+    if not body:
+        return ""
+    return body[:COMMENT_PREVIEW_CHARS]
+
+
+def _repo_short(repo: str) -> str:
+    """Return the ``name`` half of an ``owner/name`` repo string.
+
+    ``pr.fleet_digest`` + ``pr_fleet_status`` use a ``<repo-short>#<num>``
+    key for each fleet entry. Owners are redundant when every watcher in
+    a single khonliang fleet points at the same owner, and the compact
+    form reads noticeably better in log grep. A repo string without a
+    slash falls through unchanged — defensive rather than raising because
+    test fixtures sometimes use bare ``repo`` names.
+    """
+    if not repo:
+        return ""
+    return repo.rsplit("/", 1)[-1]
+
+
+def _now_iso() -> str:
+    """UTC ISO-8601 timestamp with ``Z`` suffix.
+
+    Used for the ``t`` field on ``pr.fleet_digest`` payloads and on
+    ``pr_fleet_status`` snapshot responses. Local-naive ``datetime.now``
+    would serialize without a timezone marker; the explicit Z keeps
+    cross-subscriber parsing unambiguous.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _fleet_item_from_snapshot(snapshot: "PRSnapshot") -> dict:
+    """Project a :class:`PRSnapshot` into the compact fleet-item shape.
+
+    Shared by ``developer.pr_fleet_status`` and the ``pr.fleet_digest``
+    event's per-entry ``state`` field so both views stay identical —
+    consumers that hop between the one-shot snapshot and the per-cycle
+    digest never see shape drift.
+    """
+    reviews = snapshot.reviews or []
+    latest_review = reviews[-1] if reviews else {}
+    issue_comments = snapshot.external_issue_comments or []
+    latest_issue = issue_comments[-1] if issue_comments else {}
+    inline = snapshot.inline_findings or []
+    latest_inline = inline[-1] if inline else {}
+    mergeable: Optional[str]
+    if snapshot.mergeable is None:
+        mergeable = None
+    else:
+        mergeable = "mergeable" if snapshot.mergeable else "blocked"
+    return {
+        "k": f"{_repo_short(snapshot.repo)}#{snapshot.pr_number}",
+        "reviews": {
+            "count": len(reviews),
+            "latest_state": str(latest_review.get("state", "")) if latest_review else "",
+            "latest_by": str(latest_review.get("reviewer", "")) if latest_review else "",
+            "latest_at": str(latest_review.get("submitted_at", "")) if latest_review else "",
+        },
+        "external_issue_comments": {
+            "count": len(issue_comments),
+            "latest_by": str(latest_issue.get("author", "")) if latest_issue else "",
+            "latest_at": str(latest_issue.get("posted_at", "")) if latest_issue else "",
+        },
+        "inline_findings": {
+            "count": len(inline),
+            "latest_by": str(latest_inline.get("author", "")) if latest_inline else "",
+            "latest_at": str(latest_inline.get("posted_at", "")) if latest_inline else "",
+            "latest_path": str(latest_inline.get("path") or "") if latest_inline else "",
+            "latest_line": int(latest_inline.get("line") or 0) if latest_inline else 0,
+        },
+        "merged": bool(snapshot.merged),
+        "mergeable": mergeable,
+        "head_sha": str(snapshot.head_sha or ""),
+        "state": str(snapshot.state or ""),
+    }
 
 
 def comment_looks_like_bot_verdict(body: str, author: str = "") -> bool:
@@ -483,6 +578,20 @@ class PRFleetWatcher:
         # and subsequent unchanged polls touch zero rows.
         self._seen_issue_comment_ids: dict[tuple[str, int], set[str]] = {}
         self._seen_inline_finding_ids: dict[tuple[str, int], set[str]] = {}
+        # Latest-observed snapshot per PR, keyed the same way. Populated
+        # on every successful ``_fetch_snapshot`` so that
+        # :meth:`PRWatcherRegistry.fleet_snapshot` (and through it the
+        # ``developer.pr_fleet_status`` skill) can project the compact
+        # shape without re-polling GitHub. Added by
+        # ``fr_developer_fafb36f1``. Pruned together with the seen-id
+        # caches so closed/merged PRs don't linger in memory.
+        self._latest_snapshots: dict[tuple[str, int], PRSnapshot] = {}
+        # Per-cycle transition buffer for :data:`TOPIC_FLEET_DIGEST`.
+        # Reset at the top of each :meth:`poll_once`. Keys are the same
+        # ``(repo, pr_number)`` tuples as the caches above; values are
+        # ordered lists of digest event dicts ready to drop into the
+        # payload's ``events`` array.
+        self._cycle_transitions: dict[tuple[str, int], list[dict]] = {}
 
     @property
     def pr_count(self) -> int:
@@ -498,7 +607,11 @@ class PRFleetWatcher:
         otherwise accumulate forever. Pinning to ``active_keys`` keeps
         the cache bounded by fleet size.
         """
-        for cache in (self._seen_issue_comment_ids, self._seen_inline_finding_ids):
+        for cache in (
+            self._seen_issue_comment_ids,
+            self._seen_inline_finding_ids,
+            self._latest_snapshots,
+        ):
             stale = [key for key in cache if key not in active_keys]
             for key in stale:
                 cache.pop(key, None)
@@ -548,6 +661,11 @@ class PRFleetWatcher:
         # only reclaims process memory.
         active_keys = {(repo, pr_number) for repo, pr_number in pairs}
         self._prune_seen_caches(active_keys)
+        # Reset the per-cycle digest buffer. Anything still hanging off
+        # a previous cycle is stale; ``pr.fleet_digest`` fires at most
+        # once per cycle and only when this buffer picks up entries
+        # from the emit path below.
+        self._cycle_transitions = {}
         emitted = 0
         for repo, pr_number in pairs:
             try:
@@ -570,9 +688,31 @@ class PRFleetWatcher:
                 )
                 await self._emit_poll_error(repo, pr_number, reason=str(e))
                 continue
+            # Cache the latest observed snapshot for ``pr_fleet_status``
+            # consumers. Stored before transition detection so even a
+            # cycle that produces zero new transitions still surfaces the
+            # current PR state through the snapshot skill.
+            self._latest_snapshots[(snapshot.repo, snapshot.pr_number)] = snapshot
             emitted += await self._emit_transitions(snapshot)
         self.store.touch_last_poll(self.config.watcher_id, self._now())
+        # Emit the aggregate digest only when at least one transition
+        # fired this cycle. Silent windows cost zero digest events —
+        # subscribers that care about "something happened" don't have
+        # to filter a heartbeat stream.
+        if self._cycle_transitions:
+            await self._emit_fleet_digest()
         return emitted
+
+    def latest_snapshots(self) -> list[PRSnapshot]:
+        """Return the list of most-recent snapshots, one per active PR.
+
+        ``developer.pr_fleet_status`` uses this to project the compact
+        fleet-item shape without re-polling GitHub. Order matches
+        insertion order (roughly the resolve-order from
+        :meth:`_resolve_pr_set`); consumers that need a specific order
+        should sort on the fleet-item ``k`` field.
+        """
+        return list(self._latest_snapshots.values())
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Loop until ``stop_event`` is set.
@@ -602,6 +742,16 @@ class PRFleetWatcher:
     async def _emit_transitions(self, snapshot: PRSnapshot) -> int:
         """Diff snapshot against stored dedupe state and publish new events."""
         emitted = 0
+        # Where this PR's per-cycle digest events accumulate. Appended
+        # to alongside every granular ``_emit`` that actually publishes;
+        # the digest layer reads this at the end of ``poll_once`` and
+        # never mutates it. Intentionally tied to the buffer dict's
+        # lifetime (reset on every poll cycle) so a prior cycle's events
+        # can't leak forward.
+        pr_key = (snapshot.repo, snapshot.pr_number)
+
+        def _record_digest(event: dict) -> None:
+            self._cycle_transitions.setdefault(pr_key, []).append(event)
 
         # 1. New commits. dedupe_id = head_sha.
         # NOTE: we intentionally don't include a ``pushed_at`` timestamp.
@@ -625,6 +775,7 @@ class PRFleetWatcher:
                 },
             ):
                 emitted += 1
+                _record_digest({"kind": "new_commit", "sha": snapshot.head_sha[:12]})
 
         # 2. Reviews landed. dedupe_id = review_id.
         for review in snapshot.reviews:
@@ -647,6 +798,12 @@ class PRFleetWatcher:
                 },
             ):
                 emitted += 1
+                _record_digest({
+                    "kind": "review",
+                    "state": str(review.get("state", "")),
+                    "by": str(review.get("reviewer", "")),
+                    "body": _truncate_body(str(review.get("body", "") or "")),
+                })
 
         # 2a. Issue comments (fr_developer_e2bdd869).
         # Each external (non-self) comment fires exactly one
@@ -682,6 +839,11 @@ class PRFleetWatcher:
                 },
             ):
                 emitted += 1
+                _record_digest({
+                    "kind": "comment",
+                    "by": str(comment.get("author", "")),
+                    "body": _truncate_body(str(comment.get("body", "") or "")),
+                })
             # Mark seen regardless of whether ``_emit`` actually
             # published — if the SQLite dedupe table already had the
             # row (cross-restart case), ``_emit`` returns False, but
@@ -720,6 +882,15 @@ class PRFleetWatcher:
                 },
             ):
                 emitted += 1
+                line_raw = finding.get("line")
+                _record_digest({
+                    "kind": "inline_finding",
+                    "by": str(finding.get("author", "")),
+                    "path": str(finding.get("path") or ""),
+                    "line": int(line_raw) if line_raw is not None else 0,
+                    "body": _truncate_body(str(finding.get("body", "") or "")),
+                    "review_id": finding.get("review_id"),
+                })
             seen_inline.add(id_str)
 
         # 3. Merged. dedupe_id = merged_at timestamp (stable once set).
@@ -737,6 +908,7 @@ class PRFleetWatcher:
                 },
             ):
                 emitted += 1
+                _record_digest({"kind": "merged"})
             # A merged PR is also terminal; don't emit merge_ready after
             # the fact and don't emit closed_without_merge.
             return emitted
@@ -755,6 +927,9 @@ class PRFleetWatcher:
                 },
             ):
                 emitted += 1
+                _record_digest({
+                    "kind": "state_change", "from": "open", "to": "closed",
+                })
             return emitted
 
         # 5. Merge-ready. dedupe_id = head_sha so a fresh commit can
@@ -815,6 +990,57 @@ class PRFleetWatcher:
                 self.config.watcher_id, topic, e,
             )
         return True
+
+    async def _emit_fleet_digest(self) -> None:
+        """Publish the per-cycle :data:`TOPIC_FLEET_DIGEST` event.
+
+        Called once at the end of :meth:`poll_once` when the cycle
+        transition buffer is non-empty. The payload aggregates every
+        PR whose granular events fired this cycle into a single
+        ``changed`` list — subscribers that only care "did anything
+        happen across the fleet?" get a single event per cycle instead
+        of N per-transition events to filter.
+
+        Intentionally additive to the granular ``pr.*`` topics — those
+        fire first (the digest event collects them as a side effect of
+        their emit path). A subscriber may legitimately take either
+        surface; the digest's per-entry ``state`` projection is the
+        same compact shape ``pr_fleet_status`` returns so consumers
+        never see shape drift between the two views.
+        """
+        changed: list[dict] = []
+        for (repo, pr_number), events in self._cycle_transitions.items():
+            snapshot = self._latest_snapshots.get((repo, pr_number))
+            if snapshot is None:
+                # Transition buffered without a corresponding snapshot
+                # cached — shouldn't happen on the normal path
+                # (``poll_once`` caches the snapshot before
+                # ``_emit_transitions`` can append), but skip defensively
+                # rather than emitting an entry with no state.
+                continue
+            changed.append({
+                "k": f"{_repo_short(repo)}#{pr_number}",
+                "events": list(events),
+                "state": _fleet_item_from_snapshot(snapshot),
+            })
+        if not changed:
+            return
+        payload = {
+            "t": _now_iso(),
+            "watcher_id": self.config.watcher_id,
+            "changed": changed,
+        }
+        try:
+            await self._publish(TOPIC_FLEET_DIGEST, payload)
+        except asyncio.CancelledError:
+            # CancelledError subclasses Exception; don't log-and-swallow
+            # cooperative cancellation during publish.
+            raise
+        except Exception as e:
+            logger.warning(
+                "PR watcher %s: publish %s failed: %s",
+                self.config.watcher_id, TOPIC_FLEET_DIGEST, e,
+            )
 
     async def _emit_poll_error(self, repo: str, pr_number: int, reason: str) -> None:
         """Low-severity error signal — never deduped (reset per poll).
@@ -1028,6 +1254,64 @@ class PRWatcherRegistry:
             row["pr_count"] = live.watcher.pr_count if live else 0
         return rows
 
+    def fleet_snapshot(self, watcher_id: Optional[str] = None) -> dict:
+        """Return the ``developer.pr_fleet_status`` response shape.
+
+        Walks live watchers' cached snapshots and projects them into the
+        compact fleet-item form. When ``watcher_id`` is supplied, only
+        that watcher's PRs land in the ``fleet`` list (and only that
+        watcher's row lands in ``watchers``); when ``None``, every live
+        watcher is included. An unknown ``watcher_id`` yields an empty
+        fleet and an empty watchers list — the caller learns about the
+        typo without us raising.
+
+        Intentionally synchronous: it reads in-memory state and a single
+        SQLite row per watcher (via :meth:`PRWatcherStore.list_watchers`)
+        — no GitHub traffic. That's what makes this a cheap "what's
+        going on" query compared to a subscription on ``pr.*`` events.
+        """
+        rows = self.store.list_watchers()
+        if watcher_id is not None:
+            rows = [r for r in rows if r["watcher_id"] == watcher_id]
+        watchers_out: list[dict] = []
+        fleet_out: list[dict] = []
+        for row in rows:
+            wid = row["watcher_id"]
+            live = self._watchers.get(wid)
+            # ``pr_fleet_status`` is strictly a live-fleet view: rows that
+            # exist in the registry table but have no in-memory watcher
+            # handle (startup before rehydrate, a stopped-but-not-yet-
+            # cleaned row, or a row owned by a sibling registry sharing
+            # the same store) must not appear. A previous revision
+            # surfaced persisted-only rows in ``watchers`` with an empty
+            # fleet, which made the response lie about what was actually
+            # live — bug caught in Copilot R1 on PR #41. Historical
+            # / stopped-watcher views, if ever wanted, belong on a
+            # separate skill with its own schema.
+            if live is None:
+                continue
+            pr_count = live.watcher.pr_count
+            # ISO-format started_at alongside the float so downstream
+            # consumers aren't forced to know which epoch base we used.
+            started_at_raw = float(row.get("started_at", 0.0) or 0.0)
+            started_at_iso = (
+                datetime.fromtimestamp(started_at_raw, tz=timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
+                if started_at_raw > 0 else ""
+            )
+            watchers_out.append({
+                "id": wid,
+                "started_at": started_at_iso,
+                "pr_count": pr_count,
+            })
+            for snapshot in live.watcher.latest_snapshots():
+                fleet_out.append(_fleet_item_from_snapshot(snapshot))
+        return {
+            "t": _now_iso(),
+            "watchers": watchers_out,
+            "fleet": fleet_out,
+        }
+
     async def shutdown(self) -> None:
         """Cancel every live watcher (called on agent shutdown)."""
         ids = list(self._watchers.keys())
@@ -1124,11 +1408,18 @@ async def _snapshot_from_github(
     """
     pr = await gh.get_pr(repo, pr_number)
     reviews_raw = await gh.list_pr_reviews(repo, pr_number)
+    # ``body`` is populated here so ``pr.fleet_digest`` review entries can
+    # carry the review's summary text without a second API call — the
+    # underlying ``list_pr_reviews`` call already fetches it (see
+    # :class:`GithubReview`), so this is pure projection, no extra traffic.
+    # A previous revision left ``body`` unmapped and the digest emitter's
+    # ``_truncate_body`` call was dead — bug caught in Copilot R1 on PR #41.
     reviews = [
         {
             "id": r.id,
             "reviewer": r.reviewer,
             "state": r.state,
+            "body": r.body or "",
             "submitted_at": r.submitted_at or "",
         }
         for r in reviews_raw

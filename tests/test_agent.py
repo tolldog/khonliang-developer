@@ -18,8 +18,9 @@ def test_skill_count(harness):
     # 34 existing skills + 7 milestone/handoff/migration skills
     # + concept FR candidates + PR readiness + session checkpoint/resume
     # + repo hygiene audit/apply
-    # + PR fleet watcher trio (watch/list/stop).
-    assert len(harness.skills) == 50
+    # + PR fleet watcher trio (watch/list/stop)
+    # + pr_fleet_status snapshot (fr_developer_fafb36f1).
+    assert len(harness.skills) == 51
 
 
 def test_skills_registered(harness):
@@ -51,6 +52,8 @@ def test_skills_registered(harness):
         "git_show", "git_rev_parse",
         # long-running PR fleet watcher (fr_developer_6c8ec260)
         "watch_pr_fleet", "list_pr_watchers", "stop_pr_watcher",
+        # fleet-digest snapshot (fr_developer_fafb36f1)
+        "pr_fleet_status",
     }
     assert harness.skill_names == expected
 
@@ -450,7 +453,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 50
+    assert len(reg.skills) == 51
     assert len(reg.collaborations) == 1
 
 
