@@ -1588,3 +1588,105 @@ async def test_self_login_filter_is_case_insensitive(tmp_path):
     # Both case variants of the self login are dropped; external kept.
     assert [c["id"] for c in snap.external_issue_comments] == [3]
     assert [f["id"] for f in snap.inline_findings] == [11]
+
+
+# ---------------------------------------------------------------------------
+# Copilot R2 cache-prune finding: in "watch all open PRs" mode the
+# ``_seen_*`` caches must shed entries for PRs no longer in the active
+# set. Otherwise closed/merged PRs keep their seen-id baggage forever
+# for the watcher's lifetime.
+# ---------------------------------------------------------------------------
+
+
+async def test_seen_caches_prune_when_pr_drops_out_of_active_set(store):
+    """Simulate a fleet watcher with ``list_open_prs``-driven resolution.
+    Poll 1 has PRs {1, 2, 3}; poll 2 has {1, 2} (PR 3 merged/closed).
+    After poll 2, both ``_seen_*`` caches should only contain keys for
+    PRs 1 and 2."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    # Build the watcher inline rather than via ``_make_watcher`` because
+    # that helper's ``pr_numbers or [1]`` default would coerce an empty
+    # list back into ``[1]``; the cache-leak scenario requires the
+    # "watch all open PRs" path (empty explicit list → ``list_open_prs``
+    # drives the set each cycle).
+    async def publish(topic: str, payload: dict) -> None:
+        published.append((topic, dict(payload)))
+
+    config = PRWatcherConfig(
+        watcher_id="prw_prune_test",
+        repos=["owner/repo"],
+        pr_numbers=[],
+        interval_s=60,
+        started_at=0.0,
+    )
+    store.register_watcher(
+        watcher_id=config.watcher_id,
+        repos=config.repos,
+        pr_numbers=config.pr_numbers,
+        interval_s=config.interval_s,
+        started_at=config.started_at,
+    )
+    watcher = PRFleetWatcher(
+        config=config,
+        store=store,
+        publish=publish,
+        fetch_snapshot=gh.fetch_snapshot,
+        list_open_prs=gh.list_open_prs,
+        now_fn=lambda: 0.0,
+    )
+
+    def _snap_with_ids(pr_number: int) -> PRSnapshot:
+        return _make_snapshot_with_comments(
+            pr_number=pr_number,
+            head_sha=f"sha-{pr_number}",
+            external_issue_comments=[
+                {
+                    "id": 10000 + pr_number,
+                    "author": "copilot[bot]",
+                    "body": f"issue on PR {pr_number}",
+                    "posted_at": "2026-04-22T10:00:00Z",
+                },
+            ],
+            inline_findings=[
+                {
+                    "id": 20000 + pr_number,
+                    "author": "copilot[bot]",
+                    "body": f"inline on PR {pr_number}",
+                    "posted_at": "2026-04-22T10:01:00Z",
+                    "path": "m.py",
+                    "line": 1,
+                    "review_id": 9,
+                },
+            ],
+        )
+
+    # Poll 1: fleet is {1, 2, 3}, all three populate the caches.
+    gh.open_prs["owner/repo"] = [1, 2, 3]
+    for n in (1, 2, 3):
+        gh.snapshots[("owner/repo", n)] = _snap_with_ids(n)
+    await watcher.poll_once()
+    assert set(watcher._seen_issue_comment_ids.keys()) == {
+        ("owner/repo", 1), ("owner/repo", 2), ("owner/repo", 3),
+    }
+    assert set(watcher._seen_inline_finding_ids.keys()) == {
+        ("owner/repo", 1), ("owner/repo", 2), ("owner/repo", 3),
+    }
+
+    # Poll 2: PR 3 merged/closed — fleet resolver returns only {1, 2}.
+    # Prune must drop key (owner/repo, 3) from both caches without
+    # touching keys for still-active PRs.
+    gh.open_prs["owner/repo"] = [1, 2]
+    await watcher.poll_once()
+    assert set(watcher._seen_issue_comment_ids.keys()) == {
+        ("owner/repo", 1), ("owner/repo", 2),
+    }
+    assert set(watcher._seen_inline_finding_ids.keys()) == {
+        ("owner/repo", 1), ("owner/repo", 2),
+    }
+
+    # Poll 3: fleet empties entirely → both caches go back to empty.
+    gh.open_prs["owner/repo"] = []
+    await watcher.poll_once()
+    assert watcher._seen_issue_comment_ids == {}
+    assert watcher._seen_inline_finding_ids == {}

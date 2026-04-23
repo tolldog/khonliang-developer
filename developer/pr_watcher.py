@@ -483,6 +483,20 @@ class PRFleetWatcher:
         """Number of PRs observed on the most recent poll."""
         return self._pr_count
 
+    def _prune_seen_caches(self, active_keys: set[tuple[str, int]]) -> None:
+        """Drop in-memory seen-id entries for PRs no longer in the active set.
+
+        Called once per poll after ``_resolve_pr_set``. In "watch all
+        open PRs" mode (no explicit ``pr_numbers``), closed/merged PRs
+        stop appearing in the resolved set — their cache entries would
+        otherwise accumulate forever. Pinning to ``active_keys`` keeps
+        the cache bounded by fleet size.
+        """
+        for cache in (self._seen_issue_comment_ids, self._seen_inline_finding_ids):
+            stale = [key for key in cache if key not in active_keys]
+            for key in stale:
+                cache.pop(key, None)
+
     async def _resolve_pr_set(self) -> list[tuple[str, int]]:
         """Return ``(repo, pr_number)`` pairs to poll this cycle.
 
@@ -516,6 +530,14 @@ class PRFleetWatcher:
         """
         pairs = await self._resolve_pr_set()
         self._pr_count = len(pairs)
+        # Prune in-memory seen caches for PRs that have dropped out of
+        # the active set (closed / merged PRs in "watch all open PRs"
+        # mode no longer show up in ``_resolve_pr_set``). Without this
+        # the caches grow monotonically over the watcher's lifetime.
+        # Cross-restart dedupe remains the SQLite table's job; this
+        # only reclaims process memory.
+        active_keys = {(repo, pr_number) for repo, pr_number in pairs}
+        self._prune_seen_caches(active_keys)
         emitted = 0
         for repo, pr_number in pairs:
             try:

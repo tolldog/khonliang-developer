@@ -270,9 +270,17 @@ def _install_fake_gh(client, *, reviews=None, review_comments=None,
             _maybe_raise("pulls.async_list_reviews")
             return _FakeResponse2(reviews or [])
 
-        async def async_list_review_comments(self, **_):
+        async def async_list_review_comments(self, **kwargs):
             _maybe_raise("pulls.async_list_review_comments")
-            return _FakeResponse2(review_comments or [])
+            data = review_comments or []
+            # Same convention as issues.async_list_comments: if the
+            # fixture is a list of pages (list-of-lists), return the
+            # requested page; otherwise return the flat list as a
+            # single-page response.
+            if data and isinstance(data[0], list):
+                page = int(kwargs.get("page", 1))
+                return _FakeResponse2(data[page - 1] if page <= len(data) else [])
+            return _FakeResponse2(data)
 
         async def async_get(self, **_):
             _maybe_raise("pulls.async_get")
@@ -390,6 +398,62 @@ async def test_list_pr_review_comments_carries_review_id_and_original_line():
     # has a line to report for outdated / shifted comments.
     assert out[1].line == 42
     assert out[1].pull_request_review_id is None
+
+
+@pytest.mark.asyncio
+async def test_list_pr_review_comments_paginates_until_short_page():
+    """Copilot R2 concern: a full first page would previously drop
+    anything past per_page=30 because the wrapper issued a single
+    unbounded call. Now the loop walks pages until a short page,
+    matching :meth:`list_pr_issue_comments`' shape.
+    """
+    c = GithubClient(token="t")
+    first_page = [
+        _FakeReviewComment(i, f"f{i}.py", i, f"nit {i}") for i in range(100)
+    ]
+    second_page = [_FakeReviewComment(200, "late.py", 1, "last inline")]
+    _install_fake_gh(c, review_comments=[first_page, second_page])
+    out = await c.list_pr_review_comments("o/n", 3)
+    assert len(out) == 101
+    # Order is preserved across pages, and the final element is the
+    # single entry from the second (short) page.
+    assert out[-1].body == "last inline"
+    assert out[-1].id == 200
+
+
+@pytest.mark.asyncio
+async def test_list_pr_review_comments_normalizes_datetime_to_iso():
+    """Copilot R2 correctness: when githubkit returns ``created_at`` as a
+    Python ``datetime`` instance, the wrapper must emit ISO-8601 (``T``
+    separator) — not the space-separated ``str(datetime)`` form that
+    downstream consumers (``pr.inline_finding.posted_at``) treat as
+    broken.
+    """
+    from datetime import datetime, timezone
+
+    dt = datetime(2026, 4, 23, 2, 25, 19, tzinfo=timezone.utc)
+    c = GithubClient(token="t")
+    _install_fake_gh(c, review_comments=[
+        _FakeReviewComment(30, "a.py", 1, "hi", created_at=dt),
+    ])
+    out = await c.list_pr_review_comments("o/n", 3)
+    assert out[0].created_at == "2026-04-23T02:25:19+00:00"
+    # Guardrail: no space-separated form slipped through.
+    assert " " not in out[0].created_at
+
+
+def test_as_iso_helper_roundtrip():
+    """``_as_iso`` returns ISO for datetimes, passes through existing
+    strings, and coerces ``None`` to an empty string.
+    """
+    from datetime import datetime, timezone
+
+    from developer.github_client import _as_iso
+
+    assert _as_iso(None) == ""
+    assert _as_iso("2026-04-23T02:25:19+00:00") == "2026-04-23T02:25:19+00:00"
+    dt = datetime(2026, 4, 23, 2, 25, 19, tzinfo=timezone.utc)
+    assert _as_iso(dt) == "2026-04-23T02:25:19+00:00"
 
 
 @pytest.mark.asyncio
