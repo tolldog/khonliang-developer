@@ -21,7 +21,9 @@ from khonliang.knowledge.store import KnowledgeStore
 from khonliang.knowledge.triples import TripleStore
 from khonliang_researcher.doc_reader import LocalDocReader
 
+from developer.bug_store import BugStore
 from developer.config import Config
+from developer.dogfood_store import DogfoodStore
 from developer.fr_store import FRStore
 from developer.milestone_store import MilestoneStore
 from developer.researcher_client import ResearcherClient
@@ -51,6 +53,8 @@ class Pipeline:
     developer_guide_text: str
     frs: FRStore
     milestones: MilestoneStore
+    bugs: BugStore
+    dogfood: DogfoodStore
 
     @classmethod
     def from_config(cls, config: Config) -> "Pipeline":
@@ -99,6 +103,12 @@ class Pipeline:
 
         milestones = MilestoneStore(knowledge=knowledge)
 
+        # Tracking-infrastructure stores (Phase 1: CRUD-only slice).
+        # Seed-on-construction writes curated entries from the FR bodies
+        # on a fresh DB; subsequent inits are no-ops once the rows exist.
+        bugs = BugStore(knowledge=knowledge)
+        dogfood = DogfoodStore(knowledge=knowledge)
+
         return cls(
             config=config,
             knowledge=knowledge,
@@ -110,6 +120,8 @@ class Pipeline:
             developer_guide_text=guide_text,
             frs=frs,
             milestones=milestones,
+            bugs=bugs,
+            dogfood=dogfood,
         )
 
 

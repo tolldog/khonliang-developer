@@ -20,7 +20,8 @@ def test_skill_count(harness):
     # + repo hygiene audit/apply
     # + PR fleet watcher trio (watch/list/stop)
     # + pr_fleet_status snapshot (fr_developer_fafb36f1).
-    assert len(harness.skills) == 51
+    # + tracking-infrastructure Phase 1 (BugStore 6 + DogfoodStore 3 = 9).
+    assert len(harness.skills) == 60
 
 
 def test_skills_registered(harness):
@@ -54,6 +55,12 @@ def test_skills_registered(harness):
         "watch_pr_fleet", "list_pr_watchers", "stop_pr_watcher",
         # fleet-digest snapshot (fr_developer_fafb36f1)
         "pr_fleet_status",
+        # tracking-infrastructure Phase 1 (fr_developer_f669bd33 +
+        # fr_developer_1324440c): BugStore + DogfoodStore CRUD. Phase 2
+        # adds triage_bug / triage_dogfood / report_gap hook / GH ingest.
+        "file_bug", "list_bugs", "get_bug", "update_bug_status",
+        "link_bug_pr", "close_bug",
+        "log_dogfood", "list_dogfood", "get_dogfood",
     }
     assert harness.skill_names == expected
 
@@ -453,7 +460,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 51
+    assert len(reg.skills) == 60
     assert len(reg.collaborations) == 1
 
 
