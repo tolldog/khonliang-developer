@@ -521,6 +521,10 @@ class PRFleetWatcher:
         for repo in self.config.repos:
             try:
                 open_numbers = await self._list_open_prs(repo)
+            except asyncio.CancelledError:
+                # CancelledError subclasses Exception (3.8+); never
+                # catch-and-continue past cooperative cancellation.
+                raise
             except Exception as e:
                 await self._emit_poll_error(repo, pr_number=0, reason=str(e))
                 continue
@@ -548,6 +552,11 @@ class PRFleetWatcher:
         for repo, pr_number in pairs:
             try:
                 snapshot = await self._fetch_snapshot(repo, pr_number)
+            except asyncio.CancelledError:
+                # CancelledError subclasses Exception; without this the
+                # per-PR "keep the watcher alive" fallback below would
+                # swallow cooperative shutdown mid-poll.
+                raise
             except GithubClientError as e:
                 await self._emit_poll_error(repo, pr_number, reason=str(e))
                 continue
@@ -796,6 +805,10 @@ class PRFleetWatcher:
             return False
         try:
             await self._publish(topic, payload)
+        except asyncio.CancelledError:
+            # CancelledError subclasses Exception; don't log-and-swallow
+            # cooperative cancellation during publish.
+            raise
         except Exception as e:
             logger.warning(
                 "PR watcher %s: publish %s failed: %s",
@@ -821,6 +834,8 @@ class PRFleetWatcher:
                     "at": self._now(),
                 },
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning(
                 "PR watcher %s: publish pr.poll_error failed: %s",
@@ -989,6 +1004,11 @@ class PRWatcherRegistry:
                 await live.task
             except (asyncio.CancelledError, Exception):
                 pass
+        except asyncio.CancelledError:
+            # If the caller themselves is being cancelled while waiting
+            # on live.task, propagate — don't swallow cooperative
+            # cancellation into the "shutdown succeeded" path.
+            raise
         except Exception:
             pass
         self.store.remove_watcher(watcher_id)
@@ -1014,6 +1034,11 @@ class PRWatcherRegistry:
         for watcher_id in ids:
             try:
                 await self.stop(watcher_id)
+            except asyncio.CancelledError:
+                # CancelledError subclasses Exception; without this the
+                # log-and-continue fallback would mask cooperative
+                # cancellation of the shutdown task itself.
+                raise
             except Exception as e:
                 logger.warning("registry shutdown: stop %s failed: %s", watcher_id, e)
 
@@ -1039,6 +1064,11 @@ class PRWatcherRegistry:
             if self_login_cache[0] is None:
                 try:
                     self_login_cache[0] = await gh.get_authenticated_user_login()
+                except asyncio.CancelledError:
+                    # CancelledError subclasses Exception; degrading to
+                    # empty here would swallow cooperative cancellation
+                    # of the watcher task mid-resolve.
+                    raise
                 except Exception:
                     # On failure, degrade to empty — filter disabled,
                     # watcher keeps running. Subscribers may see
@@ -1222,6 +1252,10 @@ async def _list_open_pr_numbers(gh: GithubClient, repo: str) -> list[int]:
         resp = await client.rest.pulls.async_list(
             owner=owner, repo=name, state="open", per_page=100,
         )
+    except asyncio.CancelledError:
+        # CancelledError subclasses Exception; re-raise so cooperative
+        # cancellation doesn't get wrapped as a GithubClientError.
+        raise
     except Exception as e:
         raise GithubClientError(f"list_open_prs({repo}): {e}") from e
     return [pr.number for pr in resp.parsed_data]

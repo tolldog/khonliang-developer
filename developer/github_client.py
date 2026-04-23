@@ -176,6 +176,10 @@ class GithubClient:
             resp = await self._client().rest.pulls.async_list_reviews(
                 owner=owner, repo=name, pull_number=pr_number,
             )
+        except asyncio.CancelledError:
+            # CancelledError subclasses Exception (since 3.8); never
+            # convert cooperative cancellation into GithubClientError.
+            raise
         except Exception as e:
             raise GithubClientError(f"list_pr_reviews({repo}#{pr_number}): {e}") from e
 
@@ -243,6 +247,11 @@ class GithubClient:
                 if len(batch) < 100:
                     break
                 page += 1
+        except asyncio.CancelledError:
+            # CancelledError is a subclass of Exception (3.8+); never
+            # let the generic fallback convert cooperative cancellation
+            # into a GithubClientError.
+            raise
         except Exception as e:
             raise GithubClientError(
                 f"list_pr_review_comments({repo}#{pr_number}): {e}"
@@ -260,6 +269,8 @@ class GithubClient:
             resp = await self._client().rest.issues.async_create_comment(
                 owner=owner, repo=name, issue_number=pr_number, body=body,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             raise GithubClientError(f"post_pr_comment({repo}#{pr_number}): {e}") from e
         return resp.parsed_data.id
@@ -293,6 +304,8 @@ class GithubClient:
                 if len(batch) < 100:
                     break
                 page += 1
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             raise GithubClientError(f"list_pr_issue_comments({repo}#{pr_number}): {e}") from e
         return comments
@@ -317,6 +330,8 @@ class GithubClient:
             resp = await self._client().rest.pulls.async_get(
                 owner=owner, repo=name, pull_number=pr_number,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             raise GithubClientError(f"get_pr({repo}#{pr_number}): {e}") from e
         pr = resp.parsed_data
@@ -431,6 +446,8 @@ class GithubClient:
                 owner=owner, repo=name, title=title, body=body,
                 head=head, base=base, draft=draft,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             raise GithubClientError(f"create_pr({repo}, {head}→{base}): {e}") from e
         pr = resp.parsed_data
@@ -466,6 +483,8 @@ class GithubClient:
 
         try:
             resp = await self._client().rest.pulls.async_merge(**kwargs)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             status = getattr(getattr(e, "response", None), "status_code", None)
             if status == 405:
@@ -507,6 +526,10 @@ class GithubClient:
             return ""
         try:
             resp = await self._client().rest.users.async_get_authenticated()
+        except asyncio.CancelledError:
+            # Degrade-to-empty is for transient API failures, not for
+            # cooperative cancellation — let the task actually stop.
+            raise
         except Exception as e:
             logger.warning("get_authenticated_user_login failed: %s", e)
             return ""

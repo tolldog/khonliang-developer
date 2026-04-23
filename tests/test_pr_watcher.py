@@ -1739,3 +1739,158 @@ async def test_seen_caches_prune_when_pr_drops_out_of_active_set(store):
     await watcher.poll_once()
     assert watcher._seen_issue_comment_ids == {}
     assert watcher._seen_inline_finding_ids == {}
+
+
+# ---------------------------------------------------------------------------
+# Cooperative cancellation propagation (PR #39 Copilot R4).
+#
+# ``asyncio.CancelledError`` subclasses ``Exception`` (Python 3.8+), so a
+# bare ``except Exception`` silently converts cancellation into the
+# error-isolation / degrade-to-empty / log-and-continue path. These tests
+# pin that ``poll_once`` and ``_resolve_self_login`` let ``CancelledError``
+# propagate out of those fallbacks — without the explicit
+# ``except asyncio.CancelledError: raise`` guard, cancelling a watcher
+# mid-poll would look identical to a transient API glitch and the task
+# would silently refuse to stop.
+# ---------------------------------------------------------------------------
+
+
+async def test_poll_once_propagates_cancellation_from_fetch_snapshot(store):
+    """``poll_once`` wraps ``_fetch_snapshot`` in ``except Exception`` to
+    keep the watcher alive through transient errors. CancelledError must
+    short-circuit that fallback so shutdown actually shuts down."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published)
+    gh.errors[("owner/repo", 1)] = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await watcher.poll_once()
+    # And no poll_error was published — the broad-Exception fallback
+    # must not have run.
+    assert not [t for t, _ in published if t == TOPIC_POLL_ERROR]
+
+
+async def test_poll_once_propagates_cancellation_from_list_open_prs(store):
+    """Watch-all-open-PRs mode resolves the PR set via ``_list_open_prs``
+    with its own ``except Exception`` fallback (the one that emits
+    ``pr.poll_error`` and ``continue``s). CancelledError there must also
+    propagate — otherwise cancelling during fleet discovery silently
+    returns an empty pair list and the watcher keeps polling."""
+
+    async def publish(topic: str, payload: dict) -> None:
+        pass
+
+    async def fetch_snapshot(repo, pr_number):  # pragma: no cover
+        raise AssertionError("should not be reached once list_open_prs cancels")
+
+    async def list_open_prs(repo: str) -> list[int]:
+        raise asyncio.CancelledError()
+
+    # Use pr_numbers=[] directly (bypassing _make_watcher's truthiness
+    # fallback) so poll_once takes the fleet-discovery path instead of
+    # the explicit list.
+    config = PRWatcherConfig(
+        watcher_id="prw_cancel_list_open",
+        repos=["owner/repo"],
+        pr_numbers=[],
+        interval_s=60,
+        started_at=0.0,
+    )
+    store.register_watcher(
+        watcher_id=config.watcher_id,
+        repos=config.repos,
+        pr_numbers=config.pr_numbers,
+        interval_s=config.interval_s,
+        started_at=config.started_at,
+    )
+    watcher = PRFleetWatcher(
+        config=config,
+        store=store,
+        publish=publish,
+        fetch_snapshot=fetch_snapshot,
+        list_open_prs=list_open_prs,
+        now_fn=lambda: 0.0,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await watcher.poll_once()
+
+
+async def test_default_factory_resolve_self_login_propagates_cancellation(monkeypatch, store):
+    """R4 site (``pr_watcher.py:1047``): ``_default_factory`` wires a
+    ``_resolve_self_login`` closure that degrades to empty on failure so
+    a broken /user endpoint can't take down the watcher. The degrade must
+    NOT apply to CancelledError — that would swallow cooperative
+    cancellation of the watcher task mid-resolve.
+
+    We exercise the real factory-constructed closure by calling the
+    watcher's ``_fetch_snapshot`` — which invokes ``_resolve_self_login``
+    first — with a ``GithubClient`` whose ``get_authenticated_user_login``
+    raises ``CancelledError``.
+    """
+    from developer import pr_watcher as _pw
+
+    class _CancellingClient:
+        async def get_authenticated_user_login(self) -> str:
+            raise asyncio.CancelledError()
+
+    # The factory constructs its own GithubClient(); patch the symbol in
+    # the module so the closure captures our cancelling stub instead.
+    monkeypatch.setattr(_pw, "GithubClient", lambda *a, **kw: _CancellingClient())
+
+    # Minimal shim providing the two attrs _default_factory pulls off self.
+    class _Shim:
+        _default_factory = _pw.PRWatcherRegistry._default_factory
+
+        def __init__(self, store):
+            self.store = store
+
+        async def _publish(self, topic: str, payload: dict) -> None:  # pragma: no cover
+            pass
+
+    config = PRWatcherConfig(
+        watcher_id="prw_cancel_self_login",
+        repos=["owner/repo"],
+        pr_numbers=[1],
+        interval_s=60,
+        started_at=0.0,
+    )
+    store.register_watcher(
+        watcher_id=config.watcher_id,
+        repos=config.repos,
+        pr_numbers=config.pr_numbers,
+        interval_s=config.interval_s,
+        started_at=config.started_at,
+    )
+    shim = _Shim(store)
+    watcher = shim._default_factory(config)
+
+    # Any call that triggers the fetch_snapshot closure — which resolves
+    # self_login first — must surface CancelledError instead of
+    # converting it to empty-string.
+    with pytest.raises(asyncio.CancelledError):
+        await watcher._fetch_snapshot("owner/repo", 1)
+
+
+async def test_list_open_pr_numbers_propagates_cancellation():
+    """Free function ``_list_open_pr_numbers`` wraps ``pulls.async_list``
+    in ``except Exception`` that raises ``GithubClientError``. Cancel
+    path must short-circuit that mapping."""
+    from developer.pr_watcher import _list_open_pr_numbers
+
+    class _Pulls:
+        async def async_list(self, **_):
+            raise asyncio.CancelledError()
+
+    class _Rest:
+        pulls = _Pulls()
+
+    class _Client:
+        rest = _Rest()
+
+    class _GhStub:
+        _token = "t"
+        def _client(self):
+            return _Client()
+
+    with pytest.raises(asyncio.CancelledError):
+        await _list_open_pr_numbers(_GhStub(), "owner/repo")

@@ -7,6 +7,8 @@ integration-test territory and would need a token + network.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from developer.github_client import (
@@ -855,3 +857,116 @@ async def test_get_authenticated_user_login_swallows_errors():
 
     c._gh = _Gh()
     assert await c.get_authenticated_user_login() == ""
+
+
+# ---------------------------------------------------------------------------
+# Cooperative cancellation propagation (PR #39 Copilot R4).
+#
+# ``asyncio.CancelledError`` is a subclass of ``Exception`` (Python 3.8+),
+# which means a bare ``except Exception`` will swallow it and defeat
+# cooperative cancellation. Every wrapper that catches ``Exception``
+# around an ``await`` must therefore re-raise ``CancelledError`` before
+# the generic fallback. These tests pin that invariant so a future edit
+# that drops the ``except asyncio.CancelledError: raise`` clause fails
+# loudly instead of silently converting cancellation into "success with
+# degraded value" (``get_authenticated_user_login``) or a
+# ``GithubClientError`` (the other wrappers).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_pr_review_comments_propagates_cancellation():
+    """R4 site: the paging loop's ``except Exception`` must not convert
+    ``CancelledError`` into ``GithubClientError``."""
+    c = GithubClient(token="t")
+    _install_fake_gh(
+        c,
+        raise_on={"pulls.async_list_review_comments": asyncio.CancelledError()},
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await c.list_pr_review_comments("o/n", 3)
+
+
+@pytest.mark.asyncio
+async def test_get_authenticated_user_login_propagates_cancellation():
+    """R4 site: the degrade-to-empty fallback must not swallow
+    ``CancelledError`` — otherwise watcher shutdown mid-resolve would
+    silently complete instead of cancelling cooperatively."""
+    c = GithubClient(token="t")
+
+    class _Users:
+        async def async_get_authenticated(self, **_):
+            raise asyncio.CancelledError()
+
+    class _Rest:
+        users = _Users()
+
+    class _Gh:
+        rest = _Rest()
+
+    c._gh = _Gh()
+    with pytest.raises(asyncio.CancelledError):
+        await c.get_authenticated_user_login()
+
+
+@pytest.mark.asyncio
+async def test_list_pr_reviews_propagates_cancellation():
+    """Same shape as R4 applied to the sibling raise-as-GithubClientError
+    wrappers — grep swept all eight sites in this module."""
+    c = GithubClient(token="t")
+    _install_fake_gh(
+        c,
+        raise_on={"pulls.async_list_reviews": asyncio.CancelledError()},
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await c.list_pr_reviews("o/n", 7)
+
+
+@pytest.mark.asyncio
+async def test_get_pr_propagates_cancellation():
+    c = GithubClient(token="t")
+    _install_fake_gh(c, raise_on={"pulls.async_get": asyncio.CancelledError()})
+    with pytest.raises(asyncio.CancelledError):
+        await c.get_pr("o/n", 3)
+
+
+@pytest.mark.asyncio
+async def test_merge_pr_propagates_cancellation():
+    """merge_pr has the most elaborate post-catch logic (405/409 → typed
+    errors). The CancelledError guard must fire BEFORE that mapping so a
+    cancelled merge doesn't bubble up as a ``GithubMergeBlockedError`` or
+    ``GithubMergeConflictError``."""
+    c = GithubClient(token="t")
+    _install_fake_gh(c, raise_on={"pulls.async_merge": asyncio.CancelledError()})
+    with pytest.raises(asyncio.CancelledError):
+        await c.merge_pr("o/n", 3)
+
+
+@pytest.mark.asyncio
+async def test_list_pr_issue_comments_propagates_cancellation():
+    c = GithubClient(token="t")
+    _install_fake_gh(
+        c,
+        raise_on={"issues.async_list_comments": asyncio.CancelledError()},
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await c.list_pr_issue_comments("o/n", 3)
+
+
+@pytest.mark.asyncio
+async def test_post_pr_comment_propagates_cancellation():
+    c = GithubClient(token="t")
+    _install_fake_gh(
+        c,
+        raise_on={"issues.async_create_comment": asyncio.CancelledError()},
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await c.post_pr_comment("o/n", 3, "hi")
+
+
+@pytest.mark.asyncio
+async def test_create_pr_propagates_cancellation():
+    c = GithubClient(token="t")
+    _install_fake_gh(c, raise_on={"pulls.async_create": asyncio.CancelledError()})
+    with pytest.raises(asyncio.CancelledError):
+        await c.create_pr("o/n", title="t", body="b", head="h")
