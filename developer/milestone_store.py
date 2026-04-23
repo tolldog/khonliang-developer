@@ -38,6 +38,13 @@ MILESTONE_STATUS_SUPERSEDED = "superseded"
 # ``archived`` predates this FR and is kept as a legacy synonym for
 # ``abandoned`` so existing on-disk milestones keep loading cleanly.
 # New code should prefer ``abandoned``.
+#
+# On write, :meth:`MilestoneStore.update_status` normalizes incoming
+# ``archived`` to ``abandoned`` (with a ``normalized_from`` audit marker)
+# so there is exactly one terminal-abandon status going forward.
+# :meth:`MilestoneStore.list` still filters both values out when
+# ``include_archived=False`` so legacy on-disk ``archived`` rows stay
+# hidden by default. PR #43 Copilot R6 finding 4.
 MILESTONE_STATUS_ARCHIVED = "archived"
 
 ACTIVE_MILESTONE_STATUSES = {
@@ -54,8 +61,12 @@ TERMINAL_MILESTONE_STATUSES = {
 ALL_MILESTONE_STATUSES = ACTIVE_MILESTONE_STATUSES | TERMINAL_MILESTONE_STATUSES
 
 # Allowed forward transitions. The lifecycle is monotonic-forward:
-# proposed → planned → in_progress → (completed | abandoned | superseded |
-# archived). Terminal states have no outgoing edges.
+# proposed → planned → in_progress → (completed | abandoned). Terminal
+# states have no outgoing edges. ``superseded`` is reachable only via
+# :meth:`MilestoneStore.supersede` (which takes the required
+# ``superseded_by`` back-pointer); :meth:`MilestoneStore.update_status`
+# rejects ``status="superseded"``. ``archived`` is a legacy synonym for
+# ``abandoned`` and is normalized to ``abandoned`` on write.
 #
 # Forward shortcuts (allowed without force):
 #   * proposed → in_progress — skip the ``planned`` step when the caller
@@ -63,9 +74,11 @@ ALL_MILESTONE_STATUSES = ACTIVE_MILESTONE_STATUSES | TERMINAL_MILESTONE_STATUSES
 #     callers through ``planned`` first is ceremony without signal; the
 #     ``proposed → in_progress`` path is a common lightweight flow.
 #
-# Sideways jumps to terminal states (abandoned / superseded / archived)
-# from any active status are allowed without force since they do not
-# reopen work.
+# Sideways jumps to the terminal ``abandoned`` state from any active
+# status are allowed without force since they do not reopen work.
+# ``superseded`` is excluded from this shortcut set — callers must go
+# through :meth:`MilestoneStore.supersede` so the back-pointer is always
+# set.
 #
 # ANY backward edge (completed → in_progress, in_progress → planned,
 # planned → proposed, etc.) requires the caller to pass ``force=True``
@@ -172,7 +185,15 @@ class MilestoneStore:
                 continue
             if status and milestone.status != status:
                 continue
-            if not include_archived and milestone.status == MILESTONE_STATUS_ARCHIVED:
+            # ``archived`` is the legacy synonym for ``abandoned`` (see the
+            # module-level status notes). Treat them as one terminal
+            # category for filtering purposes so legacy on-disk rows and
+            # freshly-abandoned milestones behave the same way when
+            # ``include_archived=False``. PR #43 Copilot R6 finding 4.
+            if not include_archived and milestone.status in (
+                MILESTONE_STATUS_ARCHIVED,
+                MILESTONE_STATUS_ABANDONED,
+            ):
                 continue
             milestones.append(milestone)
 
@@ -302,9 +323,14 @@ class MilestoneStore:
         proposed → planned → in_progress → terminal. One forward
         shortcut is allowed without force: ``proposed → in_progress``
         (skipping ``planned``) for the common "decided to start
-        immediately" flow. Sideways jumps to terminal states (abandoned
-        / superseded / archived) from any active status are also
-        allowed without force.
+        immediately" flow. Sideways jumps to the terminal ``abandoned``
+        state from any active status are also allowed without force.
+
+        ``status="superseded"`` is rejected by this skill — use
+        :meth:`supersede` (which takes the required ``superseded_by``
+        back-pointer). ``status="archived"`` is normalized to
+        ``abandoned`` on write with a ``normalized_from`` audit marker;
+        see module-level notes on the archived/abandoned synonym.
 
         Any backward edge (e.g. completed → in_progress, in_progress →
         planned, planned → proposed) requires ``force=True``; the
@@ -329,6 +355,16 @@ class MilestoneStore:
                 "rationale=...) to set superseded status — update_status "
                 "cannot supply the required superseded_by pointer"
             )
+        # ``archived`` is the legacy synonym for ``abandoned``. Normalize
+        # incoming writes so there is exactly one terminal-abandon value
+        # going forward; the audit row records the pre-normalization
+        # request so the history still reflects what the caller asked
+        # for. PR #43 Copilot R6 finding 4.
+        normalized_from: Optional[str] = None
+        if status == MILESTONE_STATUS_ARCHIVED:
+            normalized_from = MILESTONE_STATUS_ARCHIVED
+            status = MILESTONE_STATUS_ABANDONED
+
         milestone = self.get(milestone_id)
         if milestone is None:
             raise MilestoneError(f"unknown milestone id: {milestone_id}")
@@ -336,11 +372,15 @@ class MilestoneStore:
         now = time.time()
 
         if milestone.status == status:
-            if notes:
-                milestone.notes_history.append({
+            if notes or normalized_from:
+                entry: dict[str, Any] = {
                     "at": now, "status": status, "notes": notes,
-                })
+                }
+                if normalized_from:
+                    entry["normalized_from"] = normalized_from
+                milestone.notes_history.append(entry)
                 milestone.updated_at = now
+                self._refresh_draft_spec(milestone)
                 self._store(milestone)
             return milestone
 
@@ -364,6 +404,8 @@ class MilestoneStore:
         }
         if forced:
             entry["force_rollback"] = True
+        if normalized_from:
+            entry["normalized_from"] = normalized_from
         milestone.notes_history.append(entry)
         # Force-rolling OUT of ``superseded`` must clear the stale
         # back-pointer — otherwise the milestone ends up in (e.g.)
@@ -378,6 +420,11 @@ class MilestoneStore:
             milestone.superseded_by = ""
         milestone.status = status
         milestone.updated_at = now
+        # Recompute the cached ``draft_spec`` markdown so the embedded
+        # ``**Status:** ...`` line matches the new status. Callers of
+        # ``draft_spec_from_milestone`` otherwise see a stale line after
+        # every transition. PR #43 Copilot R6 finding 1.
+        self._refresh_draft_spec(milestone)
         self._store(milestone)
         return milestone
 
@@ -427,6 +474,9 @@ class MilestoneStore:
             "superseded_by": superseded_by_id,
         })
         superseded.updated_at = now
+        # Refresh the cached draft_spec so the ``**Status:**`` line
+        # matches the new superseded status. PR #43 Copilot R6 finding 1.
+        self._refresh_draft_spec(superseded)
         self._store(superseded)
         return superseded
 
@@ -485,6 +535,15 @@ class MilestoneStore:
 
         now = time.time()
         milestone.fr_ids = new_ids
+        # ``work_unit["frs"]`` is the source of truth for
+        # :meth:`review_scope` and :func:`_draft_spec`; keeping it in
+        # sync with ``fr_ids`` avoids stale bundles leaking into scope
+        # review, duplicate detection, and the rendered draft_spec.
+        # Preserve descriptions/priorities for surviving entries and
+        # drop removed ones; newly-added entries get a minimal dict with
+        # the id alone so downstream helpers don't crash on missing
+        # keys. PR #43 Copilot R6 finding 2.
+        _sync_work_unit_frs(milestone.work_unit, new_ids)
         audit = {
             "at": now,
             "status": milestone.status,
@@ -494,6 +553,10 @@ class MilestoneStore:
         }
         milestone.notes_history.append(audit)
         milestone.updated_at = now
+        # Refresh the cached draft_spec so its "## Feature Requests"
+        # bullet list matches the new bundle. PR #43 Copilot R6
+        # finding 2.
+        self._refresh_draft_spec(milestone)
         self._store(milestone)
         return milestone
 
@@ -625,6 +688,25 @@ class MilestoneStore:
             "removed": bool(removed),
             "reason": reason,
         }
+
+    def _refresh_draft_spec(self, milestone: Milestone) -> None:
+        """Recompute ``milestone.draft_spec`` from current milestone state.
+
+        The cached ``draft_spec`` markdown embeds ``**Status:** ...`` and
+        a bullet list of the FR bundle; any mutation that changes
+        ``status``, ``title``, ``summary``, ``target``, or the FR bundle
+        must recompute it in lock-step or ``draft_spec_from_milestone``
+        callers see stale content. Centralized here so every mutation
+        path (update_status, supersede, update_frs) calls the same
+        recompute. PR #43 Copilot R6 findings 1 + 2.
+        """
+        milestone.draft_spec = _draft_spec(
+            milestone.title,
+            milestone.target,
+            milestone.summary,
+            milestone.work_unit,
+            status=milestone.status,
+        )
 
     def _store(self, milestone: Milestone) -> None:
         entry = KnowledgeEntry(
@@ -771,6 +853,34 @@ def _draft_spec(
         "- A follow-up spec can refine design decisions before coding starts.",
     ])
     return "\n".join(lines)
+
+
+def _sync_work_unit_frs(work_unit: dict[str, Any], new_fr_ids: list[str]) -> None:
+    """Align ``work_unit["frs"]`` with ``new_fr_ids`` in-place.
+
+    Preserves existing description/priority metadata for surviving
+    entries so :meth:`review_scope` and :func:`_draft_spec` keep their
+    context. Removed entries are dropped; added entries land as minimal
+    ``{"fr_id": ...}`` dicts (downstream helpers tolerate missing
+    description/priority). Order follows ``new_fr_ids``.
+
+    Operates on both list-of-dict and list-of-str shapes, since
+    ``propose_from_work_unit`` already normalizes bare-str fr items via
+    ``_fr_id_from_item``. PR #43 Copilot R6 finding 2.
+    """
+    existing = work_unit.get("frs") or []
+    by_id: dict[str, Any] = {}
+    for item in existing:
+        fid = _fr_id_from_item(item)
+        if fid:
+            by_id[fid] = item
+    rebuilt: list[Any] = []
+    for fid in new_fr_ids:
+        if fid in by_id:
+            rebuilt.append(by_id[fid])
+        else:
+            rebuilt.append({"fr_id": fid})
+    work_unit["frs"] = rebuilt
 
 
 def _fr_description_with_priority(fr: dict[str, Any]) -> str:

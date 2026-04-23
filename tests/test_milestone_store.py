@@ -6,6 +6,7 @@ import pytest
 
 from developer.milestone_store import (
     MILESTONE_STATUS_ABANDONED,
+    MILESTONE_STATUS_ARCHIVED,
     MILESTONE_STATUS_COMPLETED,
     MILESTONE_STATUS_IN_PROGRESS,
     MILESTONE_STATUS_PROPOSED,
@@ -485,6 +486,146 @@ def test_update_status_rejects_superseded_transition(pipeline):
     reloaded = pipeline.milestones.get(milestone.id)
     assert reloaded.status == MILESTONE_STATUS_PROPOSED
     assert reloaded.superseded_by == ""
+
+
+def test_update_status_refreshes_draft_spec(pipeline):
+    """Status transitions must refresh the cached draft_spec.
+
+    The cached ``draft_spec`` markdown embeds a ``**Status:** ...``
+    line; without a recompute on transition, ``draft_spec_from_milestone``
+    callers see a stale status. PR #43 Copilot R6 finding 1.
+    """
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+    assert "**Status:** proposed" in milestone.draft_spec
+
+    advanced = pipeline.milestones.update_status(
+        milestone.id, MILESTONE_STATUS_IN_PROGRESS, notes="starting",
+    )
+    assert "**Status:** in_progress" in advanced.draft_spec
+    assert "**Status:** proposed" not in advanced.draft_spec
+
+    # Confirm persistence: re-read and the cached draft_spec still reflects
+    # the new status (i.e. the refresh wrote through ``_store``).
+    reloaded = pipeline.milestones.get(milestone.id)
+    assert reloaded is not None
+    assert "**Status:** in_progress" in reloaded.draft_spec
+
+    completed = pipeline.milestones.update_status(
+        milestone.id, MILESTONE_STATUS_COMPLETED, notes="shipped",
+    )
+    assert "**Status:** completed" in completed.draft_spec
+
+
+def test_supersede_refreshes_draft_spec(pipeline):
+    """``supersede`` must refresh the cached draft_spec.
+
+    Same invariant as update_status: the embedded ``**Status:**`` line
+    would otherwise stay ``proposed`` on a milestone whose status has
+    flipped to ``superseded``. PR #43 Copilot R6 finding 1.
+    """
+    stale = pipeline.milestones.propose_from_work_unit(_work_unit())
+    replacement = pipeline.milestones.propose_from_work_unit(_second_work_unit())
+    assert "**Status:** proposed" in stale.draft_spec
+
+    superseded = pipeline.milestones.supersede(
+        stale.id, replacement.id, rationale="test",
+    )
+    assert "**Status:** superseded" in superseded.draft_spec
+
+    reloaded = pipeline.milestones.get(stale.id)
+    assert reloaded is not None
+    assert "**Status:** superseded" in reloaded.draft_spec
+
+
+def test_update_frs_refreshes_draft_spec_and_work_unit(pipeline):
+    """update_frs must sync work_unit["frs"] AND recompute draft_spec.
+
+    Without this, ``review_scope`` and ``draft_spec`` both operate off a
+    stale bundle while ``fr_ids`` reports the updated one — classic
+    split-brain. PR #43 Copilot R6 finding 2.
+    """
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+    original_ids = list(milestone.fr_ids)
+    assert original_ids[0] in milestone.draft_spec
+    # Baseline: work_unit["frs"] and fr_ids agree.
+    wu_ids_before = [
+        (fr.get("fr_id") if isinstance(fr, dict) else str(fr))
+        for fr in milestone.work_unit.get("frs") or []
+    ]
+    assert wu_ids_before == original_ids
+
+    updated = pipeline.milestones.update_frs(
+        milestone.id,
+        add_fr_ids=["fr_developer_freshadd"],
+        remove_fr_ids=[original_ids[0]],
+        notes="retarget",
+    )
+
+    # fr_ids changed as expected (baseline from earlier tests).
+    assert original_ids[0] not in updated.fr_ids
+    assert "fr_developer_freshadd" in updated.fr_ids
+
+    # work_unit["frs"] is in lock-step with fr_ids.
+    wu_ids_after = [
+        (fr.get("fr_id") if isinstance(fr, dict) else str(fr))
+        for fr in updated.work_unit.get("frs") or []
+    ]
+    assert wu_ids_after == updated.fr_ids
+
+    # Surviving entries keep their description/priority metadata.
+    surviving = next(
+        fr for fr in updated.work_unit["frs"]
+        if isinstance(fr, dict) and fr.get("fr_id") == original_ids[1]
+    )
+    assert surviving.get("priority") == "medium"
+
+    # draft_spec reflects the new bundle: added id present, removed id gone.
+    assert "fr_developer_freshadd" in updated.draft_spec
+    assert original_ids[0] not in updated.draft_spec
+
+    # Persistence: reload and the cached draft_spec / work_unit are still fresh.
+    reloaded = pipeline.milestones.get(milestone.id)
+    assert reloaded is not None
+    assert "fr_developer_freshadd" in reloaded.draft_spec
+    assert original_ids[0] not in reloaded.draft_spec
+    reloaded_wu_ids = [
+        (fr.get("fr_id") if isinstance(fr, dict) else str(fr))
+        for fr in reloaded.work_unit.get("frs") or []
+    ]
+    assert reloaded_wu_ids == reloaded.fr_ids
+
+
+def test_update_status_normalizes_archived_to_abandoned(pipeline):
+    """``status="archived"`` is normalized to ``abandoned`` on write.
+
+    ``archived`` is the legacy synonym for ``abandoned``; normalizing on
+    write gives exactly one terminal-abandon value going forward. The
+    audit row records the pre-normalization request via
+    ``normalized_from`` so the history still shows what the caller
+    asked for. PR #43 Copilot R6 finding 4 (Option A).
+    """
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+
+    abandoned = pipeline.milestones.update_status(
+        milestone.id, MILESTONE_STATUS_ARCHIVED, notes="legacy caller",
+    )
+    assert abandoned.status == MILESTONE_STATUS_ABANDONED
+
+    audit = abandoned.notes_history[-1]
+    assert audit["status"] == MILESTONE_STATUS_ABANDONED
+    assert audit["normalized_from"] == MILESTONE_STATUS_ARCHIVED
+
+    # Persistence.
+    reloaded = pipeline.milestones.get(milestone.id)
+    assert reloaded is not None
+    assert reloaded.status == MILESTONE_STATUS_ABANDONED
+
+    # ``list(include_archived=False)`` hides both archived (legacy) and
+    # abandoned (new terminal) — they're one category now.
+    assert milestone.id not in {m.id for m in pipeline.milestones.list()}
+    assert milestone.id in {
+        m.id for m in pipeline.milestones.list(include_archived=True)
+    }
 
 
 def test_update_status_force_out_of_superseded_clears_pointer(pipeline):
