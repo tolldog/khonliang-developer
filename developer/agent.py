@@ -1032,6 +1032,19 @@ class DeveloperAgent(BaseAgent):
             msg = f"scan artifact not found: {scan_id!r}"
             await self._safe_report_gap("distill_integration_points", msg)
             return {"error": msg}
+
+        # Artifact-type gate: refuse to distill entries that weren't
+        # produced by ``suggest_integration_points``. The caller could
+        # pass any KnowledgeEntry id whose content happens to parse as
+        # JSON; without this check we'd return a misleading
+        # ``from_artifact`` response instead of a clear error. PR #46
+        # Copilot R4 finding #1.
+        tags = getattr(entry, "tags", None) or []
+        if "scan_integration" not in tags:
+            msg = f"not an integration-scan artifact: {scan_id}"
+            await self._safe_report_gap("distill_integration_points", msg)
+            return {"error": msg}
+
         try:
             payload = json.loads(entry.content)
         except (ValueError, TypeError) as e:
@@ -1050,6 +1063,17 @@ class DeveloperAgent(BaseAgent):
             )
             await self._safe_report_gap("distill_integration_points", msg)
             return {"error": msg}
+
+        # Payload-shape gate: even with the scan_integration tag, the
+        # JSON body must carry the expected integration-scan keys
+        # (candidates + source). Otherwise it's either a corrupted
+        # artifact or a mis-tagged row — either way we shouldn't pretend
+        # to distill it. PR #46 Copilot R4 finding #1.
+        if "candidates" not in payload or "source" not in payload:
+            msg = f"not an integration-scan artifact: {scan_id}"
+            await self._safe_report_gap("distill_integration_points", msg)
+            return {"error": msg}
+
         raw_candidates = payload.get("candidates")
         if raw_candidates is None:
             raw_candidates = []
@@ -1125,9 +1149,19 @@ class DeveloperAgent(BaseAgent):
         extra: dict[str, Any] = {"from_artifact": True, "signal_filter": signal}
         if skipped:
             extra["skipped_items"] = skipped
+        # Rebuild the live-scan response shape: ``source.surface`` is a
+        # nested key on the suggest path (see handle_suggest_integration_points)
+        # but stored as a sibling of ``source`` in the artifact payload. Merge
+        # them back so distill and suggest responses are symmetric — callers
+        # reproducing a scan from the artifact can see what surface was
+        # scanned. PR #46 Copilot R4 finding #2.
+        merged_source: dict[str, Any] = dict(payload.get("source") or {})
+        stored_surface = payload.get("surface")
+        if stored_surface is not None and "surface" not in merged_source:
+            merged_source["surface"] = stored_surface
         return self._project_scan_response(
             scan_id=scan_id,
-            source=payload.get("source") or {},
+            source=merged_source,
             ranked=ranked,
             top_n=top_n,
             detail=detail,

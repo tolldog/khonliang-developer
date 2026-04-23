@@ -1124,3 +1124,219 @@ async def test_suggest_integration_points_returns_error_on_persistence_failure(
     # The computed id is still surfaced for observability, just under a
     # name that won't accidentally be passed to distill.
     assert result.get("scan_id_unpersisted", "").startswith("scan_integration_")
+
+
+# ---------------------------------------------------------------------------
+# Copilot R4 — distill rejects artifacts that aren't integration scans
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_distill_integration_points_rejects_non_scan_artifact(harness):
+    """If the caller passes a KnowledgeEntry id that parses as JSON but
+    isn't an integration-scan artifact, the handler must return a clear
+    error rather than a misleading ``from_artifact`` response.
+
+    Three gates are exercised:
+      * missing ``scan_integration`` tag
+      * correct tag but payload lacks ``candidates`` key
+      * correct tag but payload lacks ``source`` key
+
+    Regression for Copilot R4 finding #1.
+    """
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+
+    _install_empty_bus(harness)
+
+    def _put(scan_id: str, tags: list[str], content: str) -> None:
+        entry = KnowledgeEntry(
+            id=scan_id,
+            tier=Tier.DERIVED,
+            title=f"non-scan {scan_id}",
+            content=content,
+            source="developer.integration_scan",
+            scope="development",
+            confidence=1.0,
+            status=EntryStatus.DISTILLED,
+            tags=tags,
+            metadata={},
+        )
+        harness.agent.pipeline.knowledge.add(entry)
+
+    # 1. Wrong tag (or no scan_integration tag) — even if the JSON body
+    # superficially looks integration-scan-shaped. A caller could pass a
+    # random ingested-paper id here; we must refuse.
+    _put(
+        "some_other_artifact_01",
+        ["ingested_paper"],
+        json.dumps({
+            "source": {"kind": "fr", "id": "fr_developer_abc"},
+            "candidates": [],
+        }),
+    )
+    r1 = await harness.call(
+        "distill_integration_points",
+        {"scan_id": "some_other_artifact_01"},
+    )
+    assert "error" in r1
+    assert "not an integration-scan artifact" in r1["error"]
+    assert "some_other_artifact_01" in r1["error"]
+
+    # 2. scan_integration tag but payload missing the 'candidates' key —
+    # a corrupted or mis-tagged row.
+    _put(
+        "scan_integration_missingcand",
+        ["scan_integration"],
+        json.dumps({"source": {"kind": "fr", "id": "x"}}),
+    )
+    r2 = await harness.call(
+        "distill_integration_points",
+        {"scan_id": "scan_integration_missingcand"},
+    )
+    assert "error" in r2
+    assert "not an integration-scan artifact" in r2["error"]
+
+    # 3. scan_integration tag but payload missing the 'source' key.
+    _put(
+        "scan_integration_missingsrc",
+        ["scan_integration"],
+        json.dumps({"candidates": []}),
+    )
+    r3 = await harness.call(
+        "distill_integration_points",
+        {"scan_id": "scan_integration_missingsrc"},
+    )
+    assert "error" in r3
+    assert "not an integration-scan artifact" in r3["error"]
+
+
+# ---------------------------------------------------------------------------
+# Copilot R4 — distill echoes surface for symmetric reproduction
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_distill_integration_points_echoes_surface(harness):
+    """``distill_integration_points`` must echo ``source.surface`` so the
+    distill response mirrors the suggest response shape. Callers using
+    distill to reproduce a scan need the surface to know what was
+    scanned.
+
+    Regression for Copilot R4 finding #2.
+    """
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+
+    _install_empty_bus(harness)
+
+    scan_id = "scan_integration_echosurface"
+    stored_surface = {
+        "kind": "fr",
+        "id": "fr_developer_source",
+        "new_skills": ["wire_bug_triage"],
+        "new_events": ["bug.opened"],
+        "new_types": ["TriageReport"],
+        "topic_concepts": ["bug triage"],
+        "tokens": ["triage", "bug"],
+        "title": "Wire bug_opened event into triage loop",
+        "description": "...",
+    }
+    payload = {
+        "source": {"kind": "fr", "id": "fr_developer_source"},
+        "surface": stored_surface,
+        "candidates": [
+            {
+                "kind": "fr",
+                "target_id": "fr_developer_target",
+                "signal": integration_scan.SIGNAL_MIGRATE,
+                "score": 0.7,
+                "rationale": "overlap",
+                "metadata": {"status": "open"},
+            },
+        ],
+        "audience": "",
+    }
+    entry = KnowledgeEntry(
+        id=scan_id,
+        tier=Tier.DERIVED,
+        title="echo-surface test",
+        content=json.dumps(payload),
+        source="developer.integration_scan",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["scan_integration", "kind:fr"],
+        metadata={},
+    )
+    harness.agent.pipeline.knowledge.add(entry)
+
+    result = await harness.call(
+        "distill_integration_points",
+        {"scan_id": scan_id, "top_n": 5},
+    )
+    assert "error" not in result
+    # Response shape mirrors suggest: source.surface nested under source.
+    assert "source" in result
+    assert isinstance(result["source"], dict)
+    assert "surface" in result["source"], (
+        f"distill response must echo surface; got {result['source']!r}"
+    )
+    assert result["source"]["surface"]["new_skills"] == ["wire_bug_triage"]
+    assert result["source"]["surface"]["new_events"] == ["bug.opened"]
+    assert result["source"]["kind"] == "fr"
+    assert result["source"]["id"] == "fr_developer_source"
+
+
+# ---------------------------------------------------------------------------
+# Copilot R4 — apply_llm_rationales counts attempts, not successes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_apply_llm_rationales_counts_attempts_including_failures():
+    """``apply_llm_rationales`` must return the number of calls attempted,
+    not only the successful ones — the counter represents budget consumed
+    (each attempt burns a provider slot whether or not it returns a
+    rationale).
+
+    Regression for Copilot R4 finding #3: pre-fix the counter incremented
+    only after a successful call, so an artifact with 5 attempts and 2
+    failures reported ``llm_rationale_calls=3``, under-reporting the budget.
+    """
+    candidates = [
+        integration_scan.IntegrationCandidate(
+            kind="fr", target_id=f"fr_developer_{i}",
+            signal=integration_scan.SIGNAL_MIGRATE,
+            score=0.5, rationale="template",
+        )
+        for i in range(5)
+    ]
+    surface = integration_scan.FeatureSurface(
+        kind="fr", id="fr_developer_source",
+        title="t", description="d",
+    )
+
+    attempts = {"n": 0}
+
+    async def flaky_rationale(candidate, surface):
+        attempts["n"] += 1
+        # Fail on every other call to simulate provider flakiness.
+        if attempts["n"] % 2 == 0:
+            raise RuntimeError("provider hiccup")
+        return f"generated-{attempts['n']}"
+
+    result = await integration_scan.apply_llm_rationales(
+        candidates, surface, flaky_rationale, top_n=5,
+    )
+    # Attempted all 5 even though 2 raised. Returned counter == attempts.
+    assert attempts["n"] == 5
+    assert result == 5, (
+        "counter must reflect attempts (budget consumed), "
+        "not just successes"
+    )
+    # Successful rationales replaced the template on odd-indexed candidates.
+    rationales_replaced = sum(
+        1 for c in candidates if c.rationale.startswith("generated-")
+    )
+    assert rationales_replaced == 3, (
+        f"expected 3 successes / 2 failures; got {rationales_replaced} replacements"
+    )

@@ -709,20 +709,27 @@ async def apply_llm_rationales(
 ) -> int:
     """Invoke ``rationale_fn`` for the first ``top_n`` candidates only.
 
-    Returns the number of calls made. Template rationales (set by the
-    scan sources) remain on everything past the cap. Exceptions from
-    ``rationale_fn`` are swallowed per-candidate so one failure doesn't
-    poison the whole pass — the candidate keeps its template rationale.
+    Returns the number of calls attempted (including failures) — this is
+    the budget-relevant metric since each attempt burns a provider slot
+    regardless of outcome. Template rationales (set by the scan sources)
+    remain on everything past the cap, and on any candidate whose
+    ``rationale_fn`` raised. Exceptions are swallowed per-candidate so
+    one failure doesn't poison the whole pass. Callers that need the
+    success count can derive it as ``attempts - failures`` by tracking
+    exceptions themselves.
+
+    PR #46 Copilot R4 finding #3: pre-fix the counter incremented only
+    on success, which under-reported the budget consumed.
     """
     if rationale_fn is None or top_n <= 0:
         return 0
-    calls = 0
+    attempts = 0
     for c in candidates[:top_n]:
+        attempts += 1
         try:
             generated = await rationale_fn(c, surface)
         except Exception:
             continue
-        calls += 1
         if generated:
             c.rationale = generated
-    return calls
+    return attempts
