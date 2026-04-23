@@ -12,7 +12,7 @@ import hashlib
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from khonliang.knowledge.store import (
     EntryStatus,
@@ -21,19 +21,68 @@ from khonliang.knowledge.store import (
     Tier,
 )
 
+# The FR store is passed into :meth:`MilestoneStore.delete` as an
+# argument rather than imported here so milestone_store stays free of
+# any hard dependency on fr_store. The only place we need FR state is
+# the "FR in_progress in this milestone" safety guard on delete, and
+# duck-typing the argument keeps the module easy to unit-test in
+# isolation and avoids the (currently hypothetical) import cycle.
+
 
 MILESTONE_STATUS_PROPOSED = "proposed"
 MILESTONE_STATUS_PLANNED = "planned"
 MILESTONE_STATUS_IN_PROGRESS = "in_progress"
 MILESTONE_STATUS_COMPLETED = "completed"
+MILESTONE_STATUS_ABANDONED = "abandoned"
+MILESTONE_STATUS_SUPERSEDED = "superseded"
+# ``archived`` predates this FR and is kept as a legacy synonym for
+# ``abandoned`` so existing on-disk milestones keep loading cleanly.
+# New code should prefer ``abandoned``.
 MILESTONE_STATUS_ARCHIVED = "archived"
 
-ALL_MILESTONE_STATUSES = {
+ACTIVE_MILESTONE_STATUSES = {
     MILESTONE_STATUS_PROPOSED,
     MILESTONE_STATUS_PLANNED,
     MILESTONE_STATUS_IN_PROGRESS,
+}
+TERMINAL_MILESTONE_STATUSES = {
     MILESTONE_STATUS_COMPLETED,
+    MILESTONE_STATUS_ABANDONED,
+    MILESTONE_STATUS_SUPERSEDED,
     MILESTONE_STATUS_ARCHIVED,
+}
+ALL_MILESTONE_STATUSES = ACTIVE_MILESTONE_STATUSES | TERMINAL_MILESTONE_STATUSES
+
+# Allowed forward transitions. Terminal states have no outgoing edges —
+# rolling back out of a terminal state requires the caller to pass
+# ``force=True`` to :meth:`MilestoneStore.update_status` (and is
+# recorded in ``notes_history`` with a ``force_rollback`` marker).
+ALLOWED_MILESTONE_TRANSITIONS: dict[str, set[str]] = {
+    MILESTONE_STATUS_PROPOSED: {
+        MILESTONE_STATUS_PLANNED,
+        MILESTONE_STATUS_IN_PROGRESS,
+        MILESTONE_STATUS_ABANDONED,
+        MILESTONE_STATUS_SUPERSEDED,
+        MILESTONE_STATUS_ARCHIVED,
+    },
+    MILESTONE_STATUS_PLANNED: {
+        MILESTONE_STATUS_PROPOSED,
+        MILESTONE_STATUS_IN_PROGRESS,
+        MILESTONE_STATUS_ABANDONED,
+        MILESTONE_STATUS_SUPERSEDED,
+        MILESTONE_STATUS_ARCHIVED,
+    },
+    MILESTONE_STATUS_IN_PROGRESS: {
+        MILESTONE_STATUS_PLANNED,
+        MILESTONE_STATUS_COMPLETED,
+        MILESTONE_STATUS_ABANDONED,
+        MILESTONE_STATUS_SUPERSEDED,
+        MILESTONE_STATUS_ARCHIVED,
+    },
+    MILESTONE_STATUS_COMPLETED: set(),
+    MILESTONE_STATUS_ABANDONED: set(),
+    MILESTONE_STATUS_SUPERSEDED: set(),
+    MILESTONE_STATUS_ARCHIVED: set(),
 }
 
 
@@ -55,6 +104,8 @@ class Milestone:
     source: str = "work_unit"
     rank: int = 0
     draft_spec: str = ""
+    notes_history: list[dict] = field(default_factory=list)
+    superseded_by: str = ""
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -70,6 +121,8 @@ class Milestone:
             "source": self.source,
             "rank": self.rank,
             "draft_spec": self.draft_spec,
+            "notes_history": list(self.notes_history),
+            "superseded_by": self.superseded_by,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -150,6 +203,19 @@ class MilestoneStore:
         existing = self.get(milestone_id)
         created_at = existing.created_at if existing else now
         status = existing.status if existing else MILESTONE_STATUS_PROPOSED
+        # Preserve existing history + supersede pointer on re-propose;
+        # seed a ``proposed`` entry on first creation so every milestone
+        # has at least one audit row.
+        if existing is not None:
+            notes_history = list(existing.notes_history)
+            superseded_by = existing.superseded_by
+        else:
+            notes_history = [{
+                "at": now,
+                "status": MILESTONE_STATUS_PROPOSED,
+                "notes": "proposed",
+            }]
+            superseded_by = ""
         milestone = Milestone(
             id=milestone_id,
             title=milestone_title,
@@ -167,6 +233,8 @@ class MilestoneStore:
                 work_unit,
                 status=status,
             ),
+            notes_history=notes_history,
+            superseded_by=superseded_by,
             created_at=created_at,
             updated_at=now,
         )
@@ -203,6 +271,257 @@ class MilestoneStore:
             "recommendation": "refine_before_implementation" if issue_count else "ready_for_spec",
         }
 
+    # ------------------------------------------------------------------
+    # Lifecycle mutations (fr_developer_91a5a072)
+    # ------------------------------------------------------------------
+
+    def update_status(
+        self,
+        milestone_id: str,
+        status: str,
+        *,
+        notes: str = "",
+        force: bool = False,
+    ) -> Milestone:
+        """Transition a milestone among lifecycle statuses.
+
+        Default (``force=False``) enforces the forward-only transition
+        graph in :data:`ALLOWED_MILESTONE_TRANSITIONS`. Passing
+        ``force=True`` allows rollback out of a terminal state (the
+        audit entry records the force so the history makes it obvious).
+
+        The idempotent case (``status`` already matches) still appends
+        an audit note when ``notes`` is provided, so "confirmed in-
+        progress after crash recovery" leaves a trail.
+        """
+        if status not in ALL_MILESTONE_STATUSES:
+            raise MilestoneError(
+                f"status must be one of {sorted(ALL_MILESTONE_STATUSES)}, got {status!r}"
+            )
+        milestone = self.get(milestone_id)
+        if milestone is None:
+            raise MilestoneError(f"unknown milestone id: {milestone_id}")
+
+        now = time.time()
+
+        if milestone.status == status:
+            if notes:
+                milestone.notes_history.append({
+                    "at": now, "status": status, "notes": notes,
+                })
+                milestone.updated_at = now
+                self._store(milestone)
+            return milestone
+
+        allowed = ALLOWED_MILESTONE_TRANSITIONS.get(milestone.status, set())
+        forced = False
+        if status not in allowed:
+            if not force:
+                raise MilestoneError(
+                    f"illegal transition {milestone.status!r} -> {status!r} "
+                    f"for {milestone_id}. Allowed from {milestone.status!r}: "
+                    f"{sorted(allowed)}. Pass force=True to override "
+                    "(rollback from terminal state)."
+                )
+            forced = True
+
+        entry = {
+            "at": now,
+            "status": status,
+            "notes": notes,
+            "from_status": milestone.status,
+        }
+        if forced:
+            entry["force_rollback"] = True
+        milestone.notes_history.append(entry)
+        milestone.status = status
+        milestone.updated_at = now
+        self._store(milestone)
+        return milestone
+
+    def supersede(
+        self,
+        superseded_id: str,
+        superseded_by_id: str,
+        *,
+        rationale: str = "",
+    ) -> Milestone:
+        """Mark ``superseded_id`` as superseded by ``superseded_by_id``.
+
+        Writes a ``superseded_by`` back-pointer on the superseded
+        milestone and sets its status to ``superseded``. The new
+        milestone is unaffected — this intentionally does NOT cascade
+        to FR state (FRs may legitimately span multiple milestones).
+
+        Returns the updated superseded milestone.
+        """
+        superseded_id = (superseded_id or "").strip()
+        superseded_by_id = (superseded_by_id or "").strip()
+        if not superseded_id or not superseded_by_id:
+            raise MilestoneError(
+                "supersede requires both superseded_id and superseded_by_id"
+            )
+        if superseded_id == superseded_by_id:
+            raise MilestoneError(
+                "a milestone cannot supersede itself"
+            )
+        superseded = self.get(superseded_id)
+        if superseded is None:
+            raise MilestoneError(f"unknown milestone id: {superseded_id}")
+        superseder = self.get(superseded_by_id)
+        if superseder is None:
+            raise MilestoneError(
+                f"unknown superseder milestone id: {superseded_by_id}"
+            )
+
+        now = time.time()
+        note_text = rationale.strip() or f"superseded by {superseded_by_id}"
+        superseded.status = MILESTONE_STATUS_SUPERSEDED
+        superseded.superseded_by = superseded_by_id
+        superseded.notes_history.append({
+            "at": now,
+            "status": MILESTONE_STATUS_SUPERSEDED,
+            "notes": note_text,
+            "superseded_by": superseded_by_id,
+        })
+        superseded.updated_at = now
+        self._store(superseded)
+        return superseded
+
+    def update_frs(
+        self,
+        milestone_id: str,
+        *,
+        add_fr_ids: Optional[Iterable[str]] = None,
+        remove_fr_ids: Optional[Iterable[str]] = None,
+        notes: str = "",
+    ) -> Milestone:
+        """Mutate the FR bundle on a ``proposed`` milestone.
+
+        Refuses on any status other than ``proposed`` — once work has
+        started (or the milestone is terminal) the FR set should be
+        considered fixed for audit purposes. Removing an already-absent
+        id is a no-op (not an error); adding an already-present id is
+        likewise a no-op. Order within ``fr_ids`` is preserved for
+        surviving entries; new entries land at the end in the order
+        given.
+        """
+        milestone = self.get(milestone_id)
+        if milestone is None:
+            raise MilestoneError(f"unknown milestone id: {milestone_id}")
+        if milestone.status != MILESTONE_STATUS_PROPOSED:
+            raise MilestoneError(
+                f"cannot update_frs on milestone {milestone_id!r}: "
+                f"status is {milestone.status!r} (only 'proposed' is mutable; "
+                "use supersede_milestone to replace a milestone that's "
+                "already moved on)"
+            )
+
+        adds = [str(x).strip() for x in (add_fr_ids or []) if str(x).strip()]
+        removes = {str(x).strip() for x in (remove_fr_ids or []) if str(x).strip()}
+
+        new_ids = [fid for fid in milestone.fr_ids if fid not in removes]
+        added: list[str] = []
+        for fid in adds:
+            if fid in new_ids:
+                continue
+            new_ids.append(fid)
+            added.append(fid)
+        removed = [fid for fid in milestone.fr_ids if fid in removes]
+
+        if not added and not removed and not notes:
+            # Nothing to persist; return unchanged.
+            return milestone
+
+        now = time.time()
+        milestone.fr_ids = new_ids
+        audit = {
+            "at": now,
+            "status": milestone.status,
+            "notes": notes or "fr bundle updated",
+            "added_fr_ids": list(added),
+            "removed_fr_ids": list(removed),
+        }
+        milestone.notes_history.append(audit)
+        milestone.updated_at = now
+        self._store(milestone)
+        return milestone
+
+    def delete(
+        self,
+        milestone_id: str,
+        *,
+        reason: str = "",
+        fr_store: Any = None,
+    ) -> dict[str, Any]:
+        """Hard-delete a milestone.
+
+        Refuses if either:
+
+        * any FR in the milestone's ``fr_ids`` currently has status
+          ``in_progress`` (caller is expected to move those FRs off
+          the milestone or close them first), OR
+        * the milestone has any non-seed ``notes_history`` entries
+          (the seed is the single ``proposed`` row written at
+          creation time; anything beyond that means real mutations
+          have been recorded, and dropping the milestone would lose
+          that audit trail — use :meth:`supersede` instead).
+
+        ``fr_store`` is an optional :class:`developer.fr_store.FRStore`.
+        When not supplied, the in-progress check is skipped with a
+        ``skipped_fr_check`` marker in the returned payload — this is
+        the documented fallback for callers that don't have an FR store
+        wired in (tests, offline tools). The primary agent wiring is
+        expected to always supply it.
+        """
+        milestone = self.get(milestone_id)
+        if milestone is None:
+            raise MilestoneError(f"unknown milestone id: {milestone_id}")
+
+        if _has_non_seed_history(milestone.notes_history):
+            raise MilestoneError(
+                f"cannot delete milestone {milestone_id!r}: notes_history has "
+                f"{len(milestone.notes_history)} entries beyond the initial "
+                "seed (mutations recorded). Use supersede_milestone to "
+                "preserve the audit trail."
+            )
+
+        fr_check_skipped = False
+        blocking_frs: list[str] = []
+        if fr_store is not None and milestone.fr_ids:
+            for fr_id in milestone.fr_ids:
+                try:
+                    fr = fr_store.get(fr_id)
+                except Exception:
+                    # FR store raised on a specific id — skip, don't block
+                    # the whole delete on a store-side glitch.
+                    continue
+                if fr is None:
+                    continue
+                # Access the same status field surface the FR dataclass
+                # exposes; keep this loose so the module doesn't hard
+                # import fr_store for typing.
+                status = getattr(fr, "status", "")
+                if status == "in_progress":
+                    blocking_frs.append(fr.id)
+            if blocking_frs:
+                raise MilestoneError(
+                    f"cannot delete milestone {milestone_id!r}: FR(s) in "
+                    f"progress reference this milestone's bundle: "
+                    f"{blocking_frs}. Move those FRs to another milestone "
+                    "or complete them first."
+                )
+        elif fr_store is None and milestone.fr_ids:
+            fr_check_skipped = True
+
+        removed = self.knowledge.remove(milestone_id)
+        return {
+            "milestone_id": milestone_id,
+            "removed": bool(removed),
+            "reason": reason,
+            "skipped_fr_check": fr_check_skipped,
+        }
+
     def _store(self, milestone: Milestone) -> None:
         entry = KnowledgeEntry(
             id=milestone.id,
@@ -222,6 +541,8 @@ class MilestoneStore:
                 "source": milestone.source,
                 "rank": milestone.rank,
                 "draft_spec": milestone.draft_spec,
+                "notes_history": list(milestone.notes_history),
+                "superseded_by": milestone.superseded_by,
             },
             created_at=milestone.created_at,
             updated_at=milestone.updated_at,
@@ -235,6 +556,9 @@ class MilestoneStore:
 
 def _milestone_from_entry(entry: KnowledgeEntry) -> Milestone:
     meta = entry.metadata or {}
+    # ``notes_history`` and ``superseded_by`` were added after the first
+    # batch of milestones was persisted; default them to empty on read so
+    # older records load without a migration pass.
     return Milestone(
         id=entry.id,
         title=entry.title,
@@ -246,6 +570,8 @@ def _milestone_from_entry(entry: KnowledgeEntry) -> Milestone:
         source=meta.get("source", "work_unit"),
         rank=int(meta.get("rank") or 0),
         draft_spec=meta.get("draft_spec", ""),
+        notes_history=list(meta.get("notes_history") or []),
+        superseded_by=meta.get("superseded_by", "") or "",
         created_at=entry.created_at,
         updated_at=entry.updated_at,
     )
@@ -369,6 +695,29 @@ def _term_hits(frs: list[dict[str, Any]], terms: list[str]) -> list[dict[str, An
         if matched:
             hits.append({"term": clean, "frs": matched})
     return hits
+
+
+def _has_non_seed_history(history: list[dict]) -> bool:
+    """True if ``history`` contains any entry beyond the creation seed.
+
+    The seed is the single ``proposed`` row written by
+    :meth:`MilestoneStore.propose_from_work_unit`. For backward
+    compatibility with milestones that predated the notes_history
+    field entirely, an empty history is also treated as "no
+    non-seed entries" (nothing to lose).
+    """
+    if not history:
+        return False
+    if len(history) > 1:
+        return True
+    entry = history[0] if history else {}
+    # A legitimate seed row: status=proposed, notes is the canonical
+    # "proposed" marker. Anything else is a real mutation that
+    # predates this implementation (e.g. a prior update_status pass).
+    return not (
+        entry.get("status") == MILESTONE_STATUS_PROPOSED
+        and str(entry.get("notes", "")).strip() == "proposed"
+    )
 
 
 def _normalized_fr_description(fr: dict[str, Any]) -> str:

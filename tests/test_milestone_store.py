@@ -5,8 +5,11 @@ from __future__ import annotations
 import pytest
 
 from developer.milestone_store import (
+    MILESTONE_STATUS_ABANDONED,
+    MILESTONE_STATUS_COMPLETED,
     MILESTONE_STATUS_IN_PROGRESS,
     MILESTONE_STATUS_PROPOSED,
+    MILESTONE_STATUS_SUPERSEDED,
     MilestoneError,
 )
 
@@ -192,3 +195,168 @@ def test_review_scope_handles_string_fr_items(pipeline):
             ],
         }
     ]
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle mutations (fr_developer_91a5a072)
+# ---------------------------------------------------------------------------
+
+
+def _second_work_unit():
+    """A second, distinct work unit — used as the superseder target."""
+    return {
+        "name": "Cluster 2 (replacement)",
+        "rank": 2,
+        "size": 1,
+        "targets": ["developer"],
+        "max_priority": "high",
+        "frs": [
+            {
+                "fr_id": "fr_developer_replace1",
+                "description": "Replacement scope -> developer [high]",
+                "priority": "high",
+            },
+        ],
+    }
+
+
+def test_update_milestone_status_transitions(pipeline):
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+
+    advanced = pipeline.milestones.update_status(
+        milestone.id, MILESTONE_STATUS_IN_PROGRESS, notes="starting work",
+    )
+    assert advanced.status == MILESTONE_STATUS_IN_PROGRESS
+
+    completed = pipeline.milestones.update_status(
+        milestone.id, MILESTONE_STATUS_COMPLETED, notes="shipped",
+    )
+    assert completed.status == MILESTONE_STATUS_COMPLETED
+
+    # Audit trail: seed + two transitions.
+    statuses = [entry["status"] for entry in completed.notes_history]
+    assert statuses == [
+        MILESTONE_STATUS_PROPOSED,
+        MILESTONE_STATUS_IN_PROGRESS,
+        MILESTONE_STATUS_COMPLETED,
+    ]
+    assert completed.notes_history[-1]["notes"] == "shipped"
+    assert completed.notes_history[-1]["from_status"] == MILESTONE_STATUS_IN_PROGRESS
+
+
+def test_update_milestone_status_rejects_rollback_from_terminal(pipeline):
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+    pipeline.milestones.update_status(milestone.id, MILESTONE_STATUS_IN_PROGRESS)
+    pipeline.milestones.update_status(milestone.id, MILESTONE_STATUS_COMPLETED)
+
+    with pytest.raises(MilestoneError, match="illegal transition"):
+        pipeline.milestones.update_status(
+            milestone.id, MILESTONE_STATUS_IN_PROGRESS,
+        )
+
+
+def test_update_milestone_status_force_allows_rollback(pipeline):
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+    pipeline.milestones.update_status(milestone.id, MILESTONE_STATUS_IN_PROGRESS)
+    pipeline.milestones.update_status(milestone.id, MILESTONE_STATUS_COMPLETED)
+
+    rolled_back = pipeline.milestones.update_status(
+        milestone.id,
+        MILESTONE_STATUS_IN_PROGRESS,
+        notes="accidental completion; reopening",
+        force=True,
+    )
+    assert rolled_back.status == MILESTONE_STATUS_IN_PROGRESS
+    assert rolled_back.notes_history[-1].get("force_rollback") is True
+    assert rolled_back.notes_history[-1]["from_status"] == MILESTONE_STATUS_COMPLETED
+
+
+def test_supersede_milestone_sets_pointer_bidirectionally(pipeline):
+    stale = pipeline.milestones.propose_from_work_unit(_work_unit())
+    replacement = pipeline.milestones.propose_from_work_unit(_second_work_unit())
+
+    superseded = pipeline.milestones.supersede(
+        stale.id, replacement.id, rationale="auto-selection bug",
+    )
+    assert superseded.status == MILESTONE_STATUS_SUPERSEDED
+    assert superseded.superseded_by == replacement.id
+    assert superseded.notes_history[-1]["superseded_by"] == replacement.id
+    assert "auto-selection bug" in superseded.notes_history[-1]["notes"]
+
+    # Re-fetch to confirm persistence.
+    reloaded = pipeline.milestones.get(stale.id)
+    assert reloaded.status == MILESTONE_STATUS_SUPERSEDED
+    assert reloaded.superseded_by == replacement.id
+
+    # Superseder is unaffected — no cascade.
+    reloaded_replacement = pipeline.milestones.get(replacement.id)
+    assert reloaded_replacement.status == MILESTONE_STATUS_PROPOSED
+    assert reloaded_replacement.superseded_by == ""
+
+
+def test_delete_milestone_refuses_if_fr_in_progress(pipeline):
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+    fr = pipeline.frs.promote(
+        target="developer",
+        title="Active work",
+        description="In-progress work inside milestone bundle",
+        priority="high",
+    )
+    pipeline.frs.update_status(fr.id, "planned")
+    pipeline.frs.update_status(fr.id, "in_progress")
+    # Rewire the milestone bundle to include the live FR so the guard fires.
+    milestone.fr_ids = [fr.id]
+    pipeline.milestones._store(milestone)
+
+    with pytest.raises(MilestoneError, match="in progress"):
+        pipeline.milestones.delete(milestone.id, fr_store=pipeline.frs)
+
+
+def test_delete_milestone_refuses_if_notes_history_nontrivial(pipeline):
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+    pipeline.milestones.update_status(
+        milestone.id, MILESTONE_STATUS_IN_PROGRESS, notes="started",
+    )
+
+    with pytest.raises(MilestoneError, match="supersede"):
+        pipeline.milestones.delete(milestone.id, fr_store=pipeline.frs)
+
+
+def test_delete_milestone_allows_clean_milestone(pipeline):
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+
+    result = pipeline.milestones.delete(
+        milestone.id, reason="test cleanup", fr_store=pipeline.frs,
+    )
+    assert result["removed"] is True
+    assert result["reason"] == "test cleanup"
+    assert pipeline.milestones.get(milestone.id) is None
+
+
+def test_update_milestone_frs_add_remove(pipeline):
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+    original = list(milestone.fr_ids)
+
+    updated = pipeline.milestones.update_frs(
+        milestone.id,
+        add_fr_ids=["fr_developer_extra1"],
+        remove_fr_ids=[original[0]],
+        notes="retargeted bundle",
+    )
+    assert original[0] not in updated.fr_ids
+    assert "fr_developer_extra1" in updated.fr_ids
+    # Audit row captures the bundle delta.
+    last = updated.notes_history[-1]
+    assert last["added_fr_ids"] == ["fr_developer_extra1"]
+    assert last["removed_fr_ids"] == [original[0]]
+    assert last["notes"] == "retargeted bundle"
+
+
+def test_update_milestone_frs_refuses_on_non_proposed_milestone(pipeline):
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+    pipeline.milestones.update_status(milestone.id, MILESTONE_STATUS_IN_PROGRESS)
+
+    with pytest.raises(MilestoneError, match="only 'proposed' is mutable"):
+        pipeline.milestones.update_frs(
+            milestone.id, add_fr_ids=["fr_developer_lateadd"],
+        )

@@ -260,6 +260,37 @@ class DeveloperAgent(BaseAgent):
                   {"milestone_id": {"type": "string", "required": True},
                    "review_terms": {"type": "string", "default": "AutoGen,GRA"}},
                   since="0.8.0"),
+            # Milestone lifecycle mutations (fr_developer_91a5a072).
+            Skill("update_milestone_status",
+                  "Advance a milestone's lifecycle status "
+                  "(proposed/planned/in_progress/completed/abandoned/superseded)",
+                  {"milestone_id": {"type": "string", "required": True},
+                   "status": {"type": "string", "required": True},
+                   "notes": {"type": "string", "default": ""},
+                   "force": {"type": "boolean", "default": False,
+                             "description": "allow rollback out of a terminal status"}},
+                  since="0.16.0"),
+            Skill("supersede_milestone",
+                  "Mark one milestone as superseded by another. Does not cascade to FRs.",
+                  {"superseded_id": {"type": "string", "required": True},
+                   "superseded_by_id": {"type": "string", "required": True},
+                   "rationale": {"type": "string", "default": ""}},
+                  since="0.16.0"),
+            Skill("update_milestone_frs",
+                  "Add or remove FRs from a proposed milestone's bundle",
+                  {"milestone_id": {"type": "string", "required": True},
+                   "add_fr_ids": {"type": "string", "default": "",
+                                  "description": "comma-separated FR ids to add"},
+                   "remove_fr_ids": {"type": "string", "default": "",
+                                     "description": "comma-separated FR ids to remove"},
+                   "notes": {"type": "string", "default": ""}},
+                  since="0.16.0"),
+            Skill("delete_milestone",
+                  "Hard-delete a milestone. Refuses if any bundled FR is in_progress "
+                  "or if notes_history has non-seed entries (use supersede instead).",
+                  {"milestone_id": {"type": "string", "required": True},
+                   "reason": {"type": "string", "default": ""}},
+                  since="0.16.0"),
             Skill("migrate_frs_from_researcher",
                   "One-way migration of researcher-owned FRs into developer's store",
                   {"source_db": {"type": "string", "required": True},
@@ -915,6 +946,85 @@ class DeveloperAgent(BaseAgent):
             )
         except MilestoneError as e:
             await self.report_gap("review_milestone_scope", str(e))
+            return {"error": str(e)}
+
+    @handler("update_milestone_status")
+    async def handle_update_milestone_status(self, args):
+        from developer.milestone_store import MilestoneError
+
+        milestone_id = args.get("milestone_id", "")
+        status = args.get("status", "")
+        if not milestone_id:
+            return {"error": "milestone_id is required"}
+        if not status:
+            return {"error": "status is required"}
+        try:
+            milestone = self.pipeline.milestones.update_status(
+                milestone_id,
+                status,
+                notes=args.get("notes", ""),
+                force=bool(args.get("force", False)),
+            )
+        except MilestoneError as e:
+            await self._safe_report_gap("update_milestone_status", str(e))
+            return {"error": str(e)}
+        return {"milestone": milestone.to_public_dict()}
+
+    @handler("supersede_milestone")
+    async def handle_supersede_milestone(self, args):
+        from developer.milestone_store import MilestoneError
+
+        superseded_id = args.get("superseded_id", "")
+        superseded_by_id = args.get("superseded_by_id", "")
+        if not superseded_id or not superseded_by_id:
+            return {
+                "error": "both superseded_id and superseded_by_id are required"
+            }
+        try:
+            milestone = self.pipeline.milestones.supersede(
+                superseded_id,
+                superseded_by_id,
+                rationale=args.get("rationale", ""),
+            )
+        except MilestoneError as e:
+            await self._safe_report_gap("supersede_milestone", str(e))
+            return {"error": str(e)}
+        return {"milestone": milestone.to_public_dict()}
+
+    @handler("update_milestone_frs")
+    async def handle_update_milestone_frs(self, args):
+        from developer.milestone_store import MilestoneError
+
+        milestone_id = args.get("milestone_id", "")
+        if not milestone_id:
+            return {"error": "milestone_id is required"}
+        try:
+            milestone = self.pipeline.milestones.update_frs(
+                milestone_id,
+                add_fr_ids=_parse_paths(args.get("add_fr_ids", "")),
+                remove_fr_ids=_parse_paths(args.get("remove_fr_ids", "")),
+                notes=args.get("notes", ""),
+            )
+        except MilestoneError as e:
+            await self._safe_report_gap("update_milestone_frs", str(e))
+            return {"error": str(e)}
+        return {"milestone": milestone.to_public_dict()}
+
+    @handler("delete_milestone")
+    async def handle_delete_milestone(self, args):
+        from developer.milestone_store import MilestoneError
+
+        milestone_id = args.get("milestone_id", "")
+        if not milestone_id:
+            return {"error": "milestone_id is required"}
+        try:
+            return self.pipeline.milestones.delete(
+                milestone_id,
+                reason=args.get("reason", ""),
+                fr_store=self.pipeline.frs,
+            )
+        except MilestoneError as e:
+            await self._safe_report_gap("delete_milestone", str(e))
             return {"error": str(e)}
 
     @handler("migrate_frs_from_researcher")

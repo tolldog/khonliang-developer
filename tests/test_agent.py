@@ -23,7 +23,9 @@ def test_skill_count(harness):
     # + tracking-infrastructure Phase 1 (BugStore 6 + DogfoodStore 3 = 9).
     # + tracking-infrastructure Phase 2A (triage_bug / link_bug_fr /
     #   triage_dogfood / dogfood_triage_queue / report_gap = 5).
-    assert len(harness.skills) == 65
+    # + milestone lifecycle (fr_developer_91a5a072): update_status /
+    #   supersede / update_frs / delete = 4.
+    assert len(harness.skills) == 69
 
 
 def test_skills_registered(harness):
@@ -66,6 +68,9 @@ def test_skills_registered(harness):
         # Phase 2B (GH issue ingest, fr_developer_47271f34) follows.
         "triage_bug", "link_bug_fr", "triage_dogfood",
         "dogfood_triage_queue", "report_gap",
+        # milestone lifecycle (fr_developer_91a5a072)
+        "update_milestone_status", "supersede_milestone",
+        "update_milestone_frs", "delete_milestone",
     }
     assert harness.skill_names == expected
 
@@ -110,6 +115,13 @@ def test_milestone_skills(harness):
     harness.assert_skill_exists("review_milestone_scope", description="duplicate")
     harness.assert_skill_exists("prepare_development_handoff", description="handoff")
     harness.assert_skill_exists("migrate_frs_from_researcher", description="migration")
+
+
+def test_milestone_lifecycle_skills(harness):
+    harness.assert_skill_exists("update_milestone_status", description="lifecycle")
+    harness.assert_skill_exists("supersede_milestone", description="superseded")
+    harness.assert_skill_exists("update_milestone_frs", description="bundle")
+    harness.assert_skill_exists("delete_milestone", description="delete")
 
 
 def test_session_checkpoint_skills(harness):
@@ -465,7 +477,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 65
+    assert len(reg.skills) == 69
     assert len(reg.collaborations) == 1
 
 
@@ -848,6 +860,75 @@ async def test_propose_milestone_accepts_json_work_unit(harness):
 
     assert result["milestone"]["title"] == "Small milestone"
     assert result["milestone"]["fr_ids"] == ["fr_developer_33333333"]
+
+
+@pytest.mark.asyncio
+async def test_update_milestone_status_and_supersede_via_agent(harness):
+    """Round-trip supersede through the handler layer.
+
+    Also doubles as the documented smoke test for the first-run
+    validation of the ``supersede_milestone`` skill: confirms the
+    pointer lands on the superseded milestone and the superseder
+    is untouched.
+    """
+    stale_wu = """{
+      "name": "Stale cluster",
+      "targets": ["developer"],
+      "frs": [{"fr_id": "fr_developer_stale1", "description": "old scope", "priority": "high"}]
+    }"""
+    replacement_wu = """{
+      "name": "Replacement cluster",
+      "targets": ["developer"],
+      "frs": [{"fr_id": "fr_developer_new1", "description": "new scope", "priority": "high"}]
+    }"""
+
+    stale = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": stale_wu, "title": "Stale milestone",
+    })
+    replacement = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": replacement_wu, "title": "Replacement milestone",
+    })
+
+    stale_id = stale["milestone"]["id"]
+    replacement_id = replacement["milestone"]["id"]
+
+    result = await harness.call("supersede_milestone", {
+        "superseded_id": stale_id,
+        "superseded_by_id": replacement_id,
+        "rationale": "auto-selection bug; obsolete",
+    })
+    assert result["milestone"]["status"] == "superseded"
+    assert result["milestone"]["superseded_by"] == replacement_id
+
+    # Read surfaces surface the pointer.
+    fetched = await harness.call("get_milestone", {"milestone_id": stale_id})
+    assert fetched["milestone"]["superseded_by"] == replacement_id
+
+    # Superseder untouched.
+    replacement_fetched = await harness.call("get_milestone", {"milestone_id": replacement_id})
+    assert replacement_fetched["milestone"]["status"] == "proposed"
+    assert replacement_fetched["milestone"]["superseded_by"] == ""
+
+
+@pytest.mark.asyncio
+async def test_delete_milestone_via_agent_refuses_with_audit_trail(harness):
+    stale_wu = """{
+      "name": "Mutated cluster",
+      "targets": ["developer"],
+      "frs": [{"fr_id": "fr_developer_mut1", "description": "scope", "priority": "high"}]
+    }"""
+    stale = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": stale_wu,
+    })
+    mid = stale["milestone"]["id"]
+
+    # Add a mutation note via the status transition skill.
+    await harness.call("update_milestone_status", {
+        "milestone_id": mid, "status": "in_progress", "notes": "kicking off",
+    })
+    delete_result = await harness.call("delete_milestone", {"milestone_id": mid})
+    assert "error" in delete_result
+    assert "supersede" in delete_result["error"].lower()
 
 
 @pytest.mark.asyncio
