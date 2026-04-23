@@ -5,7 +5,7 @@ severity: concern
 
 # Batch operations must isolate per-item failures
 
-**Invariant**: batch operations (ingest N papers, iterate N FRs, process N comments) must `try/except` each item individually, append failures to a `failed` list, and continue. A single transient error must not abort the entire batch. In async contexts the per-item catch MUST re-raise `asyncio.CancelledError` first — this pattern layers on top of the cancellation-propagation invariant (see `cancelled_error_propagation.md`); otherwise the batch loop swallows cancellation and breaks cooperative shutdown.
+**Invariant**: batch operations (ingest N papers, iterate N FRs, process N comments) must `try/except` each item individually, append failures to a `failed` list, and continue. A single transient error must not abort the entire batch. In async contexts the per-item catch should re-raise `asyncio.CancelledError` first as a defensive default — see `cancelled_error_propagation.md` (intent + future-proofing; not about what `except Exception:` catches in 3.11+).
 
 **Bad pattern**:
 ```python
@@ -26,7 +26,7 @@ async def ingest_batch(self, urls):
             paper = await fetch(url)
             ingested.append(self._store(paper))
         except asyncio.CancelledError:
-            raise                  # cooperative shutdown wins
+            raise                  # explicit intent; defends against catch-widening
         except Exception as exc:
             failed.append({"item": url, "error": str(exc)})
     status = "completed" if not failed else ("failed" if not ingested else "partial")
@@ -38,4 +38,4 @@ async def ingest_batch(self, urls):
     }
 ```
 
-**Rationale**: batches are the one place where partial progress matters; aborting loses work already done. In async code the broad catch must sit below an explicit `CancelledError` re-raise — otherwise `task.cancel()` becomes advisory and the loop refuses to exit. Sourced from PR #29 R6 (per-item isolation) + PR #39 R4 / PR #42 R2 (cancellation propagation).
+**Rationale**: batches are the one place where partial progress matters; aborting loses work already done. The `except CancelledError: raise` layer documents cancellation intent and future-proofs against catch-widening — in Python 3.11+, `except Exception:` alone does not swallow `CancelledError` (it's a `BaseException` subclass since 3.8). Sourced from PR #29 R6 + PR #39 R4 / PR #42 R2.
