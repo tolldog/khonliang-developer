@@ -30,11 +30,14 @@ from developer.pr_watcher import (
     PRWatcherConfig,
     PRWatcherRegistry,
     PRWatcherStore,
+    TOPIC_COMMENT_POSTED,
+    TOPIC_INLINE_FINDING,
     TOPIC_MERGED,
     TOPIC_MERGE_READY,
     TOPIC_NEW_COMMIT,
     TOPIC_POLL_ERROR,
     TOPIC_REVIEW_LANDED,
+    comment_looks_like_bot_verdict,
     parse_pr_numbers_arg,
     parse_repos_arg,
 )
@@ -964,3 +967,408 @@ async def test_agent_restart_rehydrates_and_does_not_reemit(temp_config_file):
         assert listed["watchers"][0]["watcher_id"] == watcher_id
     finally:
         await harness_b.call("stop_pr_watcher", {"watcher_id": watcher_id})
+
+
+# ---------------------------------------------------------------------------
+# Comment-channel events (fr_developer_e2bdd869):
+# pr.comment_posted (issue comments) + pr.inline_finding (review-thread).
+# ---------------------------------------------------------------------------
+
+
+def _make_snapshot_with_comments(
+    *,
+    pr_number: int = 1,
+    head_sha: str = "sha1",
+    external_issue_comments: list[dict] | None = None,
+    inline_findings: list[dict] | None = None,
+    reviews: list[dict] | None = None,
+) -> PRSnapshot:
+    """Build a snapshot with comment-channel lists populated.
+
+    Calls :func:`_populate_comment_summaries` so the derived snapshot
+    fields reflect the lists — mirrors what ``_snapshot_from_github``
+    does in production, and keeps the consumer-facing summary view
+    consistent regardless of whether the snapshot came from the real
+    client or a test fixture.
+    """
+    from developer.pr_watcher import _populate_comment_summaries
+
+    snap = PRSnapshot(
+        repo="owner/repo",
+        pr_number=pr_number,
+        head_sha=head_sha,
+        reviews=list(reviews or []),
+        external_issue_comments=list(external_issue_comments or []),
+        inline_findings=list(inline_findings or []),
+    )
+    _populate_comment_summaries(snap)
+    return snap
+
+
+async def test_issue_comment_fires_one_comment_posted(store):
+    """A new non-self issue comment fires exactly one pr.comment_posted."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published)
+
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot_with_comments(
+        external_issue_comments=[
+            {
+                "id": 501,
+                "author": "copilot-pull-request-reviewer[bot]",
+                "body": "Review verdict goes here.",
+                "posted_at": "2026-04-22T10:00:00Z",
+            },
+        ],
+    )
+    emitted = await watcher.poll_once()
+    comment_events = [p for t, p in published if t == TOPIC_COMMENT_POSTED]
+    assert len(comment_events) == 1
+    assert comment_events[0]["comment_id"] == 501
+    assert comment_events[0]["author"] == "copilot-pull-request-reviewer[bot]"
+    assert comment_events[0]["body"] == "Review verdict goes here."
+    assert comment_events[0]["posted_at"] == "2026-04-22T10:00:00Z"
+    assert comment_events[0]["repo"] == "owner/repo"
+    assert comment_events[0]["pr_number"] == 1
+    assert emitted >= 1
+
+    # Re-polling with the same comment must not re-emit.
+    await watcher.poll_once()
+    assert len([p for t, p in published if t == TOPIC_COMMENT_POSTED]) == 1
+
+
+async def test_inline_finding_fires_one_event_with_path_and_line(store):
+    """A new non-self inline review-thread comment fires exactly one
+    pr.inline_finding with path + line + body."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published)
+
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot_with_comments(
+        inline_findings=[
+            {
+                "id": 601,
+                "author": "copilot-pull-request-reviewer[bot]",
+                "body": "This assertion is tautological.",
+                "posted_at": "2026-04-22T10:05:00Z",
+                "path": "developer/pr_watcher.py",
+                "line": 123,
+                "review_id": 888,
+            },
+        ],
+    )
+    await watcher.poll_once()
+    inline_events = [p for t, p in published if t == TOPIC_INLINE_FINDING]
+    assert len(inline_events) == 1
+    payload = inline_events[0]
+    assert payload["comment_id"] == 601
+    assert payload["path"] == "developer/pr_watcher.py"
+    assert payload["line"] == 123
+    assert payload["body"] == "This assertion is tautological."
+    assert payload["review_id"] == 888
+    assert payload["author"] == "copilot-pull-request-reviewer[bot]"
+
+    # Re-polling with the same finding must not re-emit.
+    await watcher.poll_once()
+    assert len([p for t, p in published if t == TOPIC_INLINE_FINDING]) == 1
+
+
+async def test_copilot_review_with_four_findings_fires_one_review_plus_four_findings(store):
+    """Acceptance scenario: Copilot posts a review with 4 inline findings →
+    subscriber sees 1 pr.review_landed + 4 pr.inline_finding events."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published)
+
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot_with_comments(
+        reviews=[{
+            "id": 999,
+            "reviewer": "copilot-pull-request-reviewer[bot]",
+            "state": "COMMENTED",
+            "submitted_at": "2026-04-22T10:00:00Z",
+        }],
+        inline_findings=[
+            {
+                "id": 700 + i,
+                "author": "copilot-pull-request-reviewer[bot]",
+                "body": f"Finding {i}",
+                "posted_at": f"2026-04-22T10:0{i}:00Z",
+                "path": f"developer/mod_{i}.py",
+                "line": 10 * i,
+                "review_id": 999,
+            }
+            for i in range(4)
+        ],
+    )
+    await watcher.poll_once()
+
+    review_events = [p for t, p in published if t == TOPIC_REVIEW_LANDED]
+    inline_events = [p for t, p in published if t == TOPIC_INLINE_FINDING]
+    assert len(review_events) == 1
+    assert len(inline_events) == 4
+    # All 4 carry non-empty body content — the watcher doesn't force a
+    # follow-up API call on the subscriber.
+    assert all(p["body"] for p in inline_events)
+    # All 4 correlate to the formal review via review_id.
+    assert all(p["review_id"] == 999 for p in inline_events)
+
+
+async def test_self_authored_comments_do_not_fire_events(store):
+    """Self-authored comments on either channel must NOT fire events.
+
+    The filtering happens at :func:`_snapshot_from_github` (via the
+    ``self_login`` param) — by the time a snapshot reaches the emit
+    path its comment lists are already external-only. This test
+    verifies the filter at the fetch surface, which is the durable
+    guarantee for the FR.
+    """
+    from developer.pr_watcher import _snapshot_from_github
+
+    class _FakeClient:
+        async def get_pr(self, repo, pr_number):
+            return {
+                "state": "open", "merged": False, "merged_at": None,
+                "mergeable": True, "mergeable_state": "clean",
+                "head_sha": "sha1", "author": "tolldog",
+            }
+
+        async def list_pr_reviews(self, repo, pr_number):
+            return []
+
+        async def list_pr_issue_comments(self, repo, pr_number):
+            return [
+                {"id": 1, "user": "tolldog", "body": "@copilot please re-review",
+                 "created_at": "2026-04-22T10:00:00Z"},
+                {"id": 2, "user": "copilot-pull-request-reviewer[bot]",
+                 "body": "verdict", "created_at": "2026-04-22T10:01:00Z"},
+            ]
+
+        async def list_pr_review_comments(self, repo, pr_number):
+            from developer.github_client import GithubReviewComment
+            return [
+                GithubReviewComment(
+                    id=10, pr_number=pr_number, repo=repo, reviewer="tolldog",
+                    path="a.py", line=1, body="self inline reply",
+                    created_at="2026-04-22T10:02:00Z", pull_request_review_id=None,
+                ),
+                GithubReviewComment(
+                    id=11, pr_number=pr_number, repo=repo,
+                    reviewer="copilot-pull-request-reviewer[bot]",
+                    path="b.py", line=5, body="bot inline finding",
+                    created_at="2026-04-22T10:03:00Z", pull_request_review_id=777,
+                ),
+            ]
+
+    snap = await _snapshot_from_github(_FakeClient(), "owner/repo", 1, self_login="tolldog")
+    # Self-authored issue comment dropped; bot comment retained.
+    assert [c["id"] for c in snap.external_issue_comments] == [2]
+    # Self-authored inline comment dropped; bot finding retained.
+    assert [f["id"] for f in snap.inline_findings] == [11]
+    # Derived summary matches the non-self latest.
+    assert snap.latest_issue_comment_by == "copilot-pull-request-reviewer[bot]"
+    assert snap.latest_inline_by == "copilot-pull-request-reviewer[bot]"
+
+
+async def test_comment_dedupe_across_restart(tmp_path):
+    """Restart resume: previously-seen comments on both channels are not
+    re-emitted. Dedupe-across-restart covers pr.comment_posted AND
+    pr.inline_finding the same way it covers pr.review_landed — each by
+    the transition's stable id (comment_id / inline-comment id).
+    """
+    db = str(tmp_path / "pr_watcher.db")
+    gh = _FakeGithub()
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot_with_comments(
+        head_sha="shared_sha",
+        external_issue_comments=[{
+            "id": 501, "author": "copilot[bot]", "body": "hi",
+            "posted_at": "2026-04-22T10:00:00Z",
+        }],
+        inline_findings=[{
+            "id": 601, "author": "copilot[bot]", "body": "inline",
+            "posted_at": "2026-04-22T10:01:00Z",
+            "path": "a.py", "line": 1, "review_id": 42,
+        }],
+    )
+
+    store_a = PRWatcherStore(db)
+    pub_a: list[tuple[str, dict]] = []
+    watcher_a = _make_watcher(store_a, gh, pub_a, watcher_id="prw_comment_restart")
+    await watcher_a.poll_once()
+    # First incarnation sees the new_commit + both comment kinds.
+    topics_a = _topics(pub_a)
+    assert TOPIC_COMMENT_POSTED in topics_a
+    assert TOPIC_INLINE_FINDING in topics_a
+
+    # Second incarnation against same DB + watcher_id.
+    store_b = PRWatcherStore(db)
+    pub_b: list[tuple[str, dict]] = []
+    watcher_b = _make_watcher(store_b, gh, pub_b, watcher_id="prw_comment_restart")
+    await watcher_b.poll_once()
+    # No pr.comment_posted / pr.inline_finding re-emission.
+    topics_b = _topics(pub_b)
+    assert TOPIC_COMMENT_POSTED not in topics_b, (
+        "restart re-emitted an issue comment already observed"
+    )
+    assert TOPIC_INLINE_FINDING not in topics_b, (
+        "restart re-emitted an inline finding already observed"
+    )
+
+
+async def test_multiple_comment_ids_each_fire_once(store):
+    """Sanity: distinct comment ids on each channel each fire once, and
+    re-polling with the same set is a no-op (dedupe is per-comment-id)."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published)
+
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot_with_comments(
+        external_issue_comments=[
+            {"id": 501, "author": "bot1", "body": "a", "posted_at": "t1"},
+            {"id": 502, "author": "bot2", "body": "b", "posted_at": "t2"},
+        ],
+        inline_findings=[
+            {"id": 601, "author": "bot", "body": "x", "posted_at": "t3",
+             "path": "a.py", "line": 1, "review_id": 1},
+            {"id": 602, "author": "bot", "body": "y", "posted_at": "t4",
+             "path": "b.py", "line": 2, "review_id": 1},
+        ],
+    )
+    await watcher.poll_once()
+    assert sum(1 for t, _ in published if t == TOPIC_COMMENT_POSTED) == 2
+    assert sum(1 for t, _ in published if t == TOPIC_INLINE_FINDING) == 2
+
+    # Re-poll: no new events.
+    await watcher.poll_once()
+    assert sum(1 for t, _ in published if t == TOPIC_COMMENT_POSTED) == 2
+    assert sum(1 for t, _ in published if t == TOPIC_INLINE_FINDING) == 2
+
+    # A brand-new comment on each channel fires exactly one more event.
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot_with_comments(
+        external_issue_comments=[
+            {"id": 501, "author": "bot1", "body": "a", "posted_at": "t1"},
+            {"id": 502, "author": "bot2", "body": "b", "posted_at": "t2"},
+            {"id": 503, "author": "bot3", "body": "c", "posted_at": "t5"},
+        ],
+        inline_findings=[
+            {"id": 601, "author": "bot", "body": "x", "posted_at": "t3",
+             "path": "a.py", "line": 1, "review_id": 1},
+            {"id": 602, "author": "bot", "body": "y", "posted_at": "t4",
+             "path": "b.py", "line": 2, "review_id": 1},
+            {"id": 603, "author": "bot", "body": "z", "posted_at": "t6",
+             "path": "c.py", "line": 3, "review_id": 2},
+        ],
+    )
+    await watcher.poll_once()
+    assert sum(1 for t, _ in published if t == TOPIC_COMMENT_POSTED) == 3
+    assert sum(1 for t, _ in published if t == TOPIC_INLINE_FINDING) == 3
+
+
+async def test_snapshot_summary_fields_reflect_latest_non_self_entry(store):
+    """Sanity for the derived summary: ``latest_*_comment_*`` /
+    ``latest_inline_*`` should mirror the LAST entry in each list.
+
+    These fields feed ``pr_fleet_status`` / fleet-digest views (the
+    companion FR) — verify they're populated so the aggregate view
+    doesn't have to re-iterate the lists itself.
+    """
+    snap = _make_snapshot_with_comments(
+        external_issue_comments=[
+            {"id": 1, "author": "first", "body": "one", "posted_at": "t1"},
+            {"id": 2, "author": "second", "body": "two", "posted_at": "t2"},
+        ],
+        inline_findings=[
+            {"id": 10, "author": "bot", "body": "inline one",
+             "posted_at": "t10", "path": "a.py", "line": 1, "review_id": 1},
+            {"id": 11, "author": "bot2", "body": "inline two",
+             "posted_at": "t11", "path": "b.py", "line": 2, "review_id": 2},
+        ],
+    )
+    assert snap.external_issue_comments_count == 2
+    assert snap.latest_issue_comment_at == "t2"
+    assert snap.latest_issue_comment_by == "second"
+    assert snap.latest_issue_comment_preview == "two"
+    assert snap.inline_findings_count == 2
+    assert snap.latest_inline_at == "t11"
+    assert snap.latest_inline_by == "bot2"
+    assert snap.latest_inline_path == "b.py"
+    assert snap.latest_inline_line == 2
+    assert snap.latest_inline_body == "inline two"
+
+
+def test_comment_preview_truncates_at_500_chars():
+    """Summary ``latest_issue_comment_preview`` / ``latest_inline_body``
+    cap at 500 chars to keep the snapshot bounded for fleet-digest use.
+    Event payloads carry the full body — only the preview is capped."""
+    long = "x" * 1200
+    snap = _make_snapshot_with_comments(
+        external_issue_comments=[
+            {"id": 1, "author": "u", "body": long, "posted_at": "t"},
+        ],
+        inline_findings=[
+            {"id": 2, "author": "u", "body": long, "posted_at": "t",
+             "path": "a.py", "line": 1, "review_id": None},
+        ],
+    )
+    assert len(snap.latest_issue_comment_preview) == 500
+    assert len(snap.latest_inline_body) == 500
+
+
+# ---------------------------------------------------------------------------
+# comment_looks_like_bot_verdict classifier.
+# ---------------------------------------------------------------------------
+
+
+def test_comment_classifier_recognizes_copilot_re_review_shape():
+    """Copilot's re-review verdict posted as a bare issue comment quotes
+    the triggering ``@copilot please re-review`` mention on its first
+    non-empty line AND comes from a copilot-shaped author login."""
+    body = (
+        "> @copilot please re-review\n\n"
+        "Thanks! I've reviewed the changes and everything looks good now."
+    )
+    assert comment_looks_like_bot_verdict(
+        body, author="copilot-pull-request-reviewer[bot]",
+    ) is True
+    # Capitalized author variant also counts.
+    assert comment_looks_like_bot_verdict(body, author="Copilot") is True
+
+
+def test_comment_classifier_rejects_generic_user_comment():
+    """Random user comments and non-verdict shapes do NOT match."""
+    assert comment_looks_like_bot_verdict(
+        "Looks great, merge when ready.", author="tolldog",
+    ) is False
+    # A human quoting the same phrase shouldn't match — author guard.
+    assert comment_looks_like_bot_verdict(
+        "> @copilot please re-review\nthanks!", author="tolldog",
+    ) is False
+    # Copilot author but a non-verdict-shaped body (no quoted mention
+    # as the first non-empty line) shouldn't match — too eager otherwise.
+    assert comment_looks_like_bot_verdict(
+        "Generic copilot comment without the quoted trigger.",
+        author="copilot-pull-request-reviewer[bot]",
+    ) is False
+    # Empty body → False.
+    assert comment_looks_like_bot_verdict("", author="Copilot") is False
+
+
+def test_comment_classifier_tolerates_leading_blank_lines():
+    """First non-empty line is what matters; stray blank lines at the
+    top don't break detection. Copilot's renderer sometimes inserts
+    leading whitespace and we shouldn't be brittle about it."""
+    body = "\n\n> @copilot please re-review\n\nAll clear now."
+    assert comment_looks_like_bot_verdict(
+        body, author="copilot-pull-request-reviewer[bot]",
+    ) is True
+
+
+# ---------------------------------------------------------------------------
+# Topic namespace invariant.
+# ---------------------------------------------------------------------------
+
+
+def test_comment_topics_included_in_all_pr_topics():
+    """Both new topics must be in ALL_PR_TOPICS so subscribers filtering
+    on the ``pr.*`` namespace see them via ``bus_wait_for_event``."""
+    assert TOPIC_COMMENT_POSTED in ALL_PR_TOPICS
+    assert TOPIC_INLINE_FINDING in ALL_PR_TOPICS

@@ -50,7 +50,13 @@ class GithubReview:
 
 @dataclass
 class GithubReviewComment:
-    """A single inline review comment on a file:line."""
+    """A single inline review comment on a file:line.
+
+    ``pull_request_review_id`` links the comment back to the containing
+    review (from :meth:`GithubClient.list_pr_reviews`) when the comment
+    is part of a formal review. Standalone review-thread replies post
+    outside a review and carry ``pull_request_review_id=None``.
+    """
 
     id: int
     pr_number: int
@@ -60,6 +66,7 @@ class GithubReviewComment:
     line: int | None                 # target line; None for file-level comments
     body: str
     created_at: str
+    pull_request_review_id: int | None = None
 
 
 @dataclass
@@ -193,9 +200,15 @@ class GithubClient:
                 repo=repo,
                 reviewer=c.user.login if c.user else "unknown",
                 path=c.path,
-                line=getattr(c, "line", None),
+                # GitHub exposes both ``line`` (current position, None once
+                # the diff has shifted) and ``original_line`` (position at
+                # the time the comment was posted). Prefer ``line`` so
+                # subscribers see the current anchor; fall back to
+                # ``original_line`` when the comment is outdated.
+                line=getattr(c, "line", None) or getattr(c, "original_line", None),
                 body=c.body or "",
                 created_at=str(c.created_at),
+                pull_request_review_id=getattr(c, "pull_request_review_id", None),
             )
             for c in resp.parsed_data
         ]
@@ -441,6 +454,27 @@ class GithubClient:
             "message": resp.parsed_data.message,
             "admin_bypass": admin_bypass,
         }
+
+    async def get_authenticated_user_login(self) -> str:
+        """Return the login for the authenticated token, or ``""`` when
+        running unauthenticated.
+
+        Callers (notably :mod:`developer.pr_watcher`) use the login to
+        filter out self-authored comments from event emission — an
+        empty token discovery (``token=None``) yields an empty string,
+        which naturally disables the filter (no login ever matches).
+        Errors are swallowed to the same fallback so a transient API
+        hiccup can't take down the watcher on a filter-only path.
+        """
+        if not self._token:
+            return ""
+        try:
+            resp = await self._client().rest.users.async_get_authenticated()
+        except Exception as e:
+            logger.warning("get_authenticated_user_login failed: %s", e)
+            return ""
+        login = getattr(resp.parsed_data, "login", None)
+        return str(login) if login else ""
 
     # -- helpers --
 

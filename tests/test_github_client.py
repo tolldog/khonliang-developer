@@ -96,6 +96,18 @@ def test_review_comment_dataclass_roundtrip():
     )
     assert c.path == "developer/foo.py"
     assert c.line == 10
+    # pull_request_review_id defaults to None — stays backward-compatible
+    # with callers that construct the dataclass without the new field.
+    assert c.pull_request_review_id is None
+
+
+def test_review_comment_dataclass_carries_review_id():
+    c = GithubReviewComment(
+        id=1, pr_number=42, repo="o/n", reviewer="bot",
+        path="a.py", line=5, body="nit", created_at="2026-04-13",
+        pull_request_review_id=777,
+    )
+    assert c.pull_request_review_id == 777
 
 
 def test_pr_readiness_dataclass_roundtrip():
@@ -337,6 +349,47 @@ async def test_list_pr_review_comments_normalizes():
     assert len(out) == 2
     assert out[0].path == "a.py" and out[0].line == 5
     assert out[1].line is None
+    # pull_request_review_id absent on the fake → normalized to None,
+    # matches the "standalone reply-to-thread" case.
+    assert all(rc.pull_request_review_id is None for rc in out)
+
+
+@pytest.mark.asyncio
+async def test_list_pr_review_comments_carries_review_id_and_original_line():
+    """When the inline comment attaches to a formal review, githubkit
+    exposes ``pull_request_review_id``; the normalized dataclass carries
+    it through so :class:`developer.pr_watcher.PRFleetWatcher` can set
+    ``review_id`` on ``pr.inline_finding`` payloads.
+
+    Also checks the ``line → original_line`` fallback: when a comment's
+    current anchor line is None (the file shifted under it) we fall
+    back to the position at the time of posting so the subscriber
+    always has a line to report.
+    """
+    class _Enriched:
+        def __init__(self, id, path, line, original_line, review_id, body,
+                     user=None, created_at="2026-04-22T00:00:00Z"):
+            self.id = id
+            self.path = path
+            self.line = line
+            self.original_line = original_line
+            self.pull_request_review_id = review_id
+            self.body = body
+            self.user = user or _FakeUser()
+            self.created_at = created_at
+
+    c = GithubClient(token="t")
+    _install_fake_gh(c, review_comments=[
+        _Enriched(20, "a.py", 7, 7, 555, "inside-review finding"),
+        _Enriched(21, "b.py", None, 42, None, "outdated / standalone"),
+    ])
+    out = await c.list_pr_review_comments("o/n", 3)
+    assert out[0].pull_request_review_id == 555
+    assert out[0].line == 7
+    # line=None → fall back to original_line so the subscriber still
+    # has a line to report for outdated / shifted comments.
+    assert out[1].line == 42
+    assert out[1].pull_request_review_id is None
 
 
 @pytest.mark.asyncio
@@ -683,3 +736,58 @@ async def test_missing_user_falls_back_to_unknown():
     _install_fake_gh(c, reviews=[review_no_user])
     out = await c.list_pr_reviews("o/n", 1)
     assert out[0].reviewer == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_get_authenticated_user_login_returns_empty_without_token(monkeypatch):
+    """Unauthenticated clients can't ask "who am I" — degrade to empty
+    so callers (e.g. pr_watcher) get a disabled-filter fallback instead
+    of an exception."""
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    c = GithubClient()
+    assert await c.get_authenticated_user_login() == ""
+
+
+@pytest.mark.asyncio
+async def test_get_authenticated_user_login_reads_login_from_api():
+    """With a token, the wrapper calls ``users.async_get_authenticated``
+    and returns the login string. This is what pr_watcher uses to
+    resolve ``self_login`` once per watcher lifetime."""
+    c = GithubClient(token="t")
+
+    class _Me:
+        login = "tolldog"
+
+    class _Users:
+        async def async_get_authenticated(self, **_):
+            return _FakeResponse2(_Me())
+
+    class _Rest:
+        users = _Users()
+
+    class _Gh:
+        rest = _Rest()
+
+    c._gh = _Gh()
+    assert await c.get_authenticated_user_login() == "tolldog"
+
+
+@pytest.mark.asyncio
+async def test_get_authenticated_user_login_swallows_errors():
+    """A failed /user lookup must NOT take down the watcher — degrade
+    to empty (filter disabled) and let the watcher keep running."""
+    c = GithubClient(token="t")
+
+    class _Users:
+        async def async_get_authenticated(self, **_):
+            raise RuntimeError("api down")
+
+    class _Rest:
+        users = _Users()
+
+    class _Gh:
+        rest = _Rest()
+
+    c._gh = _Gh()
+    assert await c.get_authenticated_user_login() == ""
