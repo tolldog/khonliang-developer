@@ -42,7 +42,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
-from developer.github_client import GithubClient, GithubClientError
+from developer.github_client import GithubClient, GithubClientError, is_copilot_login
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,15 @@ TOPIC_MERGED = "pr.merged"
 TOPIC_MERGE_READY = "pr.merge_ready"
 TOPIC_CLOSED_WITHOUT_MERGE = "pr.closed_without_merge"
 TOPIC_POLL_ERROR = "pr.poll_error"
+# Added by fr_developer_e2bdd869: comment-channel coverage.
+# ``pr.comment_posted`` covers ``/issues/N/comments`` (top-level PR
+# discussion — where Copilot's re-review verdicts land as bare
+# comments instead of formal reviews).
+# ``pr.inline_finding`` covers ``/pulls/N/comments`` (inline review-
+# thread comments — where Copilot's per-finding comments live, anchored
+# to a ``(path, line)``).
+TOPIC_COMMENT_POSTED = "pr.comment_posted"
+TOPIC_INLINE_FINDING = "pr.inline_finding"
 
 ALL_PR_TOPICS = (
     TOPIC_REVIEW_LANDED,
@@ -68,7 +77,61 @@ ALL_PR_TOPICS = (
     TOPIC_MERGE_READY,
     TOPIC_CLOSED_WITHOUT_MERGE,
     TOPIC_POLL_ERROR,
+    TOPIC_COMMENT_POSTED,
+    TOPIC_INLINE_FINDING,
 )
+
+
+# Truncation cap on comment body previews attached to snapshot fields.
+# Events emit the full body; the preview is for the compact snapshot
+# view used by ``pr_fleet_status`` / fleet-digest consumers where 500
+# chars is a reasonable first-glance tradeoff.
+COMMENT_PREVIEW_CHARS = 500
+
+
+def comment_looks_like_bot_verdict(body: str, author: str = "") -> bool:
+    """Heuristic: does this issue comment look like Copilot's re-review
+    verdict posted as a bare comment?
+
+    Copilot's re-review verdicts land as ``/issues/N/comments`` entries
+    (not formal reviews) and quote back the triggering ``@copilot please
+    re-review`` mention before delivering the verdict. Detection requires
+    both signals: a quoted ``@copilot please re-review`` on the first
+    non-empty line AND a Copilot-shaped author login. Content-only
+    detection is too eager (a human could quote the same phrase) and
+    author-only detection is too loose (non-verdict Copilot comments
+    would also match).
+
+    Subscribers use this as a hint — the event still fires for any
+    external comment; this just lets consumers prioritize bot-verdict
+    comments differently when they care to.
+    """
+    if not body:
+        return False
+    # Share the Copilot-identity set with github_client rather than
+    # duplicating it here: a new auth variant (e.g. ``copilot-swe-agent``)
+    # only has to land once. Historically this module kept its own
+    # narrower set (``copilot`` / ``copilot-pull-request-reviewer`` only)
+    # that drifted out of sync with github_client's broader set; PR #39
+    # Copilot R3 flagged the duplication and consolidated on
+    # :func:`is_copilot_login`, which now carries the union of what both
+    # sites used to accept (plus the ``-swe-agent`` variants).
+    #
+    # ``is_copilot_login`` treats an empty string as not-copilot (the
+    # set doesn't contain ``""``), so the empty-author case naturally
+    # returns False without a separate guard.
+    if not is_copilot_login(author or ""):
+        return False
+    # First non-empty line of the body should start with ">" (a quote)
+    # and mention @copilot please re-review.
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(">") and "@copilot please re-review" in stripped.lower():
+            return True
+        return False
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +343,17 @@ def _review_is_from_bot(review: dict) -> bool:
 
 @dataclass
 class PRSnapshot:
-    """Bounded view of a PR's state used for transition detection."""
+    """Bounded view of a PR's state used for transition detection.
+
+    ``external_issue_comments`` and ``inline_findings`` (added by
+    ``fr_developer_e2bdd869``) carry the filtered-non-self entries from
+    ``/issues/N/comments`` and ``/pulls/N/comments`` respectively. Each
+    entry is a dict shaped as expected by the emit logic — the snapshot
+    itself is the source of truth; the derived summary fields
+    (``*_count`` / ``latest_*``) are convenience views for callers
+    (notably ``pr_fleet_status``) that want a compact digest without
+    iterating the whole list.
+    """
 
     repo: str
     pr_number: int
@@ -292,6 +365,23 @@ class PRSnapshot:
     merge_state: str = ""          # clean | blocked | dirty | ...
     reviews: list[dict] = field(default_factory=list)
     review_decision: str = ""      # APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED | ""
+    # Comment-channel fields (fr_developer_e2bdd869).
+    external_issue_comments: list[dict] = field(default_factory=list)
+    inline_findings: list[dict] = field(default_factory=list)
+    # Derived summary fields, populated by :func:`_populate_comment_summaries`
+    # after the lists are assembled. Kept on the snapshot (not computed
+    # on read) so consumers that serialize it don't have to rebuild the
+    # view every access.
+    external_issue_comments_count: int = 0
+    latest_issue_comment_at: Optional[str] = None
+    latest_issue_comment_by: Optional[str] = None
+    latest_issue_comment_preview: str = ""
+    inline_findings_count: int = 0
+    latest_inline_at: Optional[str] = None
+    latest_inline_by: Optional[str] = None
+    latest_inline_path: Optional[str] = None
+    latest_inline_line: Optional[int] = None
+    latest_inline_preview: str = ""
 
     def merge_ready(self) -> bool:
         """Strictly conservative merge-ready check.
@@ -378,11 +468,40 @@ class PRFleetWatcher:
         self._list_open_prs = list_open_prs
         self._now = now_fn
         self._pr_count: int = 0
+        # In-memory per-(repo, pr_number) caches of already-observed
+        # comment ids, one per channel. Used to skip the ``_emit`` call
+        # (and its ``INSERT OR IGNORE`` into ``pr_watcher_dedupe``) when
+        # the snapshot hasn't changed between polls. Long PR threads
+        # would otherwise churn the dedupe table on every tick even
+        # though nothing new has arrived.
+        #
+        # Cross-restart correctness still comes from the SQLite dedupe
+        # table: on a fresh process these caches are empty, so the first
+        # poll re-observes every id via ``_emit`` and ``mark_emitted``
+        # returns False for rows that were persisted before the restart
+        # (no re-emission). After that first pass the cache is primed
+        # and subsequent unchanged polls touch zero rows.
+        self._seen_issue_comment_ids: dict[tuple[str, int], set[str]] = {}
+        self._seen_inline_finding_ids: dict[tuple[str, int], set[str]] = {}
 
     @property
     def pr_count(self) -> int:
         """Number of PRs observed on the most recent poll."""
         return self._pr_count
+
+    def _prune_seen_caches(self, active_keys: set[tuple[str, int]]) -> None:
+        """Drop in-memory seen-id entries for PRs no longer in the active set.
+
+        Called once per poll after ``_resolve_pr_set``. In "watch all
+        open PRs" mode (no explicit ``pr_numbers``), closed/merged PRs
+        stop appearing in the resolved set — their cache entries would
+        otherwise accumulate forever. Pinning to ``active_keys`` keeps
+        the cache bounded by fleet size.
+        """
+        for cache in (self._seen_issue_comment_ids, self._seen_inline_finding_ids):
+            stale = [key for key in cache if key not in active_keys]
+            for key in stale:
+                cache.pop(key, None)
 
     async def _resolve_pr_set(self) -> list[tuple[str, int]]:
         """Return ``(repo, pr_number)`` pairs to poll this cycle.
@@ -402,6 +521,10 @@ class PRFleetWatcher:
         for repo in self.config.repos:
             try:
                 open_numbers = await self._list_open_prs(repo)
+            except asyncio.CancelledError:
+                # CancelledError subclasses Exception (3.8+); never
+                # catch-and-continue past cooperative cancellation.
+                raise
             except Exception as e:
                 await self._emit_poll_error(repo, pr_number=0, reason=str(e))
                 continue
@@ -417,10 +540,23 @@ class PRFleetWatcher:
         """
         pairs = await self._resolve_pr_set()
         self._pr_count = len(pairs)
+        # Prune in-memory seen caches for PRs that have dropped out of
+        # the active set (closed / merged PRs in "watch all open PRs"
+        # mode no longer show up in ``_resolve_pr_set``). Without this
+        # the caches grow monotonically over the watcher's lifetime.
+        # Cross-restart dedupe remains the SQLite table's job; this
+        # only reclaims process memory.
+        active_keys = {(repo, pr_number) for repo, pr_number in pairs}
+        self._prune_seen_caches(active_keys)
         emitted = 0
         for repo, pr_number in pairs:
             try:
                 snapshot = await self._fetch_snapshot(repo, pr_number)
+            except asyncio.CancelledError:
+                # CancelledError subclasses Exception; without this the
+                # per-PR "keep the watcher alive" fallback below would
+                # swallow cooperative shutdown mid-poll.
+                raise
             except GithubClientError as e:
                 await self._emit_poll_error(repo, pr_number, reason=str(e))
                 continue
@@ -512,6 +648,80 @@ class PRFleetWatcher:
             ):
                 emitted += 1
 
+        # 2a. Issue comments (fr_developer_e2bdd869).
+        # Each external (non-self) comment fires exactly one
+        # pr.comment_posted, deduped by comment_id.
+        #
+        # Long PR threads keep accumulating comments; without in-memory
+        # diffing against the prior snapshot we'd call ``_emit`` (and
+        # its ``INSERT OR IGNORE`` into ``pr_watcher_dedupe``) for every
+        # stored comment on every poll. Instead we track seen ids per
+        # (repo, pr_number) and only hit ``_emit`` for the delta.
+        key = (snapshot.repo, snapshot.pr_number)
+        seen_issue = self._seen_issue_comment_ids.setdefault(key, set())
+        for comment in snapshot.external_issue_comments:
+            comment_id = comment.get("id")
+            if comment_id is None:
+                continue
+            id_str = str(comment_id)
+            if id_str in seen_issue:
+                continue
+            if await self._emit(
+                TOPIC_COMMENT_POSTED,
+                repo=snapshot.repo,
+                pr_number=snapshot.pr_number,
+                transition_kind="comment_posted",
+                dedupe_id=id_str,
+                payload={
+                    "repo": snapshot.repo,
+                    "pr_number": snapshot.pr_number,
+                    "comment_id": comment_id,
+                    "author": comment.get("author", ""),
+                    "posted_at": comment.get("posted_at", ""),
+                    "body": comment.get("body", ""),
+                },
+            ):
+                emitted += 1
+            # Mark seen regardless of whether ``_emit`` actually
+            # published — if the SQLite dedupe table already had the
+            # row (cross-restart case), ``_emit`` returns False, but
+            # we still don't want to revisit it next poll.
+            seen_issue.add(id_str)
+
+        # 2b. Inline review-thread comments (fr_developer_e2bdd869).
+        # Each external (non-self) inline finding fires exactly one
+        # pr.inline_finding, deduped by comment_id. review_id correlates
+        # with the containing pr.review_landed when the comment is part
+        # of a formal review; None when it's a standalone thread reply.
+        seen_inline = self._seen_inline_finding_ids.setdefault(key, set())
+        for finding in snapshot.inline_findings:
+            comment_id = finding.get("id")
+            if comment_id is None:
+                continue
+            id_str = str(comment_id)
+            if id_str in seen_inline:
+                continue
+            if await self._emit(
+                TOPIC_INLINE_FINDING,
+                repo=snapshot.repo,
+                pr_number=snapshot.pr_number,
+                transition_kind="inline_finding",
+                dedupe_id=id_str,
+                payload={
+                    "repo": snapshot.repo,
+                    "pr_number": snapshot.pr_number,
+                    "comment_id": comment_id,
+                    "author": finding.get("author", ""),
+                    "posted_at": finding.get("posted_at", ""),
+                    "path": finding.get("path"),
+                    "line": finding.get("line"),
+                    "body": finding.get("body", ""),
+                    "review_id": finding.get("review_id"),
+                },
+            ):
+                emitted += 1
+            seen_inline.add(id_str)
+
         # 3. Merged. dedupe_id = merged_at timestamp (stable once set).
         if snapshot.merged and snapshot.merged_at:
             if await self._emit(
@@ -595,6 +805,10 @@ class PRFleetWatcher:
             return False
         try:
             await self._publish(topic, payload)
+        except asyncio.CancelledError:
+            # CancelledError subclasses Exception; don't log-and-swallow
+            # cooperative cancellation during publish.
+            raise
         except Exception as e:
             logger.warning(
                 "PR watcher %s: publish %s failed: %s",
@@ -620,6 +834,8 @@ class PRFleetWatcher:
                     "at": self._now(),
                 },
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning(
                 "PR watcher %s: publish pr.poll_error failed: %s",
@@ -788,6 +1004,11 @@ class PRWatcherRegistry:
                 await live.task
             except (asyncio.CancelledError, Exception):
                 pass
+        except asyncio.CancelledError:
+            # If the caller themselves is being cancelled while waiting
+            # on live.task, propagate — don't swallow cooperative
+            # cancellation into the "shutdown succeeded" path.
+            raise
         except Exception:
             pass
         self.store.remove_watcher(watcher_id)
@@ -813,15 +1034,52 @@ class PRWatcherRegistry:
         for watcher_id in ids:
             try:
                 await self.stop(watcher_id)
+            except asyncio.CancelledError:
+                # CancelledError subclasses Exception; without this the
+                # log-and-continue fallback would mask cooperative
+                # cancellation of the shutdown task itself.
+                raise
             except Exception as e:
                 logger.warning("registry shutdown: stop %s failed: %s", watcher_id, e)
 
     def _default_factory(self, config: PRWatcherConfig) -> PRFleetWatcher:
-        """Wire a watcher against the real :class:`GithubClient`."""
+        """Wire a watcher against the real :class:`GithubClient`.
+
+        Resolves ``self_login`` lazily on first fetch and caches it for
+        the watcher's lifetime (an authenticated GitHub token's login
+        doesn't change under us). This is the identity used to filter
+        self-authored comments on both comment channels — without it the
+        watcher would re-emit our own ``@copilot please re-review``
+        triggers and bookkeeping replies as external events.
+
+        Cache uses a single-slot list (closure mutable) rather than a
+        class attribute so per-watcher state stays scoped to the factory
+        closure; each watcher runs at its own pace and may have different
+        token wiring in a future multi-token setup.
+        """
         gh = GithubClient()
+        self_login_cache: list[str | None] = [None]
+
+        async def _resolve_self_login() -> str:
+            if self_login_cache[0] is None:
+                try:
+                    self_login_cache[0] = await gh.get_authenticated_user_login()
+                except asyncio.CancelledError:
+                    # CancelledError subclasses Exception; degrading to
+                    # empty here would swallow cooperative cancellation
+                    # of the watcher task mid-resolve.
+                    raise
+                except Exception:
+                    # On failure, degrade to empty — filter disabled,
+                    # watcher keeps running. Subscribers may see
+                    # self-authored comments as external until next
+                    # successful resolve; acceptable and noisy-loud.
+                    self_login_cache[0] = ""
+            return self_login_cache[0] or ""
 
         async def fetch_snapshot(repo: str, pr_number: int) -> PRSnapshot:
-            return await _snapshot_from_github(gh, repo, pr_number)
+            self_login = await _resolve_self_login()
+            return await _snapshot_from_github(gh, repo, pr_number, self_login)
 
         async def list_open_prs(repo: str) -> list[int]:
             return await _list_open_pr_numbers(gh, repo)
@@ -846,13 +1104,23 @@ def _new_watcher_id() -> str:
 
 async def _snapshot_from_github(
     gh: GithubClient, repo: str, pr_number: int,
+    self_login: str = "",
 ) -> PRSnapshot:
-    """Fetch PR metadata + reviews and compose a :class:`PRSnapshot`.
+    """Fetch PR metadata + reviews + comment channels and compose a
+    :class:`PRSnapshot`.
 
-    Uses :meth:`GithubClient.get_pr` for PR state and
-    :meth:`GithubClient.list_pr_reviews` for reviews. Both share the
-    same async client and the same auth discovery path (``GITHUB_TOKEN``
-    → ``GH_TOKEN`` → unauthenticated) — no separate credential surface.
+    Uses :meth:`GithubClient.get_pr` for PR state,
+    :meth:`GithubClient.list_pr_reviews` for formal reviews,
+    :meth:`GithubClient.list_pr_issue_comments` for top-level PR
+    discussion (``/issues/N/comments``), and
+    :meth:`GithubClient.list_pr_review_comments` for inline review-
+    thread comments (``/pulls/N/comments``).
+
+    ``self_login`` filters out self-authored comments on both comment
+    channels so the watcher's own ``@copilot please re-review`` triggers
+    and bookkeeping replies don't fire ``pr.comment_posted`` events.
+    An empty ``self_login`` disables the filter (e.g. tests that don't
+    care, or unauthenticated clients where we can't discover the login).
     """
     pr = await gh.get_pr(repo, pr_number)
     reviews_raw = await gh.list_pr_reviews(repo, pr_number)
@@ -865,9 +1133,50 @@ async def _snapshot_from_github(
         }
         for r in reviews_raw
     ]
+
+    # Comment channels (fr_developer_e2bdd869). Failures on these are
+    # deliberately surfaced rather than swallowed: the caller
+    # (:meth:`PRFleetWatcher.poll_once`) already catches
+    # :class:`GithubClientError` and emits ``pr.poll_error`` — so a
+    # transient comment-endpoint hiccup lands in the same path as every
+    # other fetch error instead of silently hiding missed events.
+    issue_comments_raw = await gh.list_pr_issue_comments(repo, pr_number)
+    inline_comments_raw = await gh.list_pr_review_comments(repo, pr_number)
+    # GitHub logins are case-insensitive. Normalize once and compare
+    # via ``.casefold()`` (proper Unicode-aware case folding, not
+    # ``.lower()``). Empty ``self_login`` disables filtering entirely.
+    self_login_cf = self_login.casefold() if self_login else ""
+
+    def _is_self(login: str) -> bool:
+        return bool(self_login_cf) and (login or "").casefold() == self_login_cf
+
+    external_issue_comments = [
+        {
+            "id": c.get("id"),
+            "author": c.get("user", ""),
+            "body": c.get("body", "") or "",
+            "posted_at": c.get("created_at", "") or "",
+        }
+        for c in issue_comments_raw
+        if not _is_self(c.get("user", ""))
+    ]
+    inline_findings = [
+        {
+            "id": c.id,
+            "author": c.reviewer,
+            "body": c.body or "",
+            "posted_at": c.created_at or "",
+            "path": c.path,
+            "line": c.line,
+            "review_id": c.pull_request_review_id,
+        }
+        for c in inline_comments_raw
+        if not _is_self(c.reviewer or "")
+    ]
+
     merged = bool(pr.get("state") == "closed" and _pr_was_merged(pr))
     merged_at = _extract_merged_at(pr)
-    return PRSnapshot(
+    snapshot = PRSnapshot(
         repo=repo,
         pr_number=pr_number,
         head_sha=str(pr.get("head_sha") or ""),
@@ -877,7 +1186,36 @@ async def _snapshot_from_github(
         mergeable=pr.get("mergeable"),
         merge_state=str(pr.get("mergeable_state") or ""),
         reviews=reviews,
+        external_issue_comments=external_issue_comments,
+        inline_findings=inline_findings,
     )
+    _populate_comment_summaries(snapshot)
+    return snapshot
+
+
+def _populate_comment_summaries(snapshot: PRSnapshot) -> None:
+    """Fill the derived ``latest_*`` / ``*_count`` snapshot fields.
+
+    Kept as a free function so tests that construct a snapshot with
+    pre-assembled lists can call it too — the summary fields are
+    consistent with the lists however the snapshot is built.
+    """
+    snapshot.external_issue_comments_count = len(snapshot.external_issue_comments)
+    if snapshot.external_issue_comments:
+        latest = snapshot.external_issue_comments[-1]
+        snapshot.latest_issue_comment_at = latest.get("posted_at") or None
+        snapshot.latest_issue_comment_by = latest.get("author") or None
+        body = latest.get("body") or ""
+        snapshot.latest_issue_comment_preview = body[:COMMENT_PREVIEW_CHARS]
+    snapshot.inline_findings_count = len(snapshot.inline_findings)
+    if snapshot.inline_findings:
+        latest = snapshot.inline_findings[-1]
+        snapshot.latest_inline_at = latest.get("posted_at") or None
+        snapshot.latest_inline_by = latest.get("author") or None
+        snapshot.latest_inline_path = latest.get("path")
+        snapshot.latest_inline_line = latest.get("line")
+        body = latest.get("body") or ""
+        snapshot.latest_inline_preview = body[:COMMENT_PREVIEW_CHARS]
 
 
 def _pr_was_merged(pr: dict) -> bool:
@@ -914,6 +1252,10 @@ async def _list_open_pr_numbers(gh: GithubClient, repo: str) -> list[int]:
         resp = await client.rest.pulls.async_list(
             owner=owner, repo=name, state="open", per_page=100,
         )
+    except asyncio.CancelledError:
+        # CancelledError subclasses Exception; re-raise so cooperative
+        # cancellation doesn't get wrapped as a GithubClientError.
+        raise
     except Exception as e:
         raise GithubClientError(f"list_open_prs({repo}): {e}") from e
     return [pr.number for pr in resp.parsed_data]

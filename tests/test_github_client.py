@@ -7,6 +7,8 @@ integration-test territory and would need a token + network.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from developer.github_client import (
@@ -96,6 +98,18 @@ def test_review_comment_dataclass_roundtrip():
     )
     assert c.path == "developer/foo.py"
     assert c.line == 10
+    # pull_request_review_id defaults to None — stays backward-compatible
+    # with callers that construct the dataclass without the new field.
+    assert c.pull_request_review_id is None
+
+
+def test_review_comment_dataclass_carries_review_id():
+    c = GithubReviewComment(
+        id=1, pr_number=42, repo="o/n", reviewer="bot",
+        path="a.py", line=5, body="nit", created_at="2026-04-13",
+        pull_request_review_id=777,
+    )
+    assert c.pull_request_review_id == 777
 
 
 def test_pr_readiness_dataclass_roundtrip():
@@ -258,9 +272,17 @@ def _install_fake_gh(client, *, reviews=None, review_comments=None,
             _maybe_raise("pulls.async_list_reviews")
             return _FakeResponse2(reviews or [])
 
-        async def async_list_review_comments(self, **_):
+        async def async_list_review_comments(self, **kwargs):
             _maybe_raise("pulls.async_list_review_comments")
-            return _FakeResponse2(review_comments or [])
+            data = review_comments or []
+            # Same convention as issues.async_list_comments: if the
+            # fixture is a list of pages (list-of-lists), return the
+            # requested page; otherwise return the flat list as a
+            # single-page response.
+            if data and isinstance(data[0], list):
+                page = int(kwargs.get("page", 1))
+                return _FakeResponse2(data[page - 1] if page <= len(data) else [])
+            return _FakeResponse2(data)
 
         async def async_get(self, **_):
             _maybe_raise("pulls.async_get")
@@ -337,6 +359,103 @@ async def test_list_pr_review_comments_normalizes():
     assert len(out) == 2
     assert out[0].path == "a.py" and out[0].line == 5
     assert out[1].line is None
+    # pull_request_review_id absent on the fake → normalized to None,
+    # matches the "standalone reply-to-thread" case.
+    assert all(rc.pull_request_review_id is None for rc in out)
+
+
+@pytest.mark.asyncio
+async def test_list_pr_review_comments_carries_review_id_and_original_line():
+    """When the inline comment attaches to a formal review, githubkit
+    exposes ``pull_request_review_id``; the normalized dataclass carries
+    it through so :class:`developer.pr_watcher.PRFleetWatcher` can set
+    ``review_id`` on ``pr.inline_finding`` payloads.
+
+    Also checks the ``line → original_line`` fallback: when a comment's
+    current anchor line is None (the file shifted under it) we fall
+    back to the position at the time of posting so the subscriber
+    always has a line to report.
+    """
+    class _Enriched:
+        def __init__(self, id, path, line, original_line, review_id, body,
+                     user=None, created_at="2026-04-22T00:00:00Z"):
+            self.id = id
+            self.path = path
+            self.line = line
+            self.original_line = original_line
+            self.pull_request_review_id = review_id
+            self.body = body
+            self.user = user or _FakeUser()
+            self.created_at = created_at
+
+    c = GithubClient(token="t")
+    _install_fake_gh(c, review_comments=[
+        _Enriched(20, "a.py", 7, 7, 555, "inside-review finding"),
+        _Enriched(21, "b.py", None, 42, None, "outdated / standalone"),
+    ])
+    out = await c.list_pr_review_comments("o/n", 3)
+    assert out[0].pull_request_review_id == 555
+    assert out[0].line == 7
+    # line=None → fall back to original_line so the subscriber still
+    # has a line to report for outdated / shifted comments.
+    assert out[1].line == 42
+    assert out[1].pull_request_review_id is None
+
+
+@pytest.mark.asyncio
+async def test_list_pr_review_comments_paginates_until_short_page():
+    """Copilot R2 concern: a full first page would previously drop
+    anything past per_page=30 because the wrapper issued a single
+    unbounded call. Now the loop walks pages until a short page,
+    matching :meth:`list_pr_issue_comments`' shape.
+    """
+    c = GithubClient(token="t")
+    first_page = [
+        _FakeReviewComment(i, f"f{i}.py", i, f"nit {i}") for i in range(100)
+    ]
+    second_page = [_FakeReviewComment(200, "late.py", 1, "last inline")]
+    _install_fake_gh(c, review_comments=[first_page, second_page])
+    out = await c.list_pr_review_comments("o/n", 3)
+    assert len(out) == 101
+    # Order is preserved across pages, and the final element is the
+    # single entry from the second (short) page.
+    assert out[-1].body == "last inline"
+    assert out[-1].id == 200
+
+
+@pytest.mark.asyncio
+async def test_list_pr_review_comments_normalizes_datetime_to_iso():
+    """Copilot R2 correctness: when githubkit returns ``created_at`` as a
+    Python ``datetime`` instance, the wrapper must emit ISO-8601 (``T``
+    separator) — not the space-separated ``str(datetime)`` form that
+    downstream consumers (``pr.inline_finding.posted_at``) treat as
+    broken.
+    """
+    from datetime import datetime, timezone
+
+    dt = datetime(2026, 4, 23, 2, 25, 19, tzinfo=timezone.utc)
+    c = GithubClient(token="t")
+    _install_fake_gh(c, review_comments=[
+        _FakeReviewComment(30, "a.py", 1, "hi", created_at=dt),
+    ])
+    out = await c.list_pr_review_comments("o/n", 3)
+    assert out[0].created_at == "2026-04-23T02:25:19+00:00"
+    # Guardrail: no space-separated form slipped through.
+    assert " " not in out[0].created_at
+
+
+def test_as_iso_helper_roundtrip():
+    """``_as_iso`` returns ISO for datetimes, passes through existing
+    strings, and coerces ``None`` to an empty string.
+    """
+    from datetime import datetime, timezone
+
+    from developer.github_client import _as_iso
+
+    assert _as_iso(None) == ""
+    assert _as_iso("2026-04-23T02:25:19+00:00") == "2026-04-23T02:25:19+00:00"
+    dt = datetime(2026, 4, 23, 2, 25, 19, tzinfo=timezone.utc)
+    assert _as_iso(dt) == "2026-04-23T02:25:19+00:00"
 
 
 @pytest.mark.asyncio
@@ -683,3 +802,171 @@ async def test_missing_user_falls_back_to_unknown():
     _install_fake_gh(c, reviews=[review_no_user])
     out = await c.list_pr_reviews("o/n", 1)
     assert out[0].reviewer == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_get_authenticated_user_login_returns_empty_without_token(monkeypatch):
+    """Unauthenticated clients can't ask "who am I" — degrade to empty
+    so callers (e.g. pr_watcher) get a disabled-filter fallback instead
+    of an exception."""
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    c = GithubClient()
+    assert await c.get_authenticated_user_login() == ""
+
+
+@pytest.mark.asyncio
+async def test_get_authenticated_user_login_reads_login_from_api():
+    """With a token, the wrapper calls ``users.async_get_authenticated``
+    and returns the login string. This is what pr_watcher uses to
+    resolve ``self_login`` once per watcher lifetime."""
+    c = GithubClient(token="t")
+
+    class _Me:
+        login = "tolldog"
+
+    class _Users:
+        async def async_get_authenticated(self, **_):
+            return _FakeResponse2(_Me())
+
+    class _Rest:
+        users = _Users()
+
+    class _Gh:
+        rest = _Rest()
+
+    c._gh = _Gh()
+    assert await c.get_authenticated_user_login() == "tolldog"
+
+
+@pytest.mark.asyncio
+async def test_get_authenticated_user_login_swallows_errors():
+    """A failed /user lookup must NOT take down the watcher — degrade
+    to empty (filter disabled) and let the watcher keep running."""
+    c = GithubClient(token="t")
+
+    class _Users:
+        async def async_get_authenticated(self, **_):
+            raise RuntimeError("api down")
+
+    class _Rest:
+        users = _Users()
+
+    class _Gh:
+        rest = _Rest()
+
+    c._gh = _Gh()
+    assert await c.get_authenticated_user_login() == ""
+
+
+# ---------------------------------------------------------------------------
+# Cooperative cancellation propagation (PR #39 Copilot R4).
+#
+# ``asyncio.CancelledError`` is a subclass of ``Exception`` (Python 3.8+),
+# which means a bare ``except Exception`` will swallow it and defeat
+# cooperative cancellation. Every wrapper that catches ``Exception``
+# around an ``await`` must therefore re-raise ``CancelledError`` before
+# the generic fallback. These tests pin that invariant so a future edit
+# that drops the ``except asyncio.CancelledError: raise`` clause fails
+# loudly instead of silently converting cancellation into "success with
+# degraded value" (``get_authenticated_user_login``) or a
+# ``GithubClientError`` (the other wrappers).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_pr_review_comments_propagates_cancellation():
+    """R4 site: the paging loop's ``except Exception`` must not convert
+    ``CancelledError`` into ``GithubClientError``."""
+    c = GithubClient(token="t")
+    _install_fake_gh(
+        c,
+        raise_on={"pulls.async_list_review_comments": asyncio.CancelledError()},
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await c.list_pr_review_comments("o/n", 3)
+
+
+@pytest.mark.asyncio
+async def test_get_authenticated_user_login_propagates_cancellation():
+    """R4 site: the degrade-to-empty fallback must not swallow
+    ``CancelledError`` — otherwise watcher shutdown mid-resolve would
+    silently complete instead of cancelling cooperatively."""
+    c = GithubClient(token="t")
+
+    class _Users:
+        async def async_get_authenticated(self, **_):
+            raise asyncio.CancelledError()
+
+    class _Rest:
+        users = _Users()
+
+    class _Gh:
+        rest = _Rest()
+
+    c._gh = _Gh()
+    with pytest.raises(asyncio.CancelledError):
+        await c.get_authenticated_user_login()
+
+
+@pytest.mark.asyncio
+async def test_list_pr_reviews_propagates_cancellation():
+    """Same shape as R4 applied to the sibling raise-as-GithubClientError
+    wrappers — grep swept all eight sites in this module."""
+    c = GithubClient(token="t")
+    _install_fake_gh(
+        c,
+        raise_on={"pulls.async_list_reviews": asyncio.CancelledError()},
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await c.list_pr_reviews("o/n", 7)
+
+
+@pytest.mark.asyncio
+async def test_get_pr_propagates_cancellation():
+    c = GithubClient(token="t")
+    _install_fake_gh(c, raise_on={"pulls.async_get": asyncio.CancelledError()})
+    with pytest.raises(asyncio.CancelledError):
+        await c.get_pr("o/n", 3)
+
+
+@pytest.mark.asyncio
+async def test_merge_pr_propagates_cancellation():
+    """merge_pr has the most elaborate post-catch logic (405/409 → typed
+    errors). The CancelledError guard must fire BEFORE that mapping so a
+    cancelled merge doesn't bubble up as a ``GithubMergeBlockedError`` or
+    ``GithubMergeConflictError``."""
+    c = GithubClient(token="t")
+    _install_fake_gh(c, raise_on={"pulls.async_merge": asyncio.CancelledError()})
+    with pytest.raises(asyncio.CancelledError):
+        await c.merge_pr("o/n", 3)
+
+
+@pytest.mark.asyncio
+async def test_list_pr_issue_comments_propagates_cancellation():
+    c = GithubClient(token="t")
+    _install_fake_gh(
+        c,
+        raise_on={"issues.async_list_comments": asyncio.CancelledError()},
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await c.list_pr_issue_comments("o/n", 3)
+
+
+@pytest.mark.asyncio
+async def test_post_pr_comment_propagates_cancellation():
+    c = GithubClient(token="t")
+    _install_fake_gh(
+        c,
+        raise_on={"issues.async_create_comment": asyncio.CancelledError()},
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await c.post_pr_comment("o/n", 3, "hi")
+
+
+@pytest.mark.asyncio
+async def test_create_pr_propagates_cancellation():
+    c = GithubClient(token="t")
+    _install_fake_gh(c, raise_on={"pulls.async_create": asyncio.CancelledError()})
+    with pytest.raises(asyncio.CancelledError):
+        await c.create_pr("o/n", title="t", body="b", head="h")

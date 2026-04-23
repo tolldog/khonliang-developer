@@ -30,6 +30,28 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _as_iso(value: Any) -> str:
+    """Normalize a GitHub-provided timestamp into an ISO-8601 string.
+
+    githubkit sometimes surfaces timestamp fields as Python ``datetime``
+    instances and sometimes as already-ISO strings, depending on the
+    response model / response-parsed path. Python's default
+    ``str(datetime)`` uses a space separator (``"2026-04-23 02:25:19+00:00"``)
+    rather than ISO-8601 (``"2026-04-23T02:25:19+00:00"``). Downstream
+    consumers (notably :mod:`developer.pr_watcher` payload fields like
+    ``posted_at``) expect the ``T``-separated shape, so normalize at the
+    client boundary instead of patching every payload site.
+
+    ``None`` is coerced to an empty string so callers can use the result
+    as a plain ``str`` without a separate nullable branch.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
 @dataclass
 class GithubReview:
     """Normalized shape of a PR review for downstream consumers.
@@ -50,7 +72,13 @@ class GithubReview:
 
 @dataclass
 class GithubReviewComment:
-    """A single inline review comment on a file:line."""
+    """A single inline review comment on a file:line.
+
+    ``pull_request_review_id`` links the comment back to the containing
+    review (from :meth:`GithubClient.list_pr_reviews`) when the comment
+    is part of a formal review. Standalone review-thread replies post
+    outside a review and carry ``pull_request_review_id=None``.
+    """
 
     id: int
     pr_number: int
@@ -60,6 +88,7 @@ class GithubReviewComment:
     line: int | None                 # target line; None for file-level comments
     body: str
     created_at: str
+    pull_request_review_id: int | None = None
 
 
 @dataclass
@@ -147,6 +176,10 @@ class GithubClient:
             resp = await self._client().rest.pulls.async_list_reviews(
                 owner=owner, repo=name, pull_number=pr_number,
             )
+        except asyncio.CancelledError:
+            # CancelledError subclasses Exception (since 3.8); never
+            # convert cooperative cancellation into GithubClientError.
+            raise
         except Exception as e:
             raise GithubClientError(f"list_pr_reviews({repo}#{pr_number}): {e}") from e
 
@@ -162,7 +195,7 @@ class GithubClient:
                     reviewer=r.user.login if r.user else "unknown",
                     state=r.state,
                     body=r.body or "",
-                    submitted_at=str(r.submitted_at),
+                    submitted_at=_as_iso(r.submitted_at),
                 )
             )
         return result
@@ -175,30 +208,55 @@ class GithubClient:
         Separate from :meth:`list_pr_reviews` because GitHub's API splits
         top-level review metadata (state, summary body) from per-line
         comments. Consumers typically want both.
+
+        Paginates until the API returns a short page so large PRs don't
+        silently drop older inline findings past the default page size.
+        Mirrors :meth:`list_pr_issue_comments`' loop shape so both
+        comment-channel fetches have the same operational behavior.
         """
         owner, name = self._split_repo(repo)
+        comments: list[GithubReviewComment] = []
+        page = 1
         try:
-            resp = await self._client().rest.pulls.async_list_review_comments(
-                owner=owner, repo=name, pull_number=pr_number,
-            )
+            while True:
+                resp = await self._client().rest.pulls.async_list_review_comments(
+                    owner=owner, repo=name, pull_number=pr_number,
+                    per_page=100, page=page,
+                )
+                batch = [
+                    GithubReviewComment(
+                        id=c.id,
+                        pr_number=pr_number,
+                        repo=repo,
+                        reviewer=c.user.login if c.user else "unknown",
+                        path=c.path,
+                        # GitHub exposes both ``line`` (current position,
+                        # None once the diff has shifted) and
+                        # ``original_line`` (position at the time the
+                        # comment was posted). Prefer ``line`` so
+                        # subscribers see the current anchor; fall back to
+                        # ``original_line`` when the comment is outdated.
+                        line=getattr(c, "line", None) or getattr(c, "original_line", None),
+                        body=c.body or "",
+                        created_at=_as_iso(c.created_at),
+                        pull_request_review_id=getattr(c, "pull_request_review_id", None),
+                    )
+                    for c in resp.parsed_data
+                ]
+                comments.extend(batch)
+                if len(batch) < 100:
+                    break
+                page += 1
+        except asyncio.CancelledError:
+            # CancelledError is a subclass of Exception (3.8+); never
+            # let the generic fallback convert cooperative cancellation
+            # into a GithubClientError.
+            raise
         except Exception as e:
             raise GithubClientError(
                 f"list_pr_review_comments({repo}#{pr_number}): {e}"
             ) from e
-
-        return [
-            GithubReviewComment(
-                id=c.id,
-                pr_number=pr_number,
-                repo=repo,
-                reviewer=c.user.login if c.user else "unknown",
-                path=c.path,
-                line=getattr(c, "line", None),
-                body=c.body or "",
-                created_at=str(c.created_at),
-            )
-            for c in resp.parsed_data
-        ]
+        return comments
 
     async def post_pr_comment(self, repo: str, pr_number: int, body: str) -> int:
         """Post a top-level (issue-style) comment on a PR; returns the comment id.
@@ -211,6 +269,8 @@ class GithubClient:
             resp = await self._client().rest.issues.async_create_comment(
                 owner=owner, repo=name, issue_number=pr_number, body=body,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             raise GithubClientError(f"post_pr_comment({repo}#{pr_number}): {e}") from e
         return resp.parsed_data.id
@@ -236,7 +296,7 @@ class GithubClient:
                         "id": c.id,
                         "user": c.user.login if c.user else "unknown",
                         "body": c.body or "",
-                        "created_at": str(c.created_at),
+                        "created_at": _as_iso(c.created_at),
                     }
                     for c in resp.parsed_data
                 ]
@@ -244,6 +304,8 @@ class GithubClient:
                 if len(batch) < 100:
                     break
                 page += 1
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             raise GithubClientError(f"list_pr_issue_comments({repo}#{pr_number}): {e}") from e
         return comments
@@ -268,6 +330,8 @@ class GithubClient:
             resp = await self._client().rest.pulls.async_get(
                 owner=owner, repo=name, pull_number=pr_number,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             raise GithubClientError(f"get_pr({repo}#{pr_number}): {e}") from e
         pr = resp.parsed_data
@@ -276,13 +340,14 @@ class GithubClient:
         # default ``str(datetime)`` uses a space separator ("YYYY-MM-DD HH:MM:SS+00:00")
         # rather than ISO8601 ("YYYY-MM-DDTHH:MM:SS+00:00"). Downstream consumers
         # (including the pr_watcher dedupe key per fr_developer_6c8ec260) rely on
-        # a stable ISO8601 shape, so normalize here.
+        # a stable ISO8601 shape, so normalize through the shared helper.
+        # Preserve the nullable contract: when GH reports ``merged_at=None``
+        # (open / closed-unmerged PR), we return ``None`` rather than ``""``
+        # so callers can distinguish "never merged" from "merged-at-epoch".
         if merged_at_raw is None:
             merged_at = None
-        elif isinstance(merged_at_raw, datetime):
-            merged_at = merged_at_raw.isoformat()
         else:
-            merged_at = str(merged_at_raw)
+            merged_at = _as_iso(merged_at_raw)
         return {
             "number": pr.number,
             "title": pr.title,
@@ -324,7 +389,7 @@ class GithubClient:
         ]
         effective_blocking_reviews = [
             r for r in blocking_reviews
-            if not (copilot_comment and _is_copilot_login(r.reviewer))
+            if not (copilot_comment and is_copilot_login(r.reviewer))
         ]
         actionable_comments = len(review_comments)
         merge_state = str(pr.get("mergeable_state") or "unknown").lower()
@@ -381,6 +446,8 @@ class GithubClient:
                 owner=owner, repo=name, title=title, body=body,
                 head=head, base=base, draft=draft,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             raise GithubClientError(f"create_pr({repo}, {head}→{base}): {e}") from e
         pr = resp.parsed_data
@@ -416,6 +483,8 @@ class GithubClient:
 
         try:
             resp = await self._client().rest.pulls.async_merge(**kwargs)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             status = getattr(getattr(e, "response", None), "status_code", None)
             if status == 405:
@@ -441,6 +510,31 @@ class GithubClient:
             "message": resp.parsed_data.message,
             "admin_bypass": admin_bypass,
         }
+
+    async def get_authenticated_user_login(self) -> str:
+        """Return the login for the authenticated token, or ``""`` when
+        running unauthenticated.
+
+        Callers (notably :mod:`developer.pr_watcher`) use the login to
+        filter out self-authored comments from event emission — an
+        empty token discovery (``token=None``) yields an empty string,
+        which naturally disables the filter (no login ever matches).
+        Errors are swallowed to the same fallback so a transient API
+        hiccup can't take down the watcher on a filter-only path.
+        """
+        if not self._token:
+            return ""
+        try:
+            resp = await self._client().rest.users.async_get_authenticated()
+        except asyncio.CancelledError:
+            # Degrade-to-empty is for transient API failures, not for
+            # cooperative cancellation — let the task actually stop.
+            raise
+        except Exception as e:
+            logger.warning("get_authenticated_user_login failed: %s", e)
+            return ""
+        login = getattr(resp.parsed_data, "login", None)
+        return str(login) if login else ""
 
     # -- helpers --
 
@@ -474,7 +568,7 @@ def _latest_copilot_clear_comment(comments: list[dict], *, head_sha: str = "") -
         user = str(comment.get("user", "")).lower()
         body = str(comment.get("body", ""))
         body_lower = body.lower()
-        if not _is_copilot_login(user):
+        if not is_copilot_login(user):
             continue
         if not any(marker in body_lower for marker in clear_markers):
             continue
@@ -484,9 +578,25 @@ def _latest_copilot_clear_comment(comments: list[dict], *, head_sha: str = "") -
     return ""
 
 
-def _is_copilot_login(login: str) -> bool:
+def is_copilot_login(login: str) -> bool:
+    """Does ``login`` match any known Copilot auth variant?
+
+    Public helper — the single source of truth for Copilot-identity
+    matching across developer. Callers include
+    :func:`_latest_copilot_clear_comment` (local), the readiness gate
+    in :meth:`GithubClient.pr_readiness` (local), and
+    :func:`developer.pr_watcher.comment_looks_like_bot_verdict`
+    (cross-module).
+
+    Keeping the set in one place means a new Copilot variant only needs
+    to be added once. The historical private name (``_is_copilot_login``)
+    was promoted per PR #39 Copilot R3 to remove the duplicated login
+    set that had drifted between this module and pr_watcher.py.
+    """
     return login.lower() in {
+        "copilot",
         "copilot-swe-agent",
+        "copilot-swe-agent[bot]",
         "copilot-pull-request-reviewer",
         "copilot-pull-request-reviewer[bot]",
     }
