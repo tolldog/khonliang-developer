@@ -127,6 +127,39 @@ def test_log_dogfood_source_roundtrip(store):
     assert round_tripped.source == src
 
 
+def test_log_dogfood_rejects_collision_with_non_dogfood_entry(store):
+    """A non-dogfood KnowledgeEntry at the derived dog id must not be silently
+    overwritten. Prior impl only raised on dogfood-tagged collisions; any
+    other pre-existing entry (corrupted data or an unrelated entry type
+    reusing the id) would be clobbered by ``knowledge.add()``. Enforce
+    refusal.
+    """
+    from khonliang.knowledge.store import KnowledgeEntry, Tier
+    from developer.dogfood_store import _derive_dog_id
+
+    observation = "collision-candidate observation"
+    observed = 1234.0
+    dog_id = _derive_dog_id(observation, observed)
+
+    # Seed a KnowledgeEntry at the same id but with unrelated tags.
+    store.knowledge.add(KnowledgeEntry(
+        id=dog_id,
+        tier=Tier.DERIVED,
+        title="pre-existing non-dogfood entry",
+        content="some other content",
+        tags=["fr", "unrelated"],
+    ))
+
+    with pytest.raises(DogfoodError, match="id collision with non-dogfood entry"):
+        store.log_dogfood(observation, observed_at=observed)
+
+    # Pre-existing entry must be untouched.
+    survivor = store.knowledge.get(dog_id)
+    assert survivor is not None
+    assert survivor.title == "pre-existing non-dogfood entry"
+    assert "dogfood" not in (survivor.tags or [])
+
+
 # ---------------------------------------------------------------------------
 # list_dogfood — ordering, kind/target/since filters, terminal default
 # ---------------------------------------------------------------------------
@@ -448,3 +481,44 @@ def test_mcp_list_dogfood_since_filter(pipeline):
     observations = [d.get("observation") for d in result["dogfood"]]
     assert "newer" in observations
     assert "older" not in observations
+
+
+def test_handle_list_dogfood_preserves_explicit_none_for_no_cap(pipeline):
+    """MCP handler must pass through explicit ``limit=None`` as "no cap",
+    while still defaulting omitted limit to 20 and honoring integer limits.
+
+    Prior impl coerced ``None`` via ``int(None)`` → TypeError → fallback 20,
+    making the "no cap" API expressible by the store but not by the MCP
+    surface.
+    """
+    agent = _make_agent(pipeline)
+
+    # Seed >20 observations — enough to see the cap effect and the
+    # no-cap effect clearly.
+    n_extra = 25
+    for i in range(n_extra):
+        pipeline.dogfood.log_dogfood(f"obs-{i}", observed_at=float(1000 + i))
+
+    # Total rows in the store (includes seed data).
+    total = len(pipeline.dogfood.list_dogfood(status="all", limit=None))
+    assert total > 20, "test setup should push past the default cap of 20"
+
+    # limit=None → unbounded.
+    result_none = _run(agent.handle_list_dogfood({
+        "limit": None,
+        "status": "all",
+    }))
+    assert result_none["count"] == total
+
+    # limit=5 → exactly 5.
+    result_five = _run(agent.handle_list_dogfood({
+        "limit": 5,
+        "status": "all",
+    }))
+    assert result_five["count"] == 5
+
+    # limit omitted → default cap of 20.
+    result_default = _run(agent.handle_list_dogfood({
+        "status": "all",
+    }))
+    assert result_default["count"] == 20

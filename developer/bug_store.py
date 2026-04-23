@@ -265,10 +265,19 @@ class BugStore:
 
         bug_id = _derive_bug_id(target, title, description, observed_entity)
         existing = self.knowledge.get(bug_id)
-        if existing is not None and "bug" in (existing.tags or []):
+        if existing is not None:
+            # Refuse to overwrite ANY pre-existing entry at this id, not just
+            # bug-tagged ones. A non-bug entry at the same id signals either
+            # data corruption or id-namespace collision with another entry
+            # type; either way, silently overwriting it would lose data.
+            if "bug" in (existing.tags or []):
+                raise BugError(
+                    f"bug already exists with id {bug_id} "
+                    "(same target+title+description+observed_entity as an existing bug)"
+                )
             raise BugError(
-                f"bug already exists with id {bug_id} "
-                "(same target+title+description+observed_entity as an existing bug)"
+                f"id collision with non-bug entry at {bug_id} "
+                f"(existing tags: {sorted(existing.tags or [])}); refusing to overwrite"
             )
 
         now = time.time()

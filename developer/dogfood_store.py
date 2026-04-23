@@ -254,10 +254,19 @@ class DogfoodStore:
         observed = observed_at if observed_at is not None else now
         dog_id = _derive_dog_id(observation, observed)
         existing = self.knowledge.get(dog_id)
-        if existing is not None and "dogfood" in (existing.tags or []):
+        if existing is not None:
+            # Refuse to overwrite ANY pre-existing entry at this id, not just
+            # dogfood-tagged ones. A non-dogfood entry at the same id signals
+            # either data corruption or id-namespace collision with another
+            # entry type; either way, silently overwriting it would lose data.
+            if "dogfood" in (existing.tags or []):
+                raise DogfoodError(
+                    f"dogfood already exists with id {dog_id} "
+                    "(same observation+observed_at as an existing entry)"
+                )
             raise DogfoodError(
-                f"dogfood already exists with id {dog_id} "
-                "(same observation+observed_at as an existing entry)"
+                f"id collision with non-dogfood entry at {dog_id} "
+                f"(existing tags: {sorted(existing.tags or [])}); refusing to overwrite"
             )
 
         dog = Dogfood(

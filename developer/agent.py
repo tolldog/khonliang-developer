@@ -1980,11 +1980,22 @@ class DeveloperAgent(BaseAgent):
         target = args.get("target", "") or ""
         since_raw = args.get("since", "")
         detail = args.get("detail", "brief")
-        try:
-            limit = int(args.get("limit", 20))
-        except (TypeError, ValueError):
+        # Preserve explicit None from the caller so the MCP surface can
+        # express "no cap" — matches DogfoodStore.list_dogfood's API where
+        # limit=None means unbounded. Omitted limit defaults to 20.
+        _MISSING = object()
+        raw_limit = args.get("limit", _MISSING)
+        limit: int | None
+        if raw_limit is _MISSING:
             limit = 20
-        if limit < 0:
+        elif raw_limit is None:
+            limit = None
+        else:
+            try:
+                limit = int(raw_limit)
+            except (TypeError, ValueError):
+                limit = 20
+        if limit is not None and limit < 0:
             limit = 0
 
         since: float | None

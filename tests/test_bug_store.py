@@ -127,6 +127,45 @@ def test_file_bug_deterministic_id_collision(store):
     assert other.id != first.id
 
 
+def test_file_bug_rejects_collision_with_non_bug_entry(store):
+    """A non-bug KnowledgeEntry at the derived bug id must not be silently
+    overwritten. Prior impl only raised on bug-tagged collisions; any other
+    pre-existing entry (corrupted data or an unrelated entry type reusing the
+    id) would be clobbered by ``knowledge.add()``. Enforce refusal.
+    """
+    from khonliang.knowledge.store import KnowledgeEntry, Tier
+    from developer.bug_store import _derive_bug_id
+
+    target = "developer"
+    title = "T"
+    description = "d"
+    observed_entity = "x"
+    bug_id = _derive_bug_id(target, title, description, observed_entity)
+
+    # Seed a KnowledgeEntry at the same id but with unrelated tags.
+    store.knowledge.add(KnowledgeEntry(
+        id=bug_id,
+        tier=Tier.DERIVED,
+        title="pre-existing non-bug entry",
+        content="some other content",
+        tags=["fr", "unrelated"],
+    ))
+
+    with pytest.raises(BugError, match="id collision with non-bug entry"):
+        store.file_bug(
+            target=target,
+            title=title,
+            description=description,
+            observed_entity=observed_entity,
+        )
+
+    # Pre-existing entry must be untouched.
+    survivor = store.knowledge.get(bug_id)
+    assert survivor is not None
+    assert survivor.title == "pre-existing non-bug entry"
+    assert "bug" not in (survivor.tags or [])
+
+
 def test_get_returns_none_for_unknown_id(store):
     assert store.get_bug("bug_developer_00000000") is None
 
