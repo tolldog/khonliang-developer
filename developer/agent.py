@@ -263,7 +263,9 @@ class DeveloperAgent(BaseAgent):
             # Milestone lifecycle mutations (fr_developer_91a5a072).
             Skill("update_milestone_status",
                   "Advance a milestone's lifecycle status "
-                  "(proposed/planned/in_progress/completed/abandoned/superseded)",
+                  "(proposed/planned/in_progress/completed/abandoned/superseded). "
+                  "'archived' is a legacy on-disk synonym for 'abandoned' — "
+                  "still accepted for older records but new work should use 'abandoned'.",
                   {"milestone_id": {"type": "string", "required": True},
                    "status": {"type": "string", "required": True},
                    "notes": {"type": "string", "default": ""},

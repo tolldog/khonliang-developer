@@ -362,6 +362,42 @@ def test_update_milestone_frs_refuses_on_non_proposed_milestone(pipeline):
         )
 
 
+def test_update_milestone_frs_accepts_single_str_as_one_id(pipeline):
+    """Bare-str fr-ids arg must normalize to a one-element list.
+
+    A plain ``str`` is technically ``Iterable[str]`` (of its own
+    characters); without early normalization the comprehension would
+    iterate ``"fr_developer_solo"`` into 17 bogus single-char fr ids.
+    PR #43 Copilot R3 finding 1.
+    """
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+    original = list(milestone.fr_ids)
+
+    # add_fr_ids passed as a bare string → single-id add, not per-char.
+    updated = pipeline.milestones.update_frs(
+        milestone.id,
+        add_fr_ids="fr_developer_solo",
+        notes="single-id add via bare str",
+    )
+    assert "fr_developer_solo" in updated.fr_ids
+    # No per-character id leakage.
+    assert not any(len(fid) == 1 for fid in updated.fr_ids)
+    last = updated.notes_history[-1]
+    assert last["added_fr_ids"] == ["fr_developer_solo"]
+    assert last["removed_fr_ids"] == []
+
+    # remove_fr_ids passed as a bare string → single-id remove.
+    updated2 = pipeline.milestones.update_frs(
+        milestone.id,
+        remove_fr_ids=original[0],
+        notes="single-id remove via bare str",
+    )
+    assert original[0] not in updated2.fr_ids
+    last2 = updated2.notes_history[-1]
+    assert last2["removed_fr_ids"] == [original[0]]
+    assert last2["added_fr_ids"] == []
+
+
 def test_update_milestone_status_rejects_backward_transition_without_force(pipeline):
     """Monotonic-forward: planned → proposed requires force.
 

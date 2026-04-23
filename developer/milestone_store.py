@@ -342,7 +342,7 @@ class MilestoneStore:
                     f"illegal transition {milestone.status!r} -> {status!r} "
                     f"for {milestone_id}. Allowed from {milestone.status!r}: "
                     f"{sorted(allowed)}. Pass force=True to override "
-                    "(rollback from terminal state)."
+                    "(rollback not in the forward transition graph)."
                 )
             forced = True
 
@@ -426,6 +426,12 @@ class MilestoneStore:
         likewise a no-op. Order within ``fr_ids`` is preserved for
         surviving entries; new entries land at the end in the order
         given.
+
+        ``add_fr_ids`` / ``remove_fr_ids`` accept either an iterable of
+        ids or a single bare ``str`` id. The bare-``str`` case is
+        normalized to a single-element list here so a caller passing
+        e.g. ``add_fr_ids="fr_developer_foo"`` doesn't get iterated
+        character-by-character — classic Python footgun.
         """
         milestone = self.get(milestone_id)
         if milestone is None:
@@ -438,8 +444,10 @@ class MilestoneStore:
                 "already moved on)"
             )
 
-        adds = [str(x).strip() for x in (add_fr_ids or []) if str(x).strip()]
-        removes = {str(x).strip() for x in (remove_fr_ids or []) if str(x).strip()}
+        adds_iter = _normalize_fr_ids(add_fr_ids)
+        removes_iter = _normalize_fr_ids(remove_fr_ids)
+        adds = [str(x).strip() for x in adds_iter if str(x).strip()]
+        removes = {str(x).strip() for x in removes_iter if str(x).strip()}
 
         new_ids = [fid for fid in milestone.fr_ids if fid not in removes]
         added: list[str] = []
@@ -649,6 +657,23 @@ def _fr_id_from_item(item: Any) -> str:
     if isinstance(item, dict):
         return str(item.get("fr_id") or item.get("id") or "").strip()
     return str(item).strip()
+
+
+def _normalize_fr_ids(val: Any) -> list[str]:
+    """Coerce a caller-supplied fr-ids argument into a list.
+
+    A bare ``str`` is a valid single-id value, but it's also a Python
+    ``Iterable[str]`` (of its own characters). Without this shim a
+    caller passing ``add_fr_ids="fr_developer_foo"`` would get their
+    string iterated character-by-character and each char treated as a
+    separate FR id. Normalize early so downstream code can treat every
+    input shape uniformly.
+    """
+    if val is None:
+        return []
+    if isinstance(val, str):
+        return [val]
+    return list(val)
 
 
 def _review_fr_item(item: Any) -> dict[str, str]:
