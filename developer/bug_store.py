@@ -323,7 +323,7 @@ class BugStore:
         if bug is None:
             raise BugError(f"unknown bug id: {bug_id}")
 
-        if bug.status in TERMINAL_STATUSES and bug.status != status:
+        if bug.status in TERMINAL_STATUSES:
             raise BugError(
                 f"cannot update {bug_id}: status is {bug.status!r} "
                 "(terminal bugs are immutable)"

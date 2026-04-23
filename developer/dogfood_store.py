@@ -189,7 +189,10 @@ class DogfoodStore:
         Default excludes terminal statuses (promoted / dismissed /
         duplicate). Pass ``status="all"`` (or ``include_terminal=True``)
         to include them. ``since`` filters by ``observed_at`` cutoff.
-        ``limit`` caps the returned count; pass None for no cap.
+        ``limit`` caps the returned count; pass ``None`` for no cap.
+        Negative values are normalized to ``0`` (returns empty list) to
+        match the MCP handler's normalization — callers who want no cap
+        must pass ``None`` explicitly.
         """
         allowed_statuses = _parse_status_filter(status, include_terminal=include_terminal)
         if kind and kind not in ALLOWED_KINDS:
@@ -213,8 +216,9 @@ class DogfoodStore:
                 continue
             dogs.append(d)
         dogs.sort(key=lambda x: x.observed_at, reverse=True)
-        if limit is not None and limit >= 0:
-            dogs = dogs[:limit]
+        if limit is not None:
+            effective_limit = max(limit, 0)
+            dogs = dogs[:effective_limit]
         return dogs
 
     # ------------------------------------------------------------------

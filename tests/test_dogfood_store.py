@@ -186,6 +186,29 @@ def test_list_limit_none_means_no_cap(store):
     assert len(dogs) == 5
 
 
+def test_list_dogfood_rejects_or_normalizes_negative_limit(store):
+    """Negative limits are normalized to 0 (empty) — matches MCP handler.
+
+    Covers the R2 finding: docstring says ``limit=None`` is the escape
+    hatch for no cap, but the previous ``limit is not None and limit >= 0``
+    implementation silently returned all rows for negative values (e.g.
+    ``-1``) — contradicting both the docstring and the MCP handler which
+    clamps negatives to 0. Store now matches handler normalization.
+    """
+    for i in range(5):
+        store.log_dogfood(f"obs {i}", observed_at=float(i))
+
+    # Negative limit must return empty (normalized to 0), not all rows.
+    assert store.list_dogfood(limit=-1) == []
+    assert store.list_dogfood(limit=-100) == []
+    # Zero limit returns empty.
+    assert store.list_dogfood(limit=0) == []
+    # None still means no cap.
+    assert len(store.list_dogfood(limit=None)) == 5
+    # Positive limit still caps normally.
+    assert len(store.list_dogfood(limit=2)) == 2
+
+
 # ---------------------------------------------------------------------------
 # mark_dismissed
 # ---------------------------------------------------------------------------

@@ -248,6 +248,44 @@ def test_update_status_rejects_on_terminal(store):
         store.update_bug_status(bug.id, BUG_STATUS_IN_PROGRESS)
 
 
+def test_update_bug_status_rejects_any_mutation_on_terminal_bug(store):
+    """Terminal bugs are fully immutable via update_bug_status.
+
+    Covers the R2 finding: previously ``bug.status != status`` let callers
+    pass ``status=<same terminal>`` + ``notes=...`` to append to
+    ``notes_history`` and bump ``updated_at``. Terminal means terminal —
+    no same-status note appends, no ``updated_at`` bumps, no history
+    growth. Duplicates still route via ``mark_duplicate``.
+    """
+    bug = store.file_bug(target="developer", title="T", description="d")
+    store.close_bug(bug.id, resolution=BUG_STATUS_FIXED)
+
+    before = store.get_bug(bug.id)
+    assert before.status == BUG_STATUS_FIXED
+    history_len_before = len(before.notes_history)
+    updated_at_before = before.updated_at
+
+    # Same-status "update" with notes must be refused.
+    with pytest.raises(BugError, match="terminal"):
+        store.update_bug_status(bug.id, BUG_STATUS_FIXED, notes="sneak note")
+
+    # Different terminal target also refused (unchanged behavior).
+    with pytest.raises(BugError, match="terminal"):
+        store.update_bug_status(bug.id, BUG_STATUS_WONTFIX, notes="flip")
+
+    # Non-terminal target still refused (unchanged behavior).
+    with pytest.raises(BugError, match="terminal"):
+        store.update_bug_status(bug.id, BUG_STATUS_TRIAGED)
+
+    # Verify no mutation leaked through any of the rejected calls.
+    after = store.get_bug(bug.id)
+    assert after.status == BUG_STATUS_FIXED
+    assert len(after.notes_history) == history_len_before
+    assert after.updated_at == updated_at_before
+    # Ensure the attempted note text never landed in history.
+    assert all("sneak note" not in (n.get("notes") or "") for n in after.notes_history)
+
+
 def test_update_status_rejects_unknown_id(store):
     with pytest.raises(BugError, match="unknown"):
         store.update_bug_status("bug_developer_missing", BUG_STATUS_TRIAGED)
