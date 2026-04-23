@@ -55,13 +55,22 @@ ALL_MILESTONE_STATUSES = ACTIVE_MILESTONE_STATUSES | TERMINAL_MILESTONE_STATUSES
 
 # Allowed forward transitions. The lifecycle is monotonic-forward:
 # proposed → planned → in_progress → (completed | abandoned | superseded |
-# archived). Terminal states have no outgoing edges. ANY backward edge
-# (completed → in_progress, in_progress → planned, planned → proposed,
-# etc.) requires the caller to pass ``force=True`` to
-# :meth:`MilestoneStore.update_status` (and is recorded in
-# ``notes_history`` with a ``force_rollback`` marker). Sideways jumps
-# to terminal states (abandon / supersede / archive from any active
-# status) are allowed without force since they do not reopen work.
+# archived). Terminal states have no outgoing edges.
+#
+# Forward shortcuts (allowed without force):
+#   * proposed → in_progress — skip the ``planned`` step when the caller
+#     has already decided to start work immediately. Kept because forcing
+#     callers through ``planned`` first is ceremony without signal; the
+#     ``proposed → in_progress`` path is a common lightweight flow.
+#
+# Sideways jumps to terminal states (abandoned / superseded / archived)
+# from any active status are allowed without force since they do not
+# reopen work.
+#
+# ANY backward edge (completed → in_progress, in_progress → planned,
+# planned → proposed, etc.) requires the caller to pass ``force=True``
+# to :meth:`MilestoneStore.update_status` (and is recorded in
+# ``notes_history`` with a ``force_rollback`` marker).
 ALLOWED_MILESTONE_TRANSITIONS: dict[str, set[str]] = {
     MILESTONE_STATUS_PROPOSED: {
         MILESTONE_STATUS_PLANNED,
@@ -290,12 +299,17 @@ class MilestoneStore:
 
         Default (``force=False``) enforces the monotonic-forward
         transition graph in :data:`ALLOWED_MILESTONE_TRANSITIONS`:
-        proposed → planned → in_progress → terminal, plus sideways
-        jumps to terminal states (abandoned / superseded / archived)
-        from any active status. Any backward edge (e.g. completed →
-        in_progress, in_progress → planned, planned → proposed)
-        requires ``force=True``; the audit entry records the force via
-        ``force_rollback=True`` so the history makes it obvious.
+        proposed → planned → in_progress → terminal. One forward
+        shortcut is allowed without force: ``proposed → in_progress``
+        (skipping ``planned``) for the common "decided to start
+        immediately" flow. Sideways jumps to terminal states (abandoned
+        / superseded / archived) from any active status are also
+        allowed without force.
+
+        Any backward edge (e.g. completed → in_progress, in_progress →
+        planned, planned → proposed) requires ``force=True``; the
+        audit entry records the force via ``force_rollback=True`` so
+        the history makes it obvious.
 
         The idempotent case (``status`` already matches) still appends
         an audit note when ``notes`` is provided, so "confirmed in-
@@ -474,6 +488,21 @@ class MilestoneStore:
           have been recorded, and dropping the milestone would lose
           that audit trail — use :meth:`supersede` instead).
 
+        Recovery tree when delete refuses:
+
+        * Non-seed history present → use :meth:`supersede` (which works
+          regardless of status) to retire the milestone while keeping
+          the audit trail intact.
+        * FR lookup raised on a ``proposed`` milestone → call
+          :meth:`update_frs` to drop the unreachable FR id(s) from the
+          bundle, then retry delete. ``update_frs`` only works on
+          ``proposed`` milestones.
+        * FR lookup raised on a non-``proposed`` milestone → use
+          :meth:`supersede` instead; the bundle is considered fixed
+          for audit once work has started.
+        * FR(s) genuinely in_progress → move them to a different
+          milestone or complete them first, then retry delete.
+
         ``fr_store`` is an optional :class:`developer.fr_store.FRStore`.
         When not supplied, the in-progress check is skipped with a
         ``skipped_fr_check`` marker in the returned payload — this is
@@ -504,14 +533,30 @@ class MilestoneStore:
                     # this FR is in_progress, and silently continuing
                     # would bypass the safety guard (e.g. on a redirect
                     # cycle or DB issue). Refuse the delete and surface
-                    # the failure; callers who really want to proceed
-                    # can clear the FR bundle via ``update_frs`` first.
+                    # the failure. The recovery path depends on the
+                    # milestone's status, since ``update_frs`` only
+                    # accepts ``proposed`` milestones: proposed →
+                    # clear the offending id via update_milestone_frs
+                    # and retry; non-proposed → use supersede_milestone
+                    # instead (which does not require FR verification
+                    # and preserves the audit trail).
+                    if milestone.status == MILESTONE_STATUS_PROPOSED:
+                        recovery = (
+                            "Clear the FR bundle via update_milestone_frs "
+                            "first if the FR is unreachable by design, "
+                            "then retry delete."
+                        )
+                    else:
+                        recovery = (
+                            f"Milestone status is {milestone.status!r}; "
+                            "use supersede_milestone instead "
+                            "(update_milestone_frs only accepts "
+                            "'proposed' milestones)."
+                        )
                     raise MilestoneError(
                         f"cannot delete milestone {milestone_id!r}: "
                         f"failed to verify FR state for {fr_id!r} "
-                        f"({type(exc).__name__}: {exc}). Clear the "
-                        "FR bundle via update_milestone_frs first if "
-                        "the FR is unreachable by design."
+                        f"({type(exc).__name__}: {exc}). {recovery}"
                     ) from exc
                 if fr is None:
                     continue
