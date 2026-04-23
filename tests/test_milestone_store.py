@@ -70,6 +70,59 @@ def test_list_filters_by_target_and_status(pipeline):
     assert pipeline.milestones.list(status=MILESTONE_STATUS_PROPOSED)
 
 
+def test_list_status_abandoned_includes_legacy_archived(pipeline):
+    """``list(status='abandoned')`` must surface legacy archived rows.
+
+    ``archived`` is the legacy synonym for ``abandoned``; treating the
+    filter as literal-match makes legacy on-disk rows invisible to the
+    canonical filter. Mirror ``update_status``' write-time normalization
+    on the read path so the filter input and stored value don't drift.
+    The test plants one ``archived`` row (simulating a legacy milestone
+    that pre-dates the ``abandoned`` canonical value) plus one
+    ``abandoned`` row, and asserts both surface under
+    ``status='abandoned'``. PR #43 Copilot R8 finding 3.
+    """
+    legacy = pipeline.milestones.propose_from_work_unit(_work_unit())
+    # Write-bypass the normalization in update_status to simulate a
+    # legacy on-disk row stored with the pre-normalization value.
+    legacy.status = MILESTONE_STATUS_ARCHIVED
+    pipeline.milestones._store(legacy)
+
+    fresh = pipeline.milestones.propose_from_work_unit(_second_work_unit())
+    pipeline.milestones.update_status(
+        fresh.id, MILESTONE_STATUS_ABANDONED, notes="wound down",
+    )
+
+    abandoned_ids = {
+        ms.id
+        for ms in pipeline.milestones.list(
+            status=MILESTONE_STATUS_ABANDONED, include_archived=True,
+        )
+    }
+    assert legacy.id in abandoned_ids
+    assert fresh.id in abandoned_ids
+
+    # Symmetric: ``status='archived'`` returns the same set — the two
+    # filter inputs are interchangeable for the legacy alias.
+    archived_ids = {
+        ms.id
+        for ms in pipeline.milestones.list(
+            status=MILESTONE_STATUS_ARCHIVED, include_archived=True,
+        )
+    }
+    assert archived_ids == abandoned_ids
+
+    # ``status='abandoned'`` without include_archived still returns
+    # both rows — the explicit filter request overrides the default
+    # ``hide archived`` flag so the two don't silently contradict.
+    default_flag_ids = {
+        ms.id
+        for ms in pipeline.milestones.list(status=MILESTONE_STATUS_ABANDONED)
+    }
+    assert legacy.id in default_flag_ids
+    assert fresh.id in default_flag_ids
+
+
 def test_propose_requires_frs(pipeline):
     with pytest.raises(MilestoneError, match="frs"):
         pipeline.milestones.propose_from_work_unit({"targets": ["developer"], "frs": []})
@@ -272,7 +325,7 @@ def test_update_milestone_status_force_allows_rollback(pipeline):
     assert rolled_back.notes_history[-1]["from_status"] == MILESTONE_STATUS_COMPLETED
 
 
-def test_supersede_milestone_sets_pointer_bidirectionally(pipeline):
+def test_supersede_milestone_sets_one_way_pointer_on_superseded(pipeline):
     stale = pipeline.milestones.propose_from_work_unit(_work_unit())
     replacement = pipeline.milestones.propose_from_work_unit(_second_work_unit())
 
@@ -311,6 +364,63 @@ def test_delete_milestone_refuses_if_fr_in_progress(pipeline):
 
     with pytest.raises(MilestoneError, match="in progress"):
         pipeline.milestones.delete(milestone.id, fr_store=pipeline.frs)
+
+
+def test_delete_refusal_message_reports_original_fr_id_on_redirect(pipeline):
+    """Delete refusal must surface the bundled fr_id, not just the resolved id.
+
+    When an FR in ``milestone.fr_ids`` has been merge-redirected to a
+    different FR, ``fr_store.get(fr_id)`` returns the terminal FR whose
+    ``.id`` differs from the bundled id. Reporting only the resolved id
+    leaves the caller with an id they cannot find in the milestone's
+    bundle and no way to correlate the blocker back to the offending
+    bundle entry. The refusal message now includes both sides of the
+    redirect so operators can trace the blocker. PR #43 Copilot R8
+    finding 1.
+    """
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+
+    # Build a two-source merge so ``fr_x`` becomes a merged-status record
+    # whose ``merged_into`` pointer redirects to the newly-created ``fr_y``.
+    fr_x = pipeline.frs.promote(
+        target="developer",
+        title="Legacy A",
+        description="source A prior to merge",
+        priority="high",
+    )
+    fr_peer = pipeline.frs.promote(
+        target="developer",
+        title="Legacy B",
+        description="source B prior to merge",
+        priority="medium",
+    )
+    fr_y = pipeline.frs.merge(
+        source_ids=[fr_x.id, fr_peer.id],
+        title="Unified scope",
+        description="post-merge terminal FR",
+    )
+    pipeline.frs.update_status(fr_y.id, "planned")
+    pipeline.frs.update_status(fr_y.id, "in_progress")
+
+    # Rewire the bundle so it carries the ORIGINAL (merged) id. Reading
+    # it through fr_store.get() will resolve to fr_y; the error message
+    # must still name fr_x so the caller can find it in fr_ids.
+    milestone.fr_ids = [fr_x.id]
+    pipeline.milestones._store(milestone)
+
+    with pytest.raises(MilestoneError) as excinfo:
+        pipeline.milestones.delete(milestone.id, fr_store=pipeline.frs)
+
+    message = str(excinfo.value)
+    assert fr_x.id in message, (
+        f"error message must contain the original bundled id {fr_x.id!r}, "
+        f"got: {message!r}"
+    )
+    assert fr_y.id in message, (
+        f"error message must also surface the resolved id {fr_y.id!r} "
+        f"for correlation, got: {message!r}"
+    )
+    assert "resolved to" in message
 
 
 def test_delete_milestone_refuses_if_notes_history_nontrivial(pipeline):

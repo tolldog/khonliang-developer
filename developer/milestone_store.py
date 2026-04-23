@@ -181,6 +181,24 @@ class MilestoneStore:
         if status and status not in ALL_MILESTONE_STATUSES:
             raise MilestoneError(f"status must be one of: {sorted(ALL_MILESTONE_STATUSES)}")
 
+        # Mirror ``update_status``' write-time normalization on the read
+        # path: ``archived`` is the legacy synonym for ``abandoned``, so
+        # a ``status=abandoned`` filter must also surface legacy on-disk
+        # rows stored as ``archived`` (otherwise callers see an empty
+        # list even though the rows exist). A ``status=archived`` filter
+        # is treated symmetrically — match both canonical and legacy
+        # values — so the two filter inputs are interchangeable.
+        # PR #43 Copilot R8 finding 3.
+        status_match: set[str] = set()
+        if status:
+            if status in (MILESTONE_STATUS_ABANDONED, MILESTONE_STATUS_ARCHIVED):
+                status_match = {
+                    MILESTONE_STATUS_ABANDONED,
+                    MILESTONE_STATUS_ARCHIVED,
+                }
+            else:
+                status_match = {status}
+
         entries = self.knowledge.get_by_tier(Tier.DERIVED)
         milestones: list[Milestone] = []
         for entry in entries:
@@ -189,16 +207,29 @@ class MilestoneStore:
             milestone = _milestone_from_entry(entry)
             if target and milestone.target != target:
                 continue
-            if status and milestone.status != status:
+            if status_match and milestone.status not in status_match:
                 continue
             # ``archived`` is the legacy synonym for ``abandoned`` (see the
             # module-level status notes). Treat them as one terminal
             # category for filtering purposes so legacy on-disk rows and
             # freshly-abandoned milestones behave the same way when
             # ``include_archived=False``. PR #43 Copilot R6 finding 4.
-            if not include_archived and milestone.status in (
-                MILESTONE_STATUS_ARCHIVED,
+            #
+            # When the caller explicitly filters for abandoned/archived,
+            # honor that over ``include_archived=False`` — otherwise the
+            # filter and the default flag would contradict each other and
+            # return an empty list. PR #43 Copilot R8 finding 3.
+            explicitly_requested_terminal = status in (
                 MILESTONE_STATUS_ABANDONED,
+                MILESTONE_STATUS_ARCHIVED,
+            )
+            if (
+                not include_archived
+                and not explicitly_requested_terminal
+                and milestone.status in (
+                    MILESTONE_STATUS_ARCHIVED,
+                    MILESTONE_STATUS_ABANDONED,
+                )
             ):
                 continue
             milestones.append(milestone)
@@ -653,7 +684,14 @@ class MilestoneStore:
                 "Use supersede_milestone to preserve the audit trail."
             )
 
-        blocking_frs: list[str] = []
+        # Blocking entries track BOTH the original bundled fr_id and the
+        # resolved fr.id post-redirect, so the refusal message lets the
+        # caller correlate the blocker back to ``milestone.fr_ids``.
+        # Without the original id, a merge redirect (bundle carries
+        # ``fr_x`` → fr_store returns fr with ``id=fr_y``) produces an
+        # error message referencing ``fr_y``, which the caller cannot
+        # find in ``milestone.fr_ids`` at all. PR #43 Copilot R8 finding 1.
+        blocking_frs: list[tuple[str, str]] = []
         if milestone.fr_ids:
             for fr_id in milestone.fr_ids:
                 try:
@@ -695,12 +733,18 @@ class MilestoneStore:
                 # import fr_store for typing.
                 status = getattr(fr, "status", "")
                 if status == "in_progress":
-                    blocking_frs.append(fr.id)
+                    blocking_frs.append((fr_id, getattr(fr, "id", fr_id)))
             if blocking_frs:
+                blocker_details = ", ".join(
+                    f"{original!r} (resolved to {resolved!r})"
+                    if original != resolved
+                    else f"{original!r}"
+                    for original, resolved in blocking_frs
+                )
                 raise MilestoneError(
                     f"cannot delete milestone {milestone_id!r}: FR(s) in "
                     f"progress reference this milestone's bundle: "
-                    f"{blocking_frs}. Move those FRs to another milestone "
+                    f"{blocker_details}. Move those FRs to another milestone "
                     "or complete them first."
                 )
 
