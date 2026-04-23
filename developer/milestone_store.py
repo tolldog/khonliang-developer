@@ -319,6 +319,16 @@ class MilestoneStore:
             raise MilestoneError(
                 f"status must be one of {sorted(ALL_MILESTONE_STATUSES)}, got {status!r}"
             )
+        if status == MILESTONE_STATUS_SUPERSEDED:
+            # update_status has no ``superseded_by`` parameter, so letting
+            # it set ``superseded`` would always produce an invalid
+            # milestone (status=superseded, superseded_by=""). Route the
+            # caller to the dedicated skill that takes the back-pointer.
+            raise MilestoneError(
+                "use supersede_milestone(superseded_id, superseded_by_id, "
+                "rationale=...) to set superseded status — update_status "
+                "cannot supply the required superseded_by pointer"
+            )
         milestone = self.get(milestone_id)
         if milestone is None:
             raise MilestoneError(f"unknown milestone id: {milestone_id}")
@@ -355,6 +365,17 @@ class MilestoneStore:
         if forced:
             entry["force_rollback"] = True
         milestone.notes_history.append(entry)
+        # Force-rolling OUT of ``superseded`` must clear the stale
+        # back-pointer — otherwise the milestone ends up in (e.g.)
+        # ``in_progress`` status while still carrying a superseded_by id
+        # that references an unrelated replacement. The only supported
+        # way to re-enter ``superseded`` is ``supersede_milestone``,
+        # which re-sets the pointer explicitly.
+        if (
+            milestone.status == MILESTONE_STATUS_SUPERSEDED
+            and status != MILESTONE_STATUS_SUPERSEDED
+        ):
+            milestone.superseded_by = ""
         milestone.status = status
         milestone.updated_at = now
         self._store(milestone)

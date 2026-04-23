@@ -446,3 +446,54 @@ def test_delete_milestone_refuses_when_fr_store_lookup_raises(pipeline):
 
     # Milestone is still present — delete was refused, not partially applied.
     assert pipeline.milestones.get(milestone.id) is not None
+
+
+def test_update_status_rejects_superseded_transition(pipeline):
+    """update_status cannot set 'superseded' — the skill has no superseded_by parameter.
+
+    Letting it through produced invalid milestones
+    (status=superseded, superseded_by=""). PR #43 Copilot R4 finding 1.
+    """
+    milestone = pipeline.milestones.propose_from_work_unit(_work_unit())
+
+    with pytest.raises(MilestoneError, match="supersede_milestone"):
+        pipeline.milestones.update_status(milestone.id, MILESTONE_STATUS_SUPERSEDED)
+
+    # Milestone is untouched — rejection happened before any state change.
+    reloaded = pipeline.milestones.get(milestone.id)
+    assert reloaded.status == MILESTONE_STATUS_PROPOSED
+    assert reloaded.superseded_by == ""
+
+
+def test_update_status_force_out_of_superseded_clears_pointer(pipeline):
+    """Force-rolling OUT of 'superseded' must clear the stale superseded_by pointer.
+
+    Without this, force-rollback could leave an ``in_progress`` milestone
+    still carrying a superseded_by id that references an unrelated
+    replacement. PR #43 Copilot R4 finding 1 (invariant follow-up).
+    """
+    stale = pipeline.milestones.propose_from_work_unit(_work_unit())
+    replacement = pipeline.milestones.propose_from_work_unit(_second_work_unit())
+
+    # Go through the proper skill to land a real superseded milestone.
+    superseded = pipeline.milestones.supersede(
+        stale.id, replacement.id, rationale="test rollout",
+    )
+    assert superseded.status == MILESTONE_STATUS_SUPERSEDED
+    assert superseded.superseded_by == replacement.id
+
+    # Force-roll back to in_progress — the superseded_by pointer must clear.
+    rolled_out = pipeline.milestones.update_status(
+        stale.id,
+        MILESTONE_STATUS_IN_PROGRESS,
+        notes="supersede was wrong, reopening",
+        force=True,
+    )
+    assert rolled_out.status == MILESTONE_STATUS_IN_PROGRESS
+    assert rolled_out.superseded_by == ""
+    assert rolled_out.notes_history[-1].get("force_rollback") is True
+
+    # Confirm persistence too.
+    reloaded = pipeline.milestones.get(stale.id)
+    assert reloaded.status == MILESTONE_STATUS_IN_PROGRESS
+    assert reloaded.superseded_by == ""
