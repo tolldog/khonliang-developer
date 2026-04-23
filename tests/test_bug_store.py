@@ -108,6 +108,18 @@ def test_file_bug_rejects_missing_fields(store):
         store.file_bug(target="x", title="", description="d")
 
 
+def test_file_bug_rejects_empty_description(store):
+    """``description`` feeds into ``_derive_bug_id``, so an empty or
+    whitespace-only description would produce a distinct id from the same
+    conceptual bug filed with any real description — poisoning dedup.
+    Must be rejected the same as target/title.
+    """
+    with pytest.raises(BugError, match="non-empty"):
+        store.file_bug(target="developer", title="t", description="")
+    with pytest.raises(BugError, match="non-empty"):
+        store.file_bug(target="developer", title="t", description="   ")
+
+
 def test_file_bug_rejects_invalid_severity(store):
     with pytest.raises(BugError, match="severity"):
         store.file_bug(target="developer", title="t", description="d",

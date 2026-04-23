@@ -91,15 +91,32 @@ def test_log_dogfood_rejects_invalid_kind(store):
         store.log_dogfood("x", kind="other_bogus")
 
 
-def test_log_dogfood_is_cheap(store):
-    """Smoke test — <100ms per the FR body. Not a hard timer, but a ceiling."""
-    import time as _t
-    start = _t.monotonic()
-    for i in range(10):
-        store.log_dogfood(f"observation {i}", observed_at=_t.time() + i * 1e-3)
-    elapsed = _t.monotonic() - start
-    # 10 writes should comfortably fit under 1s even on loaded CI.
-    assert elapsed < 1.0
+def test_log_dogfood_is_pure_local(store, monkeypatch):
+    """``log_dogfood`` must be a pure local write — no LLM call, no network,
+    no subprocess. Prior version of this test measured wall-clock elapsed
+    (<1s for 10 writes), which flaked under CI load. Replace the timing
+    smoke with a deterministic invariant: patch ``time.time`` on the
+    module to a fixed fake clock and assert the store consumes that fake
+    value verbatim. If the code path reached out to a real clock (let
+    alone an LLM / HTTP / subprocess), the stored ``observed_at`` /
+    ``created_at`` would diverge from the fake value.
+    """
+    from developer import dogfood_store as mod
+
+    FAKE_NOW = 424242.0
+    monkeypatch.setattr(mod.time, "time", lambda: FAKE_NOW)
+
+    # observed_at omitted → store must fall back to ``time.time()``, which
+    # is now the fake. Any real syscall would produce a wall-clock value.
+    dog = store.log_dogfood("pure-local observation")
+
+    assert dog.observed_at == FAKE_NOW, (
+        "observed_at fallback must consume the patched time.time(); "
+        "a non-FAKE value means log_dogfood reached a real clock / "
+        "external I/O path"
+    )
+    assert dog.created_at == FAKE_NOW
+    assert dog.updated_at == FAKE_NOW
 
 
 def test_log_dogfood_same_observation_distinct_times_separate_ids(store):

@@ -256,8 +256,12 @@ class BugStore:
         observed_entity) so re-filing the same content yields the same id
         and an already-exists error.
         """
-        if not target or not title:
-            raise BugError("file_bug requires non-empty target and title")
+        # ``description`` is part of the id derivation (``_derive_bug_id``)
+        # so an empty/whitespace description would produce a distinct id
+        # from a non-empty one even if the conceptual bug is the same —
+        # poisoning dedup. Require it like target/title.
+        if not target or not title or not description or not description.strip():
+            raise BugError("file_bug requires non-empty target, title, and description")
         if severity not in ALLOWED_SEVERITIES:
             raise BugError(
                 f"severity must be one of {sorted(ALLOWED_SEVERITIES)}, got {severity!r}"
