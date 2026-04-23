@@ -5,7 +5,7 @@ severity: concern
 
 # Batch operations must isolate per-item failures
 
-**Invariant**: batch operations (ingest N papers, iterate N FRs, process N comments) must `try/except` each item individually, append failures to a `failed` list, and continue. A single transient error must not abort the entire batch. In async contexts the per-item catch should re-raise `asyncio.CancelledError` first as a defensive default — see `cancelled_error_propagation.md` (intent + future-proofing; not about what `except Exception:` catches in 3.11+).
+**Invariant**: batch operations (ingest N papers, iterate N FRs, process N comments) must `try/except` each item individually, append failures to a `failed` list, and continue. A single transient error must not abort the entire batch. In async contexts the per-item catch should re-raise `asyncio.CancelledError` first as a defensive default — see `cancelled_error_propagation.md`.
 
 **Bad pattern**:
 ```python
@@ -38,4 +38,4 @@ async def ingest_batch(self, urls):
     }
 ```
 
-**Rationale**: batches are the one place where partial progress matters; aborting loses work already done. The `except CancelledError: raise` layer documents cancellation intent and future-proofs against catch-widening — in Python 3.11+, `except Exception:` alone does not swallow `CancelledError` (it's a `BaseException` subclass since 3.8). Sourced from PR #29 R6 + PR #39 R4 / PR #42 R2.
+**Rationale**: batches are the one place where partial progress matters; aborting loses work already done. The `except CancelledError: raise` layer is a defensive default — don't tie the pattern to the exact Python-version semantics of what `except Exception:` catches. Sourced from PR #29 R6 + PR #39 R4 / PR #42 R2.

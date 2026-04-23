@@ -5,7 +5,7 @@ severity: concern
 
 # Re-raise `asyncio.CancelledError` before a broad catch in async work
 
-**Invariant**: async code catching exceptions around cooperative work should re-raise `asyncio.CancelledError` explicitly before any broader catch. On Python 3.8+ `CancelledError` inherits from `BaseException`, so `except Exception:` does **not** catch it — but `except:` / `except BaseException:` does, and future refactors can silently widen a catch. Explicit re-raise documents intent and defends against both.
+**Invariant**: async code catching exceptions around cooperative work should re-raise `asyncio.CancelledError` explicitly before any broader catch. The explicit re-raise documents intent, protects against bare `except:` / `except BaseException:` (which DO catch cancellation), and defends against future widening of a narrower catch. Treat this as an always-apply defensive pattern — don't rely on the Python-version / BaseException-subclass details.
 
 **Bad pattern** (bare except swallows cancellation and everything else):
 ```python
@@ -31,4 +31,4 @@ async def run(self):
             await asyncio.sleep(1)
 ```
 
-**Rationale**: in Python 3.11+ (this repo: `requires-python >=3.11`) `except Exception:` alone is technically safe for cancellation — `CancelledError` is a `BaseException` subclass. The explicit re-raise-first pattern is still the right default: it states intent, protects against a future widening to `BaseException`, and matches the shape a reader scanning for cancellation handling expects. Flag bare `except:` / `except BaseException:` in async code, not `except Exception:`. Sourced from PR #39 R4 and PR #42 R2; corrected for Python 3.8+ semantics in R2.
+**Rationale**: the explicit `except asyncio.CancelledError: raise` is low-cost, reader-friendly, and robust across Python versions and catch-width refactors. Recommend it any time async work lives inside an `except` block — don't make the pattern conditional on the exact semantics of what `except Exception:` does or doesn't catch in a given Python release. Sourced from PR #39 R4 and PR #42 R2.
