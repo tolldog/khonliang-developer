@@ -22,14 +22,14 @@ def list(self, status=None):
 ```python
 _ALIASES = {"archived": "abandoned"}
 
-def _normalize(self, s):
-    return self._ALIASES.get(s, s)
+def _normalize(s):
+    return _ALIASES.get(s, s)
 
 def update_status(self, mid, status):
-    self._save(mid, status=self._normalize(status))
+    self._save(mid, status=_normalize(status))
 
 def list(self, status=None):
-    target = self._normalize(status) if status else None
+    target = _normalize(status) if status else None
     return [m for m in self._all() if target is None or m.status == target]
 ```
 

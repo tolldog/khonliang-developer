@@ -9,7 +9,7 @@ severity: concern
 
 **Bad pattern**:
 ```python
-fr = fr_store.resolve(fr_id)  # may redirect fr_id -> fr.id
+fr = fr_store.get(fr_id)  # follow_redirect=True by default; may change .id
 if fr.status == "in_progress":
     raise MilestoneError(f"blocked by {fr.id}")  # caller passed different id
 ```
@@ -17,8 +17,8 @@ if fr.status == "in_progress":
 **Good pattern**:
 ```python
 original = fr_id
-fr = fr_store.resolve(fr_id)
-if fr.status == "in_progress":
+fr = fr_store.get(fr_id)  # default follow_redirect=True
+if fr is not None and fr.status == "in_progress":
     if fr.id != original:
         raise MilestoneError(
             f"bundled FR {original!r} (resolved to {fr.id!r}) is in_progress"
