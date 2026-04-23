@@ -124,6 +124,7 @@ class FeatureSurface:
             "new_events": list(self.new_events),
             "new_types": list(self.new_types),
             "topic_concepts": list(self.topic_concepts),
+            "tokens": sorted(self.tokens),
         }
 
 
@@ -264,8 +265,7 @@ def _extract_skill_names(text: str) -> list[str]:
     added: set[str] = set()
     for m in _SKILL_NAME_RE.finditer(text or ""):
         name = m.group(1)
-        # Filter candidates that are obviously not skills: identifiers
-        # containing a dot belong to event extraction, not skill extraction.
+        # Deduplicate repeated matches while preserving first-seen order.
         if name in added:
             continue
         added.add(name)
@@ -278,6 +278,7 @@ def _extract_event_topics(text: str) -> list[str]:
     added: set[str] = set()
     for m in _EVENT_TOPIC_RE.finditer(text or ""):
         name = m.group(1)
+        # Deduplicate repeated matches while preserving first-seen order.
         if name in added:
             continue
         added.add(name)
@@ -347,7 +348,13 @@ def extract_feature_surface_from_skill(
     # ``agent_id`` is the agent that hosts the skill (e.g. ``developer-primary``).
     # Earlier revisions called this ``agent_type``; the value was always an
     # agent id, not a type. Renamed for accuracy (PR #46 Copilot R3).
-    combined = f"{skill_id}\n{description}\n{agent_id}"
+    # Fold ``args_schema`` into the combined haystack so parameter-name
+    # tokens (e.g. ``bug_id``, ``source_id``) contribute to skill-name /
+    # event-topic / token extraction. The JSON serialization is stable via
+    # ``sort_keys`` so two equivalent schemas produce identical token sets.
+    # PR #46 Copilot R8 finding #4.
+    schema_blob = json.dumps(args_schema, sort_keys=True) if args_schema else ""
+    combined = f"{skill_id}\n{description}\n{agent_id}\n{schema_blob}"
     # The skill name itself is the only *new skill* this surface contributes.
     # Extract bare skill name (strip ``<agent>.`` prefix if present).
     bare_name = skill_id.split(".")[-1] if "." in skill_id else skill_id
@@ -387,6 +394,11 @@ def scan_fr_store(
     surface_tokens = surface.tokens
     surface_title = (surface.title or "").lower().strip()
     surface_id = surface.id
+    # Hoist ``tokens(surface.title)`` once per scan — previously recomputed
+    # per-FR inside the loop, which is measurable on large FR corpora
+    # (every FR body already spawns one ``tokens()`` call via ``fr_tokens``).
+    # PR #46 Copilot R8 finding #5.
+    surface_title_tokens = tokens(surface.title)
 
     candidates: list[IntegrationCandidate] = []
     seen: set[tuple[str, str]] = set()
@@ -408,7 +420,7 @@ def scan_fr_store(
         # multiple signals, deduplicated at the (target_id, signal) level.
         # An FR whose title matches AND whose body mentions "TODO" legitimately
         # belongs under both direct_replace and refactor_to_primitive.
-        title_sim = jaccard(tokens(fr_title), tokens(surface.title))
+        title_sim = jaccard(tokens(fr_title), surface_title_tokens)
         if surface_title and fr_title.lower().strip() == surface_title:
             key = (fr_id, SIGNAL_DIRECT_REPLACE)
             if key not in seen:
@@ -421,7 +433,7 @@ def scan_fr_store(
                     metadata={
                         "status": getattr(fr, "status", ""),
                         "target": getattr(fr, "target", ""),
-                        "title_sim": round(title_sim, 3),
+                        "title_sim": 1.0,
                     },
                 ))
         elif title_sim >= 0.8:
