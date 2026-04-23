@@ -164,7 +164,7 @@ Checks run **before** the LLM pass; LLM prompt sees their findings and can refer
 - **Workflow prerequisites** (enforced via the reusable workflow's `checkout` step):
   - `actions/checkout@v4` with **`fetch-depth: 0`** so the base SHA is locally reachable. Without this, `git show <base_sha>:pyproject.toml` fails silently and every run would look like a shallow-clone infrastructure error (see Milestone B's `DiffContext` failure modes).
   - Alternative: explicit `git fetch --depth=1 origin $BASE_SHA` before the check step, for repos that need to keep default checkout shallow. The reusable workflow picks whichever is appropriate.
-- **Config reading**: the composite action `read-reviewer-config` runs a Python step (stdlib-only, `import yaml` via `pip install pyyaml` in the same step) that:
+- **Config reading**: the composite action `read-reviewer-config` runs a Python step that installs two lightweight dependencies inline (`pip install pyyaml packaging` in the same step — stdlib is not sufficient because YAML parsing and SemVer comparison both need third-party packages) and then:
   1. Reads `.reviewer/config.yaml` from the **base branch** (`git show $BASE_SHA:.reviewer/config.yaml`).
   2. Extracts `checks.version_bump.enabled` + `checks.version_bump.source_paths` into workflow outputs.
   3. Outputs fallback defaults (enabled=true, canonical include/exclude globs from Milestone B.3) when the file is absent.

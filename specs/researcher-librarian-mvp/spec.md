@@ -508,11 +508,14 @@ truth for implementation.
 
 - **Seed doc** (user-authored 2026-04-22):
   `khonliang-developer/docs/researcher-librarian-spec-seed.md`.
-- **Scoping memory** (session-side running notes):
-  `~/.claude/projects/-mnt-dev-ttoll-dev/memory/project_librarian_scoping.md`.
+- **Scoping memory** (session-side running notes, local to the
+  authoring session): produced during the 2026-04-22 working session;
+  not committed to the repo. Key decisions from those notes are
+  reflected in this spec and in the dogfooding-log entries cited
+  below.
 - **Dogfooding log Episode 15**: records the milestone-workflow
   friction that surfaced the need for this hand-written spec rather
   than relying on the auto-generated draft.
-- **Charter alignment**: Platform tier (core) — `project_true_north_charter.md`.
+- **Charter alignment**: Platform tier (core) — `proposals/true-north.md`.
   Reuses existing agent primitives (charter Tier 1 discipline); no
   new repos until workflow stabilizes (Phase 2 gate).

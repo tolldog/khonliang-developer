@@ -46,7 +46,14 @@ Ingested 2026-04-21 via researcher.fetch_paper(s):
 
 Distilled subset (sufficient for the FRs above): "Two Reviewers", "Sandboxing agents at the kernel level", "Greptile v4", "Content-ification of Software", "Best Local AI Coding Models". Remaining 10 Greptile posts are pending distillation — pick up when Milestones C/D FRs need the signal.
 
-## Next step
+## Status as of 2026-04-23
 
-Land PR #12, then implement `fr_khonliang_4e60ffaa` on a fresh branch. See
-`proposal.md` §Milestone A for the full acceptance criteria.
+Milestone A has **landed**: PR #13 merged `fr_khonliang_4e60ffaa`
+(versioning primitives) and PR #14 merged part 1 of
+`fr_khonliang_31b750d7` (`add_version_flag()` CLI helper). Per-agent
+adoption of `add_version_flag()` (part 2 of `fr_khonliang_31b750d7`)
+is still pending.
+
+Milestones B/C/D are partially in flight — the Milestone B FRs listed
+above have been authored and their first implementations are landing
+in parallel PRs. Refer to the live FR store for current status.
