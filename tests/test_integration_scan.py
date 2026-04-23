@@ -1399,10 +1399,13 @@ async def test_resolve_feature_surface_requires_agent_prefix(harness):
     assert "agent.skill" in result["error"]
 
     # Sanity check: the fully-qualified form still resolves fine.
-    surface = await harness.agent._resolve_feature_surface(
+    surface, prefetched = await harness.agent._resolve_feature_surface(
         "skill", "developer-primary.health_check",
     )
     assert surface.id == "developer-primary.health_check"
+    # Skill resolution now returns the registry it fetched so the handler
+    # can reuse it rather than re-fetching (PR #46 Copilot R7 finding #4).
+    assert prefetched is not None
 
 
 # ---------------------------------------------------------------------------

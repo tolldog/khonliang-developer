@@ -904,8 +904,13 @@ class DeveloperAgent(BaseAgent):
         # Resolve the feature surface. Each branch raises a descriptive
         # error that we surface verbatim rather than mapping to a generic
         # "invalid source" — callers want to know which field broke.
+        # For ``kind == "skill"`` the registry is fetched here as a
+        # side-effect of resolution and threaded through to ``scan_agent_skills``
+        # below to avoid a second bus round-trip. PR #46 Copilot R7 finding #4.
         try:
-            surface = await self._resolve_feature_surface(kind, source_id)
+            surface, prefetched_registry = await self._resolve_feature_surface(
+                kind, source_id,
+            )
         except (ValueError, LookupError) as e:
             msg = str(e)
             await self._safe_report_gap("suggest_integration_points", msg)
@@ -923,11 +928,16 @@ class DeveloperAgent(BaseAgent):
             existing = []
         candidates.extend(integration_scan.scan_fr_store(surface, existing))
 
-        try:
-            remote_skills = await self._fetch_remote_skills()
-        except Exception as e:
-            logger.warning("suggest_integration_points: bus skill fetch failed: %s", e)
-            remote_skills = []
+        if prefetched_registry is not None:
+            remote_skills = prefetched_registry
+        else:
+            try:
+                remote_skills = await self._fetch_remote_skills()
+            except Exception as e:
+                logger.warning(
+                    "suggest_integration_points: bus skill fetch failed: %s", e,
+                )
+                remote_skills = []
         skill_candidates = integration_scan.scan_agent_skills(surface, remote_skills)
         # Defensive self-reference filter. ``scan_agent_skills`` already
         # excludes the source's own ``(agent_id, skill_name)`` pair when
@@ -1100,11 +1110,6 @@ class DeveloperAgent(BaseAgent):
             )
             await self._safe_report_gap("distill_integration_points", msg)
             return {"error": msg}
-        if signal:
-            raw_candidates = [
-                c for c in raw_candidates
-                if isinstance(c, dict) and c.get("signal") == signal
-            ]
         # The stored shape matches IntegrationCandidate.to_full(); rehydrate
         # into objects for uniform ranking with the live-scan path.
         # Non-dict entries and individual items with non-coercible fields
@@ -1114,6 +1119,11 @@ class DeveloperAgent(BaseAgent):
         # whatever good rows survived. The response carries a
         # ``skipped_items`` counter so callers can tell the artifact was
         # partial without diffing against a fresh scan.
+        #
+        # Signal filtering happens post-rehydration so malformed non-dict
+        # items are still counted in skipped_items — filtering them out
+        # pre-rehydration would silently drop them, undermining the
+        # "partial artifact" signal. PR #46 Copilot R7 finding #2.
         rehydrated: list[integration_scan.IntegrationCandidate] = []
         skipped = 0
         for c in raw_candidates:
@@ -1161,6 +1171,8 @@ class DeveloperAgent(BaseAgent):
                 rationale=str(c.get("rationale", "")),
                 metadata=meta,
             ))
+        if signal:
+            rehydrated = [r for r in rehydrated if r.signal == signal]
         ranked = integration_scan.rank_candidates(rehydrated)
         extra: dict[str, Any] = {"from_artifact": True, "signal_filter": signal}
         if skipped:
@@ -1209,8 +1221,15 @@ class DeveloperAgent(BaseAgent):
 
     async def _resolve_feature_surface(
         self, kind: str, source_id: str,
-    ) -> integration_scan.FeatureSurface:
+    ) -> tuple[integration_scan.FeatureSurface, Optional[list[dict]]]:
         """Load the underlying feature and extract a scan surface.
+
+        Returns ``(surface, prefetched_registry)``. The second slot is
+        the bus skill registry when ``kind == "skill"`` (fetched here to
+        resolve the surface) and ``None`` otherwise. The handler threads
+        the prefetched registry into ``scan_agent_skills`` to avoid a
+        second bus round-trip — one fetch, one failure surface, lower
+        latency. PR #46 Copilot R7 finding #4.
 
         Raises ``LookupError`` when the source can't be found (includes
         bus / network faults while resolving the skill registry — an
@@ -1222,7 +1241,7 @@ class DeveloperAgent(BaseAgent):
             fr = self.pipeline.frs.get(source_id)
             if fr is None:
                 raise LookupError(f"FR {source_id!r} not found in developer store")
-            return integration_scan.extract_feature_surface_from_fr(fr)
+            return integration_scan.extract_feature_surface_from_fr(fr), None
 
         if kind == "pr":
             parsed = integration_scan.parse_pr_id(source_id)
@@ -1264,7 +1283,7 @@ class DeveloperAgent(BaseAgent):
                 title=pr_data.get("title", ""),
                 body=pr_data.get("body", "") or "",
                 owner=owner, repo=repo_name,
-            )
+            ), None
 
         if kind == "skill":
             # source_id is '<agent>.<skill>'; resolve via the bus skill
@@ -1316,7 +1335,7 @@ class DeveloperAgent(BaseAgent):
                 description=match.get("description", ""),
                 agent_id=match.get("agent_id", ""),
                 args_schema=match.get("parameters"),
-            )
+            ), skills
 
         # Unreachable — validated at handler entry, but belt-and-braces.
         raise ValueError(f"unknown feature kind: {kind!r}")
@@ -1383,7 +1402,7 @@ class DeveloperAgent(BaseAgent):
             id=scan_id,
             tier=Tier.DERIVED,
             title=f"Integration scan for {source.get('kind')}:{source.get('id')}",
-            content=json.dumps(payload, indent=2, default=str),
+            content=json.dumps(payload, default=str, separators=(",", ":")),
             source="developer.integration_scan",
             scope="development",
             confidence=1.0,

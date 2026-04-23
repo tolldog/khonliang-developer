@@ -477,9 +477,11 @@ def scan_fr_store(
         # --- refactor_to_primitive: adoption-keyword co-occurrence --------
         # Word-boundary match via pre-compiled regexes: "adopt" must not
         # hit "adoptable", "todo" must not hit "todolist".
+        # Scan body-only (not title/concept) — the signal is "FR body
+        # mentions adoption verbs", so title/concept hits are false positives.
         hit_kw: list[str] = []
         for kw, kw_re in _ADOPT_KEYWORD_RES:
-            if kw_re.search(haystack):
+            if kw_re.search(fr_body):
                 hit_kw.append(kw)
         if hit_kw:
             # Require some thematic link before flagging — an FR that
