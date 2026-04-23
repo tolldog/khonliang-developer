@@ -160,7 +160,7 @@ class IntegrationCandidate:
     # triage decisions. Heavier fields (e.g. shared_tokens, keywords lists)
     # stay behind the ``full`` detail to keep ``compact`` genuinely leaner.
     _COMPACT_META_FIELDS = (
-        "status", "target", "title_sim", "body_sim",
+        "status", "target", "title_sim", "content_sim",
         "agent_id", "skill_name", "similarity",
         "subscriber_count", "expected",
     )
@@ -453,13 +453,17 @@ def scan_fr_store(
                 ))
 
         # --- migrate: description cosine-fallback (jaccard) ---------------
-        body_sim = jaccard(surface_tokens, fr_tokens)
-        if body_sim >= 0.25:
+        # ``content_sim`` (not ``body_sim``) because ``haystack`` covers
+        # title + body + concept, not body-only. The broader signal
+        # preserves recall for a first-pass ranking; renamed per PR #46
+        # Copilot R9 finding #5.
+        content_sim = jaccard(surface_tokens, fr_tokens)
+        if content_sim >= 0.25:
             # 0.25 is an intentionally low threshold — recall beats
             # precision for a first pass, and the reviewer sees the score.
             # Score is mapped linearly from [0.25, 1.0] → [0.5, 1.0] so
             # migrate candidates stay below direct_replace's baseline.
-            score = 0.5 + (body_sim - 0.25) * (0.5 / 0.75)
+            score = 0.5 + (content_sim - 0.25) * (0.5 / 0.75)
             key = (fr_id, SIGNAL_MIGRATE)
             if key not in seen:
                 seen.add(key)
@@ -480,7 +484,7 @@ def scan_fr_store(
                     metadata={
                         "status": getattr(fr, "status", ""),
                         "target": getattr(fr, "target", ""),
-                        "body_sim": round(body_sim, 3),
+                        "content_sim": round(content_sim, 3),
                         "shared_token_count": len(full_overlap),
                         "shared_tokens": shared_preview,
                     },
@@ -617,7 +621,17 @@ def scan_event_subscribers(
     expected_consumers = expected_consumers or {}
     candidates: list[IntegrationCandidate] = []
     for topic in surface.new_events:
-        count = int(subscriber_counts.get(topic, 0))
+        # Defensive coercion: ``subscriber_counts`` comes from bus data
+        # whose shape may evolve over time. A single malformed value
+        # (``None``, a non-numeric string, a dict) shouldn't crash the
+        # whole scan — fall back to 0 (treat unknown as "no subscribers",
+        # which is the signal we'd flag anyway for a missing topic).
+        # PR #46 Copilot R9 finding #4.
+        raw_count = subscriber_counts.get(topic, 0)
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            count = 0
         if count == 0:
             candidates.append(IntegrationCandidate(
                 kind="event_broker_gap", target_id=topic,

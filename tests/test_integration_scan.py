@@ -543,14 +543,14 @@ def test_candidate_full_preserves_unrounded_score():
         signal=integration_scan.SIGNAL_MIGRATE,
         score=0.123456789,
         rationale="x",
-        metadata={"body_sim": 0.321},
+        metadata={"content_sim": 0.321},
     )
     brief = c.to_brief()
     full = c.to_full()
     assert brief["score"] == 0.123  # rounded
     assert full["score"] == 0.123456789  # unrounded
     # Full still carries metadata.
-    assert full["metadata"] == {"body_sim": 0.321}
+    assert full["metadata"] == {"content_sim": 0.321}
 
 
 @pytest.mark.asyncio

@@ -1192,19 +1192,23 @@ class DeveloperAgent(BaseAgent):
         # bypass the earlier payload-shape gates. Same class as the
         # per-candidate validation (Copilot R3 finding #3) — PR #46 Copilot
         # R6 finding #1.
+        # The earlier ``"source" not in payload`` gate catches a missing
+        # key but lets ``"source": null`` through. Previously we defaulted
+        # ``None`` to ``{}`` and proceeded silently, which produced
+        # responses missing ``source.kind`` / ``source.id`` — consumers
+        # expecting those fields would break without a clear error. A
+        # single ``isinstance(..., dict)`` check cleanly rejects both
+        # ``None`` and non-dict types (list/str/number) with one error
+        # message. PR #46 Copilot R9 findings #2, #3.
         raw_source = payload.get("source")
-        if raw_source is None:
-            merged_source: dict[str, Any] = {}
-        elif isinstance(raw_source, dict):
-            merged_source = dict(raw_source)
-        else:
+        if not isinstance(raw_source, dict):
             msg = (
                 f"scan artifact {scan_id!r} malformed: source is "
-                f"{type(raw_source).__name__}, expected dict "
-                f"(malformed scan source: not a dict)"
+                f"{type(raw_source).__name__}, expected dict"
             )
             await self._safe_report_gap("distill_integration_points", msg)
             return {"error": msg}
+        merged_source: dict[str, Any] = dict(raw_source)
         stored_surface = payload.get("surface")
         if stored_surface is not None and "surface" not in merged_source:
             merged_source["surface"] = stored_surface
@@ -1344,8 +1348,13 @@ class DeveloperAgent(BaseAgent):
         """Return the bus-side skill registry as a list of dicts.
 
         Uses the agent's own :attr:`_http` client + ``self.bus_url`` so
-        tests can monkeypatch the attribute directly. A failing fetch
-        falls through to ``[]`` and is logged by the caller.
+        tests can monkeypatch the attribute directly. Exceptions from
+        ``client.get`` (network faults) or ``response.raise_for_status()``
+        (HTTP 4xx/5xx) propagate to the caller; callers are responsible
+        for catching + logging and degrading to an empty-registry scan
+        path. The ``_http is None`` branch below still returns ``[]``
+        (pre-init / older base class) — that's the only fall-through
+        default. PR #46 Copilot R9 finding #1.
         """
         # _http is set by BaseAgent.__init__. If we somehow got constructed
         # without it (older base class), degrade to empty list.
