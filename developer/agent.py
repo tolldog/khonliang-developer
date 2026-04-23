@@ -493,6 +493,66 @@ class DeveloperAgent(BaseAgent):
                   {"watcher_id": {"type": "string", "default": "",
                                   "description": "optional — scope to a single watcher"}},
                   since="0.15.0"),
+            # Tracking-infrastructure (Phase 1 of fr_developer_f669bd33 +
+            # fr_developer_1324440c). CRUD-only slice: triage promotion,
+            # report_gap integration, and GH-issue ingest land in Phase 2.
+            Skill("file_bug", "File a new bug in developer's bug store",
+                  {"target": {"type": "string", "required": True},
+                   "title": {"type": "string", "required": True},
+                   "description": {"type": "string", "required": True},
+                   "reproduction": {"type": "string", "default": ""},
+                   "observed_entity": {"type": "string", "default": ""},
+                   "severity": {"type": "string", "default": "medium"},
+                   "reporter": {"type": "string", "default": ""}},
+                  since="0.15.0"),
+            Skill("list_bugs", "List bugs. Default filters terminal statuses.",
+                  {"target": {"type": "string", "default": ""},
+                   "severity_min": {"type": "string", "default": ""},
+                   "status": {"type": "string", "default": "open,triaged,in_progress",
+                              "description": "comma-separated names or 'all'"},
+                   "detail": {"type": "string", "default": "brief"}},
+                  since="0.15.0"),
+            Skill("get_bug", "Look up a bug by id",
+                  {"bug_id": {"type": "string", "required": True},
+                   "detail": {"type": "string", "default": "brief"}},
+                  since="0.15.0"),
+            Skill("update_bug_status", "Advance a bug's lifecycle status",
+                  {"bug_id": {"type": "string", "required": True},
+                   "status": {"type": "string", "required": True},
+                   "notes": {"type": "string", "default": ""}},
+                  since="0.15.0"),
+            Skill("link_bug_pr", "Record the PR URL fixing this bug",
+                  {"bug_id": {"type": "string", "required": True},
+                   "pr_url": {"type": "string", "required": True}},
+                  since="0.15.0"),
+            Skill("close_bug", "Terminal-close a bug as fixed or wontfix",
+                  {"bug_id": {"type": "string", "required": True},
+                   "resolution": {"type": "string", "required": True,
+                                  "description": "'fixed' or 'wontfix'"}},
+                  since="0.15.0"),
+            Skill("log_dogfood", "Cheap local capture of a friction/UX observation. "
+                  "No LLM / embedding / network calls — <100ms local write.",
+                  {"observation": {"type": "string", "required": True},
+                   "kind": {"type": "string", "default": "friction",
+                            "description": "friction / bug / ux / docs / other"},
+                   "target": {"type": "string", "default": ""},
+                   "context": {"type": "string", "default": ""},
+                   "reporter": {"type": "string", "default": ""}},
+                  since="0.15.0"),
+            Skill("list_dogfood", "List dogfood observations, newest first. "
+                  "Default filters terminal statuses.",
+                  {"kind": {"type": "string", "default": ""},
+                   "target": {"type": "string", "default": ""},
+                   "since": {"type": "string", "default": ""},
+                   "status": {"type": "string", "default": "observed,triaged",
+                              "description": "comma-separated names or 'all'"},
+                   "limit": {"type": "integer", "default": 20},
+                   "detail": {"type": "string", "default": "brief"}},
+                  since="0.15.0"),
+            Skill("get_dogfood", "Look up a dogfood observation by id",
+                  {"dog_id": {"type": "string", "required": True},
+                   "detail": {"type": "string", "default": "brief"}},
+                  since="0.15.0"),
         ]
 
     def register_collaborations(self):
@@ -1757,6 +1817,211 @@ class DeveloperAgent(BaseAgent):
             "parsed": result.parsed,
             "digest": tests_runner.format_response(result, detail=detail),
         }
+
+    # -- tracking infrastructure (Phase 1: CRUD-only) --
+    #
+    # Phase 2 will add triage_bug / triage_dogfood / dogfood_triage_queue /
+    # report_gap(bug=True) / GH-issue ingest. Those cross the bug<->fr and
+    # dogfood<->bug<->fr boundaries; Phase 1 keeps each store independent.
+
+    @handler("file_bug")
+    async def handle_file_bug(self, args):
+        from developer.bug_store import BugError
+
+        try:
+            bug = self.pipeline.bugs.file_bug(
+                target=args.get("target", ""),
+                title=args.get("title", ""),
+                description=args.get("description", ""),
+                reproduction=args.get("reproduction", ""),
+                observed_entity=args.get("observed_entity", ""),
+                severity=args.get("severity", "medium"),
+                reporter=args.get("reporter", ""),
+            )
+        except BugError as e:
+            await self._safe_report_gap("file_bug", str(e))
+            return {"error": str(e)}
+        except Exception as e:
+            await self._safe_report_gap("file_bug", f"unexpected failure: {e}")
+            raise
+        return {
+            "bug_id": bug.id,
+            "target": bug.target,
+            "severity": bug.severity,
+            "status": bug.status,
+        }
+
+    @handler("list_bugs")
+    async def handle_list_bugs(self, args):
+        from developer.bug_store import BugError
+
+        target = args.get("target", "") or ""
+        severity_min = args.get("severity_min", "") or ""
+        status_arg = args.get("status", "")
+        detail = args.get("detail", "brief")
+
+        try:
+            bugs = self.pipeline.bugs.list(
+                target=target,
+                severity_min=severity_min,
+                status=status_arg or None,
+            )
+        except BugError as e:
+            return {"error": str(e)}
+
+        if detail == "full":
+            serialized = [b.to_public_dict() for b in bugs]
+        elif detail == "compact":
+            serialized = [b.to_compact_dict() for b in bugs]
+        else:
+            serialized = [b.to_brief_dict() for b in bugs]
+        return {"count": len(bugs), "bugs": serialized}
+
+    @handler("get_bug")
+    async def handle_get_bug(self, args):
+        bug_id = args.get("bug_id", "")
+        detail = args.get("detail", "brief")
+        bug = self.pipeline.bugs.get(bug_id)
+        if bug is None:
+            return {"error": "not found", "bug_id": bug_id}
+        if detail == "full":
+            return bug.to_public_dict()
+        if detail == "compact":
+            return bug.to_compact_dict()
+        return bug.to_brief_dict()
+
+    @handler("update_bug_status")
+    async def handle_update_bug_status(self, args):
+        from developer.bug_store import BugError
+
+        try:
+            bug = self.pipeline.bugs.update_status(
+                bug_id=args.get("bug_id", ""),
+                status=args.get("status", ""),
+                notes=args.get("notes", ""),
+            )
+        except BugError as e:
+            await self._safe_report_gap("update_bug_status", str(e))
+            return {"error": str(e)}
+        return {
+            "bug_id": bug.id,
+            "status": bug.status,
+            "updated_at": bug.updated_at,
+        }
+
+    @handler("link_bug_pr")
+    async def handle_link_bug_pr(self, args):
+        from developer.bug_store import BugError
+
+        try:
+            bug = self.pipeline.bugs.link_bug_pr(
+                bug_id=args.get("bug_id", ""),
+                pr_url=args.get("pr_url", ""),
+            )
+        except BugError as e:
+            await self._safe_report_gap("link_bug_pr", str(e))
+            return {"error": str(e)}
+        return {
+            "bug_id": bug.id,
+            "linked_pr": bug.linked_pr,
+            "status": bug.status,
+        }
+
+    @handler("close_bug")
+    async def handle_close_bug(self, args):
+        from developer.bug_store import BugError
+
+        try:
+            bug = self.pipeline.bugs.close_bug(
+                bug_id=args.get("bug_id", ""),
+                resolution=args.get("resolution", ""),
+            )
+        except BugError as e:
+            await self._safe_report_gap("close_bug", str(e))
+            return {"error": str(e)}
+        return {
+            "bug_id": bug.id,
+            "status": bug.status,
+            "updated_at": bug.updated_at,
+        }
+
+    @handler("log_dogfood")
+    async def handle_log_dogfood(self, args):
+        """Cheap local capture — keep this hot.
+
+        Must not block on LLM, embedding, or network. Only ``DogfoodStore.
+        log_dogfood`` (pure SQLite write) runs here. Errors surface as a
+        structured ``error`` dict rather than exceptions so the friction
+        of *capturing* friction stays near-zero.
+        """
+        from developer.dogfood_store import DogfoodError
+
+        try:
+            dog = self.pipeline.dogfood.log_dogfood(
+                args.get("observation", ""),
+                kind=args.get("kind", "friction"),
+                target=args.get("target", ""),
+                context=args.get("context", ""),
+                reporter=args.get("reporter", ""),
+            )
+        except DogfoodError as e:
+            return {"error": str(e)}
+        return {
+            "dog_id": dog.id,
+            "kind": dog.kind,
+            "status": dog.status,
+        }
+
+    @handler("list_dogfood")
+    async def handle_list_dogfood(self, args):
+        from developer.dogfood_store import DogfoodError
+
+        kind = args.get("kind", "") or ""
+        target = args.get("target", "") or ""
+        since_raw = args.get("since", "")
+        detail = args.get("detail", "brief")
+        try:
+            limit = int(args.get("limit", 20))
+        except (TypeError, ValueError):
+            limit = 20
+        if limit < 0:
+            limit = 0
+
+        since: float | None
+        if since_raw == "" or since_raw is None:
+            since = None
+        else:
+            try:
+                since = float(since_raw)
+            except (TypeError, ValueError):
+                return {"error": f"since must be a number (epoch seconds), got {since_raw!r}"}
+
+        try:
+            dogs = self.pipeline.dogfood.list(
+                kind=kind,
+                target=target,
+                since=since,
+                status=args.get("status") or None,
+                limit=limit,
+            )
+        except DogfoodError as e:
+            return {"error": str(e)}
+
+        if detail == "full":
+            serialized = [d.to_public_dict() for d in dogs]
+        elif detail == "compact":
+            serialized = [d.to_compact_dict() for d in dogs]
+        else:
+            serialized = [d.to_brief_dict() for d in dogs]
+        return {"count": len(dogs), "dogfood": serialized}
+
+    @handler("get_dogfood")
+    async def handle_get_dogfood(self, args):
+        dog_id = args.get("dog_id", "")
+        dog = self.pipeline.dogfood.get(dog_id)
+        if dog is None:
+            return {"error": "not found", "dog_id": dog_id}
+        return dog.to_public_dict()
 
 
 def _parse_paths(value) -> list[str]:
