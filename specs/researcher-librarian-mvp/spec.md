@@ -249,19 +249,28 @@ the `ingest.*` event surface explicitly — the librarian
 subscribes to those names, not invented ones. Relevant subset:
 
 - `ingest.url_distilled` — a single URL finished the full
-  fetch+distill pipeline. Payload: `{entry_id, url, distilled_at,
+  fetch+distill pipeline. Payload: `{paper_id, url, distilled_at,
   summary_preview}`. Librarian may trigger a `classify_paper` pass
-  on the new `entry_id`.
+  on the new `paper_id`.
 - `ingest.queue_drained` — distillation queue transitioned
   non-empty → empty. Payload: `{drained_at, total_items_processed}`.
   Librarian may trigger `rebuild_neighborhoods`, refresh
   `library_health`, or run a coverage-gap scan at this natural
   batch boundary.
 - `ingest.url_failed` — a URL failed fetch or distill. Payload:
-  `{entry_id, url, stage, error_kind, error_message}`. Librarian
+  `{paper_id, url, stage, error_kind, error_message}`. Librarian
   cross-references against open gap reports (was this URL
   requested by librarian?) and adjusts gap-report state so
   repeated failures don't silently re-request the same source.
+
+**Identifier naming**: the `ingest.*` event payloads use `paper_id`
+to match the skill surface (`classify_paper(paper_id, ...)`) and the
+paper-catalog data model (`paper_id → classification_code`). Earlier
+draft notes called this `entry_id`; those two names refer to the same
+stable identifier. `fr_researcher_2bdb5632` (`watch_ingest_queue`)
+emits with `paper_id` as the canonical field; if its current
+implementation still uses `entry_id`, the FR should rename on merge
+so producer and consumer agree on one name across the surface.
 
 Librarian does NOT subscribe to `ingest.url_queued`,
 `ingest.url_fetching`, `ingest.url_fetched`, or

@@ -98,6 +98,7 @@ Mirrors `.claude/` layout:
 
 - `reviewer.config.repo.load(repo_root) -> RepoConfig`
 - **Override chain** (higher overrides lower): model-specific → vendor default → repo `config.yaml` → built-in defaults.
+- **Scope rule (enable/disable is repo-only)**: the override chain above applies to check *parameters* (tuning knobs like `source_paths`, severity floors, thresholds). The `enabled` flag for any check is **repo-level only** and cannot be overridden by vendor or model configs. This keeps the Milestone B.3 repo-level opt-out (`checks.version_bump.enabled: false` in base-branch `.reviewer/config.yaml`) authoritative: vendor/model configs can retune a check's behavior but cannot re-enable a check the repo has turned off, nor disable a check the repo expects to run. Concretely: a `checks.<name>.enabled` key under `.reviewer/models/<vendor>/<model>.yaml` or `_default.yaml` is ignored at load time (and surfaced as a config-hygiene warning); only `.reviewer/config.yaml`'s `enabled` is read. Parameters (e.g. `checks.version_bump.source_paths`) follow the normal precedence chain.
 - **Trust boundary**: all files under `.reviewer/` read from **base-branch HEAD**, never from PR branch tip. Prevents a PR from disabling checks that would flag it.
 - Fallback: missing `.reviewer/` = built-in defaults, no error, no deterministic checks disabled.
 
