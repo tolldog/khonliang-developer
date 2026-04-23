@@ -95,7 +95,7 @@ Subtotal: 57.
 
 ### librarian-primary — durable library taxonomy + classification
 
-Subtotal: 8. New agent added 2026-04-22 under `fr_researcher_librarian_agent` to split long-lived library-graph ownership out of researcher. Researcher retains ingest + distill + investigation workspaces; librarian owns classification, taxonomy rebuilds, gap detection, and promotion of workspace artifacts into the durable library.
+Subtotal: 8. New agent added 2026-04-22 under `fr_researcher_9cbe1e54` to split long-lived library-graph ownership out of researcher. Researcher retains ingest + distill + investigation workspaces; librarian owns classification, taxonomy rebuilds, gap detection, and promotion of workspace artifacts into the durable library.
 
 | Group | Skills |
 |---|---|

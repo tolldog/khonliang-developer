@@ -368,7 +368,8 @@ a test bus fixture.
 ## Acceptance Criteria
 
 1. A `librarian-primary` agent registers through the bus
-   (`bus_services` shows it with the 7 MVP skills).
+   (`bus_services` shows it with 8 registered skills: the 7 MVP
+   skills plus `health_check` as per-agent hygiene).
 2. `rebuild_neighborhoods` persists:
    - taxonomy index
    - concept neighborhoods

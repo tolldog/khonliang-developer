@@ -31,7 +31,7 @@ Reviewer-primary review of v1 (claude-sonnet-4-6, 15 findings) is addressed belo
 | [2] Namespace collision with `reviewer/rules/` | Deterministic checks live in `reviewer.checks`, **not** `reviewer.rules`. Existing `reviewer/rules/` stays = routing policy |
 | [3] Precedence operator ambiguous | Restated as unambiguous **override chain**: model-specific **overrides** vendor default **overrides** repo config |
 | [4] `instructions.md` prompt-injection surface | Defined **trust boundary**: reviewer reads `instructions.md` from **base branch HEAD**, never from PR branch tip. Stated in Milestone B |
-| [5] `resolve_version` walk needs sentinel | Walk stops at **first ancestor containing `.git/`**. Documented; prevents traversing past repo root |
+| [5] `resolve_version` walk needs sentinel | Walk stops at **first ancestor containing a `.git` entry (file or directory)** — file form covers git worktrees, directory form covers main checkouts. Documented; prevents traversing past repo root |
 | [6] Base `pyproject.toml` fetch unspecified | Added `DiffContext.base_file(path)` interface using `git show <base_sha>:<path>`. Failure modes enumerated |
 | [7] Label bypass has no access control | Dropped label escape hatch. Replaced with **repo-level opt-out** in `.reviewer/config.yaml` (committed to base branch, changes require a code review) |
 | [8] `tolldog/khonliang-bus-lib#12` disposition implicit | Milestone A explicit: **merge `tolldog/khonliang-bus-lib#12` first**, then Milestone-A work builds on it (pyproject-walk branch + `--version` flag are additive) |
@@ -54,7 +54,7 @@ Reviewer-primary review of v1 (claude-sonnet-4-6, 15 findings) is addressed belo
 - New `khonliang_bus.versioning` module:
   - `resolve_version(module_name=None) -> str | None` — resolution chain:
     1. If `module_name == "__main__"`, consult `sys.modules["__main__"].__spec__.name` (`tolldog/khonliang-bus-lib#12` logic).
-    2. Walk up from the module's file, stopping at **first directory containing `.git/`**. Try `pyproject.toml` at each level; on hit, parse `project.version` via `tomllib`.
+    2. Walk up from the module's file, stopping at the **first ancestor containing a `.git` entry (file or directory)** — the file form covers git worktrees (where `.git` is a pointer file) and the directory form covers main checkouts. Try `pyproject.toml` at each level; on hit, parse `project.version` via `tomllib`.
     3. Fall back to `importlib.metadata.version(...)` via `packages_distributions()` (today's `tolldog/khonliang-bus-lib#11` logic).
     4. Return `None` on total miss.
   - `add_version_flag(parser, module_name=None) -> None` — argparse helper wiring `--version`/`-V`. Prints resolved version + exits.
@@ -64,7 +64,7 @@ Reviewer-primary review of v1 (claude-sonnet-4-6, 15 findings) is addressed belo
 ### AC
 - `python -m reviewer.agent --version` prints a value that matches `project.version` in the on-disk `pyproject.toml` at invocation time (no pip reinstall required between the bump and the read).
 - Bumping `pyproject.toml` and restarting reviewer-primary shows the new version in `bus_services` on the next heartbeat, with no other intervention.
-- `resolve_version` walk terminates at `.git/`-containing ancestor; test with a nested-fake-repo fixture verifies it doesn't escape.
+- `resolve_version` walk terminates at the first ancestor containing a `.git` entry (file or directory, so worktrees resolve correctly); test with a nested-fake-repo fixture verifies it doesn't escape.
 - `BaseAgent` behavior: all existing `test_agent.py` tests pass; a new test verifies pyproject-walk preferred over metadata when both are present with differing versions.
 - `add_version_flag` in a script: `python my_script.py --version` prints and exits 0.
 
