@@ -1501,3 +1501,81 @@ def test_project_scan_response_omits_distill_hint_when_scan_id_empty(
     assert "re-run suggest_integration_points" in hint
     # Must NOT mention distill — callers would hit an error.
     assert "distill_integration_points(scan_id" not in hint
+
+
+# ---------------------------------------------------------------------------
+# Copilot R6 — distill rejects non-dict source without crashing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_distill_integration_points_rejects_non_dict_source(harness):
+    """A mis-tagged or corrupted artifact whose ``source`` field is not a
+    dict (string / list / number) must surface a clear validation error
+    rather than crash the handler inside ``dict(raw_source)``. The earlier
+    shape gate only asserts the key exists — a non-dict value still slips
+    through and would explode the coercion.
+
+    Regression for Copilot R6 finding #1.
+    """
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+
+    _install_empty_bus(harness)
+
+    def _put(scan_id: str, source_value) -> None:
+        payload = {
+            "source": source_value,
+            "candidates": [
+                {
+                    "kind": "fr",
+                    "target_id": "fr_developer_x",
+                    "signal": integration_scan.SIGNAL_MIGRATE,
+                    "score": 0.5,
+                    "rationale": "r",
+                    "metadata": {},
+                },
+            ],
+        }
+        entry = KnowledgeEntry(
+            id=scan_id,
+            tier=Tier.DERIVED,
+            title=f"bad source {scan_id}",
+            content=json.dumps(payload),
+            source="developer.integration_scan",
+            scope="development",
+            confidence=1.0,
+            status=EntryStatus.DISTILLED,
+            tags=["scan_integration"],
+            metadata={},
+        )
+        harness.agent.pipeline.knowledge.add(entry)
+
+    # 1. source is a string — dict("abc") raises ValueError.
+    _put("scan_integration_srcstr", "fr_developer_x")
+    r1 = await harness.call(
+        "distill_integration_points",
+        {"scan_id": "scan_integration_srcstr"},
+    )
+    assert "error" in r1
+    assert "source" in r1["error"]
+    assert "str" in r1["error"] or "expected dict" in r1["error"]
+
+    # 2. source is a list — dict(["a","b"]) raises TypeError/ValueError.
+    _put("scan_integration_srclist", ["not", "a", "dict"])
+    r2 = await harness.call(
+        "distill_integration_points",
+        {"scan_id": "scan_integration_srclist"},
+    )
+    assert "error" in r2
+    assert "source" in r2["error"]
+    assert "list" in r2["error"] or "expected dict" in r2["error"]
+
+    # 3. source is a number — dict(42) raises TypeError.
+    _put("scan_integration_srcnum", 42)
+    r3 = await harness.call(
+        "distill_integration_points",
+        {"scan_id": "scan_integration_srcnum"},
+    )
+    assert "error" in r3
+    assert "source" in r3["error"]
+    assert "int" in r3["error"] or "expected dict" in r3["error"]

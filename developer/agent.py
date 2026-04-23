@@ -1171,7 +1171,28 @@ class DeveloperAgent(BaseAgent):
         # them back so distill and suggest responses are symmetric — callers
         # reproducing a scan from the artifact can see what surface was
         # scanned. PR #46 Copilot R4 finding #2.
-        merged_source: dict[str, Any] = dict(payload.get("source") or {})
+        #
+        # Defensive type gate: a mis-tagged or corrupted artifact with a
+        # non-dict ``source`` (string / list / number) would crash
+        # ``dict(raw_source)`` on list/str inputs in non-obvious ways
+        # (``dict(["a", "b"])`` raises ``ValueError``; ``dict("ab")`` raises
+        # ``ValueError`` too). Surface a clear validation error rather than
+        # bypass the earlier payload-shape gates. Same class as the
+        # per-candidate validation (Copilot R3 finding #3) — PR #46 Copilot
+        # R6 finding #1.
+        raw_source = payload.get("source")
+        if raw_source is None:
+            merged_source: dict[str, Any] = {}
+        elif isinstance(raw_source, dict):
+            merged_source = dict(raw_source)
+        else:
+            msg = (
+                f"scan artifact {scan_id!r} malformed: source is "
+                f"{type(raw_source).__name__}, expected dict "
+                f"(malformed scan source: not a dict)"
+            )
+            await self._safe_report_gap("distill_integration_points", msg)
+            return {"error": msg}
         stored_surface = payload.get("surface")
         if stored_surface is not None and "surface" not in merged_source:
             merged_source["surface"] = stored_surface
