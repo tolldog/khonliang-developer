@@ -201,9 +201,10 @@ consumer skill (see note below — new researcher-side FR required).
 This is the delegation primitive from librarian back to researcher.
 **The librarian does not write directly to researcher's ingest
 queue** — it publishes the research-request event and researcher
-translates intent into concrete searches / URL fetches via a new
-`consume_research_request` skill (TBD FR, adjacent to this
-milestone — see "Cross-cluster dependencies" below).
+translates intent into concrete searches / URL fetches via the
+`consume_research_request` skill on researcher-primary (landed via
+`fr_researcher_fa450606` / `tolldog/khonliang-researcher#29` —
+see "Cross-cluster dependencies" below).
 
 ---
 
@@ -296,8 +297,9 @@ transient pipeline state.
   durable write to the catalog until resolved.
 - `library.gap_identified` — coverage gap found. Payload is a
   **structured research request** (see shape below); researcher's
-  `consume_research_request` skill (new, cross-cluster dep) reads
-  this and translates intent into concrete searches / fetches.
+  `consume_research_request` skill (landed on researcher-primary
+  via `fr_researcher_fa450606` / `tolldog/khonliang-researcher#29`)
+  reads this and translates intent into concrete searches / fetches.
 - `library.coverage_report` — periodic health snapshot. Payload:
   `{audience, branch, coverage_pct, stale_count, ambiguous_count,
   uncataloged_count, reported_at}`.
@@ -482,7 +484,7 @@ This spec ties the following FRs (per `ms_researcher_b99b97ea`):
 | `fr_researcher_d443f633` | Enabling — suggest_missing_nodes primitive | medium | in_progress |
 | `fr_researcher_3b991fa9` | Adjacent — evidence-source catalog distinct from dev-repos | medium | open |
 | `fr_researcher_2bdb5632` | Adjacent — watch_ingest_queue (ingest.* bus events librarian subscribes to) | medium | open |
-| `fr_researcher_fa450606` | **Cross-cluster (blocking ACC-6 loop closure)** — consume_research_request on researcher (consumer for `library.gap_identified`) | medium | open |
+| `fr_researcher_fa450606` | **Cross-cluster (closes ACC-6 loop)** — consume_research_request on researcher (consumer for `library.gap_identified`) | medium | completed (`tolldog/khonliang-researcher#29`) |
 | `fr_researcher-lib_aabc86bc` | Optional — session context distillation for agent memory | low | open |
 
 Dependencies into this spec from outside the cluster:
@@ -490,41 +492,35 @@ Dependencies into this spec from outside the cluster:
   the bus-event substrate (shared pattern for `ingest.*` /
   `library.*` events).
 
-### Cross-cluster blocking dependency: `fr_researcher_fa450606`
+### Cross-cluster dependency: `fr_researcher_fa450606` (landed)
 
 `library.gap_identified` requires a researcher-side consumer to
 translate the structured research request into concrete searches /
-URL fetches. Researcher's current ingest surface is URL-oriented
+URL fetches. Researcher's prior ingest surface was URL-oriented
 (`fetch_paper`, `fetch_paper_list`, `find_papers`), not
-research-request-oriented — the handoff would be missing without
-an explicit consumer skill.
+research-request-oriented — the handoff would have been missing
+without an explicit consumer skill.
 
-**Tracked as** `fr_researcher_fa450606`
-(`consume_research_request` on researcher). Filed 2026-04-22.
-Medium priority. Promoted + linked here so the milestone doesn't
-stall on an unnamed dependency.
+**Landed as** `fr_researcher_fa450606`
+(`consume_research_request` on researcher-primary) via
+`tolldog/khonliang-researcher#29`. Filed 2026-04-22, merged
+shortly after. The skill is registered on the bus and accepts
+the `library.gap_identified` payload shape described above.
 
 **Relationship to this milestone's acceptance criterion 6**: ACC-6
 requires that `identify_gaps` emit well-formed events. That is
-bounded by librarian-side work and does NOT require
-`fr_researcher_fa450606` to merge first. BUT the
+bounded by librarian-side work. The
 **delegation-closes-the-loop property** (gap identified →
 researcher actually consumes → new papers enter ingest pipeline →
-coverage improves) is only realized once `fr_researcher_fa450606`
-lands. Options:
+coverage improves) is realized now that the consumer is live —
+end-to-end delegation is testable against the running
+researcher-primary agent.
 
-- **Option A (recommended)**: ship librarian MVP with ACC-6 as
-  "event emission" only; `fr_researcher_fa450606` lands as a
-  follow-up that completes the loop. Librarian's events become
-  useful telemetry immediately and close the loop when the
-  consumer merges.
-- **Option B**: bring `fr_researcher_fa450606` into
-  `ms_researcher_b99b97ea` scope and require loop-closure for MVP
-  acceptance. Larger initial ship but cleaner story.
-
-This spec defaults to Option A. Operator choosing Option B should
-update the milestone's `fr_ids` to include `fr_researcher_fa450606`
-and tighten ACC-6 to require end-to-end delegation-consumed path.
+Remaining loop-closure wiring (bus subscription glue that routes
+`library.gap_identified` events into `consume_research_request`
+without manual invocation) is tracked separately; the MVP can
+drive the skill directly via an explicit call during tests while
+the event-routing path is finalized.
 
 ---
 
