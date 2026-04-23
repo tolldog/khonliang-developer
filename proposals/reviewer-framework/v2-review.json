@@ -1,0 +1,101 @@
+{
+  "request_id": "rev-6b21e01871ac45ff",
+  "summary": "All 15 v1 findings are genuinely resolved \u2014 the split into four milestones, trust boundary for `instructions.md`, `.git/` sentinel, `DiffContext.base_file()` interface, opt-out via base-branch config, and benchmark corpus floor are substantive improvements, not rubber stamps. Eight new issues introduced by the resolutions: five concerns (caching invalidation undefined, source_globs interface/semantics mismatch, GH Action config-reading mechanism absent, shallow-clone downgraded to `nit`, GH Actions shallow-fetch incompatibility with `git show`) and three lighter items (hardcoded version in AC, three-way-compare misnomer, ground-truth authorship unspecified). The shallow-clone + GH Actions fetch-depth interaction is the most likely silent failure in production.",
+  "findings": [
+    {
+      "severity": "concern",
+      "title": "Caching invalidation trigger is undefined",
+      "body": "Milestone A spec says caching is 'per-class, invalidated when module_name changes.' Module names don't change at runtime in Python \u2014 once a class is defined, its module_name is fixed for the process lifetime. Either (a) the invalidation condition is never triggered, making it dead code, or (b) the intended semantics are unspecified. If the intent is to cache once per class definition and never invalidate, say that. If there's a scenario where module_name should vary (e.g., testing with monkey-patching), document it explicitly.",
+      "category": "spec/implementation",
+      "path": null,
+      "line": null,
+      "suggestion": "Replace 'invalidated when module_name changes' with the actual invariant: 'cached per class at first call; tests that need different resolution must use a fresh subclass or clear the cache explicitly via a test helper.'"
+    },
+    {
+      "severity": "concern",
+      "title": "`source_globs` field name conflicts with exclusion-list semantics",
+      "body": "Milestone B.3 names the field `checks.version_bump.source_globs` (implying include patterns) but describes the default as 'all files except docs/**, *.md, .github/**, tests/**' (exclusion semantics). These are not the same interface. Standard glob lists are include patterns; exclusion requires negation syntax (e.g. `!docs/**`) or a separate `exclude_globs` field. The GH Action in Milestone C is supposed to share the same semantics \u2014 if the interface is ambiguous here, the two implementations will diverge. Decide: pure include globs, or include + exclude pair, or negation globs. Document the chosen form before B.3 ships.",
+      "category": "interface-design",
+      "path": null,
+      "line": null,
+      "suggestion": "Split into `source_globs` (default `['**']`) and `source_exclude_globs` (default `['docs/**', '*.md', '.github/**', 'tests/**']`), or switch to a single list with negation syntax and state that explicitly."
+    },
+    {
+      "severity": "concern",
+      "title": "GH Action reading `.reviewer/config.yaml` mechanism unspecified",
+      "body": "Milestone C AC requires: 'The workflow reads and respects `.reviewer/config.yaml`'s `checks.version_bump` settings when present.' A GitHub Actions YAML workflow cannot natively parse YAML config files \u2014 it needs a Python step, `yq`, or another mechanism to extract the opt-out flag. The mechanism is entirely unspecified. This is non-trivial: it requires checking out the base branch (not the PR branch), finding the file, parsing it, and conditionally skipping. Neither the scope nor the AC mentions any of this.",
+      "category": "milestone-c",
+      "path": null,
+      "line": null,
+      "suggestion": "Add a setup step to the workflow spec: checkout base branch at `${{ github.base_ref }}`, run a small Python or shell snippet to read the opt-out flag, and export it as an env var or step output gating subsequent steps."
+    },
+    {
+      "severity": "concern",
+      "title": "Shallow clone converts an infrastructure failure to a `nit` finding",
+      "body": "Milestone B spec: 'Shallow clone \u2192 raise `DiffContextError`, caller converts to a single `nit` finding \"checks unavailable: shallow clone\".' A shallow clone disables ALL deterministic checks \u2014 this is an infrastructure problem, not a minor style issue. Classifying it as `nit` means it will be sorted below real findings, potentially ignored by threshold filters, and won't trigger CI failure. It should either be `concern`-severity (to surface prominently) or an out-of-band status signal that doesn't pollute the finding list at all.",
+      "category": "error-handling",
+      "path": null,
+      "line": null,
+      "suggestion": "Raise the severity to `concern` with category `infrastructure`, or treat it as a special disposition (`skipped: shallow_clone`) distinct from findings so it doesn't affect precision/recall metrics in benchmarks."
+    },
+    {
+      "severity": "concern",
+      "title": "`git show <base_sha>:<path>` requires full fetch; GH Actions default is shallow",
+      "body": "`DiffContext.base_file()` uses `git show <base_sha>:<path>`. In GitHub Actions, `actions/checkout` defaults to `fetch-depth: 1`. On a shallow clone the base SHA is often not present locally, causing `git show` to fail \u2014 which triggers the `DiffContextError` path and disables all checks. Milestone C's workflow spec doesn't mention requiring `fetch-depth: 0` or a targeted `git fetch origin <base_sha>` before invoking the check. Every PR run would silently degrade to the shallow-clone error path unless the workflow is written correctly.",
+      "category": "milestone-c",
+      "path": null,
+      "line": null,
+      "suggestion": "Add `fetch-depth: 0` (or a targeted fetch of `${{ github.base_sha }}`) to the workflow checkout step in Milestone C's scope, and add an AC item that verifies `DiffContext.base_file()` succeeds on the test PR."
+    },
+    {
+      "severity": "nit",
+      "title": "Hardcoded version literal `0.2.0` in Milestone A AC will rot",
+      "body": "Milestone A AC states: '`python -m reviewer.agent --version` prints `0.2.0` (the on-disk pyproject version) without pip reinstall.' The value `0.2.0` is a snapshot. When the version next increments, this AC is wrong. ACs should describe the invariant, not a transient value.",
+      "category": "ac-quality",
+      "path": null,
+      "line": null,
+      "suggestion": "Rewrite as: 'prints the version declared in `pyproject.toml` without requiring `pip install -e .` to be re-run after a version edit.'"
+    },
+    {
+      "severity": "nit",
+      "title": "\"Three-way compare\" is a misnomer in Milestone D",
+      "body": "Milestone D calls the runner a 'three-way compare by default' and lists: ground truth, local LLM, external LLM. Ground truth is a fixture, not a model output \u2014 comparing two model outputs against one fixture is not a three-way comparison in the conventional sense. The matrix description (rows = `(vendor, model)`) also contradicts including ground truth as a row. The ambiguity could confuse implementers about whether ground truth should appear as a matrix row.",
+      "category": "spec/terminology",
+      "path": null,
+      "line": null,
+      "suggestion": "Rename to 'two-model evaluation against ground truth' or similar. Ground truth is the reference axis, not a matrix row. The matrix rows are `(vendor, model)` pairs; columns are precision/recall/F1 per check."
+    },
+    {
+      "severity": "comment",
+      "title": "Benchmark ground-truth authorship policy unspecified",
+      "body": "Milestone D requires N\u226520 `expected_findings.yaml` fixtures as part of the milestone deliverable, but doesn't specify who or what authors the ground truth. If the same LLM being benchmarked generates the expected findings, the benchmark measures self-consistency, not accuracy. The seed corpus quality is the entire value of the benchmark harness.",
+      "category": "benchmark-validity",
+      "path": null,
+      "line": null,
+      "suggestion": "Add a one-line authorship policy to the Milestone D scope: e.g., 'Seed fixtures are human-reviewed; LLM-suggested findings require explicit human approval before landing in `expected_findings.yaml`.'"
+    }
+  ],
+  "disposition": "posted",
+  "error": "",
+  "error_category": "",
+  "usage": {
+    "timestamp": 1776770643.4110198,
+    "backend": "claude_cli",
+    "model": "claude-sonnet-4-6",
+    "input_tokens": 4,
+    "output_tokens": 7299,
+    "cache_read_tokens": 71433,
+    "cache_creation_tokens": 23514,
+    "duration_ms": 178508,
+    "disposition": "posted",
+    "request_id": "rev-6b21e01871ac45ff",
+    "repo": "",
+    "pr_number": null,
+    "estimated_api_cost_usd": 0.37427755000000007,
+    "error": "",
+    "error_category": ""
+  },
+  "backend": "claude_cli",
+  "model": "claude-sonnet-4-6",
+  "created_at": 1776770643.4110198
+}
