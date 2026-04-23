@@ -64,6 +64,21 @@ def test_log_dogfood_roundtrip(store):
     assert out.observation == "observation text"
 
 
+def test_dogfood_observed_at_epoch_zero_roundtrips(store):
+    dog = store.log_dogfood(
+        "observation",
+        target="developer",
+        observed_at=0.0,
+    )
+    assert dog.observed_at == 0.0
+    out = store.get_dogfood(dog.id)
+    assert out is not None
+    assert out.observed_at == 0.0, (
+        "epoch-0 observed_at must survive round-trip; "
+        "prior impl used `or` which treats 0.0 as falsy"
+    )
+
+
 def test_log_dogfood_rejects_empty_observation(store):
     with pytest.raises(DogfoodError, match="non-empty"):
         store.log_dogfood("")

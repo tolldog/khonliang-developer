@@ -84,6 +84,23 @@ def test_file_bug_roundtrip_through_get(store):
     assert out.reporter == "user"
 
 
+def test_bug_observed_at_epoch_zero_roundtrips(store):
+    bug = store.file_bug(
+        target="developer",
+        title="T",
+        description="d",
+        reporter="user",
+        observed_at=0.0,
+    )
+    assert bug.observed_at == 0.0
+    out = store.get_bug(bug.id)
+    assert out is not None
+    assert out.observed_at == 0.0, (
+        "epoch-0 observed_at must survive round-trip; "
+        "prior impl used `or` which treats 0.0 as falsy"
+    )
+
+
 def test_file_bug_rejects_missing_fields(store):
     with pytest.raises(BugError, match="non-empty"):
         store.file_bug(target="", title="t", description="d")

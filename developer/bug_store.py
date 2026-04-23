@@ -524,7 +524,11 @@ def _bug_from_entry(entry: KnowledgeEntry) -> Bug:
         linked_frs=list(meta.get("linked_frs") or []),
         linked_pr=meta.get("linked_pr", ""),
         duplicate_of=meta.get("duplicate_of", ""),
-        observed_at=float(meta.get("observed_at") or entry.created_at),
+        observed_at=float(
+            meta["observed_at"]
+            if meta.get("observed_at") is not None
+            else entry.created_at
+        ),
         created_at=entry.created_at,
         updated_at=entry.updated_at,
         notes_history=list(meta.get("notes_history") or []),

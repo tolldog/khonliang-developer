@@ -461,7 +461,11 @@ def _dogfood_from_entry(entry: KnowledgeEntry) -> Dogfood:
         context=meta.get("context", ""),
         reporter=meta.get("reporter", ""),
         status=meta.get("dogfood_status", DOGFOOD_STATUS_OBSERVED),
-        observed_at=float(meta.get("observed_at") or entry.created_at),
+        observed_at=float(
+            meta["observed_at"]
+            if meta.get("observed_at") is not None
+            else entry.created_at
+        ),
         created_at=entry.created_at,
         updated_at=entry.updated_at,
         promoted_to=list(meta.get("promoted_to") or []),
