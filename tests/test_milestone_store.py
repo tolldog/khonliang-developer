@@ -1025,3 +1025,23 @@ def test_milestone_legacy_record_reads_as_default_project(pipeline):
     # list() also surfaces it.
     assert any(m.id == "ms_legacy_read" and m.project == DEFAULT_PROJECT
                for m in pipeline.milestones.list())
+
+
+def test_milestone_list_empty_string_project_filters_for_default(pipeline):
+    default_ms = pipeline.milestones.propose_from_work_unit(_work_unit())
+    # Make a second milestone with a distinct fr_ids set so it gets a
+    # separate id, and pin it to a non-default project.
+    def _wu(fr_id):
+        return {
+            "name": f"WU for {fr_id}",
+            "targets": ["developer"],
+            "rank": 1,
+            "frs": [{"fr_id": fr_id, "target": "developer", "title": fr_id}],
+        }
+    alpha_ms = pipeline.milestones.propose_from_work_unit(
+        _wu("fr_developer_alphafilter"), project="alpha",
+    )
+    filtered = pipeline.milestones.list(project="")
+    ids = {m.id for m in filtered}
+    assert default_ms.id in ids
+    assert alpha_ms.id not in ids

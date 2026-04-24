@@ -215,6 +215,12 @@ class BugStore:
         ``observed_at`` first.
         """
         allowed_statuses = _parse_status_filter(status, include_terminal=include_terminal)
+        # Normalize the project filter. `None` = all projects; empty /
+        # whitespace strings map to DEFAULT_PROJECT so bus/CLI defaults
+        # that send "" filter for the default project rather than
+        # silently bypassing the filter.
+        if project is not None:
+            project = project.strip() or DEFAULT_PROJECT
         if severity_min:
             if severity_min not in ALLOWED_SEVERITIES:
                 raise BugError(
@@ -233,7 +239,7 @@ class BugStore:
             bug = _bug_from_entry(entry)
             if target and bug.target != target:
                 continue
-            if project and bug.project != project:
+            if project is not None and bug.project != project:
                 continue
             if allowed_statuses is not None and bug.status not in allowed_statuses:
                 continue

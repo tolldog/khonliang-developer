@@ -1181,3 +1181,14 @@ def test_dogfood_legacy_record_reads_as_default_project(store):
     assert d.project == DEFAULT_PROJECT
     assert any(x.id == "dog_legacyread" and x.project == DEFAULT_PROJECT
                for x in store.list_dogfood())
+
+
+def test_list_dogfood_empty_string_project_filters_for_default(store):
+    from developer.project_store import DEFAULT_PROJECT
+    import time
+    default_d = store.log_dogfood("default obs", observed_at=time.time() - 1)
+    other = store.log_dogfood("alpha obs", project="alpha", observed_at=time.time())
+    filtered = store.list_dogfood(project="")
+    ids = {d.id for d in filtered}
+    assert default_d.id in ids
+    assert other.id not in ids

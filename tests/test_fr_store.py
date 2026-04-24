@@ -1201,3 +1201,27 @@ def test_merge_rejects_cross_project_sources(store):
             title="A+B",
             description="combined",
         )
+
+
+def test_list_empty_string_project_filters_for_default_not_all(store):
+    from developer.project_store import DEFAULT_PROJECT
+    default_fr = store.promote(
+        target="developer", title="default-proj", description="d",
+    )
+    other = store.promote(
+        target="developer", title="other-proj", description="d", project="alpha",
+    )
+    # `project=""` is a common bus/CLI default. Treating it as
+    # "no filter" silently mis-scopes the call to all projects.
+    # Expect: "" normalizes to DEFAULT_PROJECT and scopes to it.
+    filtered = store.list(project="")
+    ids = {f.id for f in filtered}
+    assert default_fr.id in ids
+    assert other.id not in ids
+    # Whitespace normalizes the same way.
+    filtered_ws = store.list(project="   ")
+    ids_ws = {f.id for f in filtered_ws}
+    assert default_fr.id in ids_ws
+    assert other.id not in ids_ws
+    # None still means "all projects".
+    assert {f.id for f in store.list(project=None)} >= {default_fr.id, other.id}

@@ -277,8 +277,17 @@ class FRStore:
         Pass ``status=<name>`` to filter to a single status
         (ignores ``include_all`` since it's more specific).
         Pass ``project=<slug>`` to restrict to one project; ``None``
-        returns every project (cross-project view).
+        returns every project (cross-project view). Empty / whitespace
+        strings normalize to :data:`DEFAULT_PROJECT` — matches writer
+        normalization and avoids bus/CLI defaults (where ``""`` is
+        common) silently bypassing the filter.
         """
+        # Normalize the project filter once, up front. `None` means
+        # "all projects"; anything else maps an empty/whitespace value
+        # to DEFAULT_PROJECT so `""` behaves like the documented
+        # default slug rather than disabling the filter.
+        if project is not None:
+            project = project.strip() or DEFAULT_PROJECT
         entries = self.knowledge.get_by_tier(Tier.DERIVED)
         frs: list[FR] = []
         for entry in entries:
@@ -287,7 +296,7 @@ class FRStore:
             fr = _fr_from_entry(entry)
             if target and fr.target != target:
                 continue
-            if project and fr.project != project:
+            if project is not None and fr.project != project:
                 continue
             if status:
                 if fr.status != status:

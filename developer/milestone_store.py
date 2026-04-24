@@ -189,6 +189,16 @@ class MilestoneStore:
         if status and status not in ALL_MILESTONE_STATUSES:
             raise MilestoneError(f"status must be one of: {sorted(ALL_MILESTONE_STATUSES)}")
 
+        # Normalize the project filter up front. `None` = all projects;
+        # any string (including "" or whitespace) maps to a concrete
+        # slug, so bus/CLI defaults that send "" filter for the default
+        # project rather than silently disabling the filter.
+        normalized_project: Optional[str]
+        if project is None:
+            normalized_project = None
+        else:
+            normalized_project = project.strip() or DEFAULT_PROJECT
+
         # Mirror ``update_status``' write-time normalization on the read
         # path: ``archived`` is the legacy synonym for ``abandoned``, so
         # a ``status=abandoned`` filter must also surface legacy on-disk
@@ -215,7 +225,7 @@ class MilestoneStore:
             milestone = _milestone_from_entry(entry)
             if target and milestone.target != target:
                 continue
-            if project and milestone.project != project:
+            if normalized_project is not None and milestone.project != normalized_project:
                 continue
             if status_match and milestone.status not in status_match:
                 continue

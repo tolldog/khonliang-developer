@@ -1093,3 +1093,18 @@ def test_bug_legacy_record_reads_as_default_project(store):
     assert bug.project == DEFAULT_PROJECT
     assert any(b.id == "bug_developer_legacyread" and b.project == DEFAULT_PROJECT
                for b in store.list_bugs())
+
+
+def test_list_bugs_empty_string_project_filters_for_default(store):
+    from developer.project_store import DEFAULT_PROJECT
+    default_bug = store.file_bug(
+        target="developer", title="A", description="d1", observed_entity="e1",
+    )
+    other = store.file_bug(
+        target="developer", title="B", description="d2",
+        observed_entity="e2", project="alpha",
+    )
+    filtered = store.list_bugs(project="")
+    ids = {b.id for b in filtered}
+    assert default_bug.id in ids
+    assert other.id not in ids

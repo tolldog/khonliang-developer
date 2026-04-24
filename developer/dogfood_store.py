@@ -206,6 +206,11 @@ class DogfoodStore:
         must pass ``None`` explicitly.
         """
         allowed_statuses = _parse_status_filter(status, include_terminal=include_terminal)
+        # Normalize project filter — None = all projects; anything else
+        # maps ""/whitespace to DEFAULT_PROJECT so bus/CLI defaults
+        # don't silently bypass the filter.
+        if project is not None:
+            project = project.strip() or DEFAULT_PROJECT
         if kind and kind not in ALLOWED_KINDS:
             raise DogfoodError(
                 f"kind must be one of {sorted(ALLOWED_KINDS)}, got {kind!r}"
@@ -221,7 +226,7 @@ class DogfoodStore:
                 continue
             if target and d.target != target:
                 continue
-            if project and d.project != project:
+            if project is not None and d.project != project:
                 continue
             if since is not None and d.observed_at < since:
                 continue
