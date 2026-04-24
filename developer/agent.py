@@ -26,6 +26,7 @@ from typing import Any, Optional
 from khonliang_bus import BaseAgent, Skill, Collaboration, handler
 
 from developer import integration_scan
+from developer import project_ecosystem as _project_ecosystem
 from developer.project_store import ProjectDuplicateError
 
 
@@ -267,6 +268,22 @@ class DeveloperAgent(BaseAgent):
                   since="0.1.0"),
             Skill("developer_guide", "Development workflow guide",
                   since="0.1.0"),
+            # Read-only project introspection (fr_developer_5564b81f).
+            # Heuristic path today (walks pyproject.toml + sibling repos);
+            # real project records come later (gated on fr_developer_5d0a8711).
+            Skill("project_ecosystem",
+                  "Introspect a project's ecosystem — discover repos, roles, "
+                  "ecosystem deps, and live agents (read-only).",
+                  {"start_dir": {"type": "string", "default": "",
+                                 "description": "repo path to anchor discovery; defaults to the configured developer repo (falls back to cwd)"},
+                   "sibling_prefix": {"type": "string", "default": "",
+                                      "description": "override heuristic prefix; derived from install-name if empty"},
+                   "domain": {"type": "string", "default": "generic"},
+                   "detail": {"type": "string", "default": "brief",
+                              "description": "compact / brief / full"},
+                   "include_live": {"type": "boolean", "default": True,
+                                    "description": "overlay live-agent state from /v1/services"}},
+                  since="0.18.0"),
             # Project lifecycle (fr_developer_5d0a8711 Phase 2). Thin
             # wrappers over ProjectStore; cross-store migration (adding
             # `project` dimension to FR / milestone / spec / bug / dogfood)
@@ -965,6 +982,87 @@ class DeveloperAgent(BaseAgent):
         if project is None:
             return {"project": None}
         return {"project": project.to_dict()}
+
+    @handler("project_ecosystem")
+    async def handle_project_ecosystem(self, args):
+        """Heuristic ecosystem introspection, with optional live-agent overlay.
+
+        No dependency on project records — walks pyproject.toml and sibling
+        repos to infer shape. When project records land
+        (fr_developer_5d0a8711), this handler will prefer them and fall back
+        to heuristics.
+        """
+
+        from pathlib import Path
+
+        # Normalize + validate detail. Unknown values silently fall through
+        # to an undocumented response shape today; default instead.
+        allowed_detail = {"compact", "brief", "full"}
+        detail = str(args.get("detail") or "brief").strip().lower()
+        if detail not in allowed_detail:
+            detail = "brief"
+
+        # Strip whitespace on the free-form string args so values like
+        # "   " don't become literal path / prefix / domain inputs. For
+        # `domain`, a whitespace-only arg falls back to the default
+        # (matches the schema's stated `default: generic`).
+        start_dir_arg = str(args.get("start_dir") or "").strip()
+        sibling_prefix = str(args.get("sibling_prefix") or "").strip() or None
+        domain = str(args.get("domain") or "generic").strip() or "generic"
+        # Use `_bool_arg` for string-bool safety; naive bool() treats
+        # "false" / "0" as truthy and would fire bus fetches unintended.
+        include_live = _bool_arg(args, "include_live", default=True)
+
+        # Resolve the starting dir: explicit arg wins. Otherwise prefer a
+        # configured REPO path — workspace_root is the parent directory
+        # containing repos, not a repo itself, so walking up from there
+        # won't find a pyproject (→ project='unknown'). Falls back to cwd
+        # when no developer-project repo is configured.
+        if start_dir_arg:
+            start_dir = Path(start_dir_arg)
+        else:
+            start_dir = None
+            try:
+                projects = getattr(self.pipeline.config, "projects", None) or {}
+                developer_project = projects.get("developer") if isinstance(projects, dict) else None
+                repo = getattr(developer_project, "repo", None)
+                if repo:
+                    start_dir = Path(repo)
+            except Exception:
+                start_dir = None
+            if start_dir is None:
+                start_dir = Path.cwd()
+
+        services_payload = None
+        if include_live and getattr(self, "bus_url", None):
+            # Reuse the agent's existing async HTTP client (same one
+            # `_fetch_remote_skills` uses). Avoids spawning threads per
+            # call and keeps httpx/timeout/error-shape handling consistent.
+            # Failure is non-fatal — degrades to empty overlay.
+            client = getattr(self, "_http", None)
+            if client is not None:
+                try:
+                    # Explicit 3s timeout per the PR's stated contract —
+                    # don't inherit whatever default `self._http` happens
+                    # to carry, which may be generous (or absent) and let
+                    # this skill hang longer than advertised. Timeout is
+                    # non-fatal just like HTTP 5xx / connect errors.
+                    response = await client.get(
+                        f"{self.bus_url.rstrip('/')}/v1/services",
+                        timeout=3.0,
+                    )
+                    response.raise_for_status()
+                    services_payload = response.json()
+                except Exception as e:
+                    logger.debug("project_ecosystem live-overlay fetch failed: %s", e)
+
+        view = _project_ecosystem.build_view(
+            start_dir,
+            sibling_prefix=sibling_prefix,
+            domain=domain,
+            services_payload=services_payload,
+        )
+        return view.to_dict(detail=detail)
 
     # -- researcher evidence/concept skills (via bus-lib self.request) --
 
