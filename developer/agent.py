@@ -391,7 +391,9 @@ class DeveloperAgent(BaseAgent):
                    "title": {"type": "string", "default": ""},
                    "summary": {"type": "string", "default": ""},
                    "work_unit": {"type": "string", "default": "",
-                                 "description": "optional JSON work unit; omitted uses next_work_unit"}},
+                                 "description": "optional JSON work unit; omitted uses next_work_unit"},
+                   "project": {"type": "string", "default": "",
+                               "description": "project slug (Phase 3); empty preserves existing on re-propose, defaults to khonliang for new milestones"}},
                   since="0.8.0"),
             Skill("get_milestone", "Look up a developer milestone by id",
                   {"milestone_id": {"type": "string", "required": True}},
@@ -399,7 +401,9 @@ class DeveloperAgent(BaseAgent):
             Skill("list_milestones", "List developer milestones",
                   {"target": {"type": "string", "default": ""},
                    "status": {"type": "string", "default": ""},
-                   "include_archived": {"type": "boolean", "default": False}},
+                   "include_archived": {"type": "boolean", "default": False},
+                   "project": {"type": "string", "default": "",
+                               "description": "project slug to filter by (Phase 3); empty returns all projects"}},
                   since="0.8.0"),
             Skill("draft_spec_from_milestone", "Return the milestone's deterministic draft spec",
                   {"milestone_id": {"type": "string", "required": True}},
@@ -520,7 +524,9 @@ class DeveloperAgent(BaseAgent):
                    "priority": {"type": "string", "default": "medium"},
                    "concept": {"type": "string", "default": ""},
                    "classification": {"type": "string", "default": "app"},
-                   "backing_papers": {"type": "string", "default": ""}},
+                   "backing_papers": {"type": "string", "default": ""},
+                   "project": {"type": "string", "default": "",
+                               "description": "project slug (Phase 3); empty defaults to khonliang"}},
                   since="0.4.0"),
             Skill("update_fr_status", "Advance an FR's lifecycle status",
                   {"fr_id": {"type": "string", "required": True},
@@ -554,7 +560,9 @@ class DeveloperAgent(BaseAgent):
                   "Default filters out terminal states.",
                   {"target": {"type": "string", "default": ""},
                    "status": {"type": "string", "default": ""},
-                   "include_all": {"type": "boolean", "default": False}},
+                   "include_all": {"type": "boolean", "default": False},
+                   "project": {"type": "string", "default": "",
+                               "description": "project slug to filter by (Phase 3); empty returns all projects"}},
                   since="0.4.0"),
             Skill("update_fr", "Edit an existing FR in place. Terminal FRs "
                   "are immutable.",
@@ -570,7 +578,9 @@ class DeveloperAgent(BaseAgent):
                   since="0.6.0"),
             Skill("next_fr_local", "Pick the highest-priority open/planned FR "
                   "whose deps are completed. Returns null when nothing's ready.",
-                  {"target": {"type": "string", "default": ""}},
+                  {"target": {"type": "string", "default": ""},
+                   "project": {"type": "string", "default": "",
+                               "description": "project slug to scope the search (Phase 3); empty returns all projects"}},
                   since="0.6.0"),
             # Native git operations (fr_developer_e778b9bf). Each takes a
             # `cwd` (repo path); destructive ops require explicit flags.
@@ -689,14 +699,18 @@ class DeveloperAgent(BaseAgent):
                    "reproduction": {"type": "string", "default": ""},
                    "observed_entity": {"type": "string", "default": ""},
                    "severity": {"type": "string", "default": "medium"},
-                   "reporter": {"type": "string", "default": ""}},
+                   "reporter": {"type": "string", "default": ""},
+                   "project": {"type": "string", "default": "",
+                               "description": "project slug (Phase 3); empty defaults to khonliang"}},
                   since="0.15.0"),
             Skill("list_bugs", "List bugs. Default filters terminal statuses.",
                   {"target": {"type": "string", "default": ""},
                    "severity_min": {"type": "string", "default": ""},
                    "status": {"type": "string", "default": "open,triaged,in_progress",
                               "description": "comma-separated names or 'all'"},
-                   "detail": {"type": "string", "default": "brief"}},
+                   "detail": {"type": "string", "default": "brief"},
+                   "project": {"type": "string", "default": "",
+                               "description": "project slug to filter by (Phase 3); empty returns all projects"}},
                   since="0.15.0"),
             Skill("get_bug", "Look up a bug by id",
                   {"bug_id": {"type": "string", "required": True},
@@ -723,7 +737,9 @@ class DeveloperAgent(BaseAgent):
                             "description": "friction / bug / ux / docs / other"},
                    "target": {"type": "string", "default": ""},
                    "context": {"type": "string", "default": ""},
-                   "reporter": {"type": "string", "default": ""}},
+                   "reporter": {"type": "string", "default": ""},
+                   "project": {"type": "string", "default": "",
+                               "description": "project slug (Phase 3); empty defaults to khonliang"}},
                   since="0.15.0"),
             Skill("list_dogfood", "List dogfood observations, newest first. "
                   "Default filters terminal statuses.",
@@ -733,7 +749,9 @@ class DeveloperAgent(BaseAgent):
                    "status": {"type": "string", "default": "observed,triaged",
                               "description": "comma-separated names or 'all'"},
                    "limit": {"type": "integer", "default": 20},
-                   "detail": {"type": "string", "default": "brief"}},
+                   "detail": {"type": "string", "default": "brief"},
+                   "project": {"type": "string", "default": "",
+                               "description": "project slug to filter by (Phase 3); empty returns all projects"}},
                   since="0.15.0"),
             Skill("get_dogfood", "Look up a dogfood observation by id",
                   {"dog_id": {"type": "string", "required": True},
@@ -1934,12 +1952,19 @@ class DeveloperAgent(BaseAgent):
                     return next_result
                 work_unit = next_result.get("work_unit") or {}
                 source = next_result.get("source", "work_unit")
+            # Phase 3 pass-through: empty `project` maps to None =
+            # preserve-existing-or-default (store's documented
+            # re-propose semantics); an explicit slug — including
+            # DEFAULT_PROJECT — always overrides.
+            project_raw = str(args.get("project") or "").strip()
+            project = project_raw or None
             milestone = self.pipeline.milestones.propose_from_work_unit(
                 work_unit,
                 target=args.get("target", ""),
                 title=args.get("title", ""),
                 summary=args.get("summary", ""),
                 source=source,
+                project=project,
             )
         except (MilestoneError, ValueError, TypeError) as e:
             await self.report_gap("propose_milestone_from_work_unit", str(e))
@@ -1960,11 +1985,16 @@ class DeveloperAgent(BaseAgent):
     async def handle_list_milestones(self, args):
         from developer.milestone_store import MilestoneError
 
+        # Phase 3 pass-through: empty project → None = all projects;
+        # slug partitions to that project only.
+        project_raw = str(args.get("project") or "").strip()
+        project = project_raw or None
         try:
             milestones = self.pipeline.milestones.list(
                 target=args.get("target", ""),
                 status=args.get("status", ""),
                 include_archived=bool(args.get("include_archived", False)),
+                project=project,
             )
         except MilestoneError as e:
             await self.report_gap("list_milestones", str(e))
@@ -2314,9 +2344,15 @@ class DeveloperAgent(BaseAgent):
     @handler("promote_fr")
     async def handle_promote_fr(self, args):
         from developer.fr_store import FRError
+        from developer.project_store import DEFAULT_PROJECT
 
         try:
             backing = [p.strip() for p in (args.get("backing_papers") or "").split(",") if p.strip()]
+            # Phase 3 pass-through: an empty/whitespace `project` at
+            # the skill boundary means "use the store default"; the
+            # store's normalize_project maps it to DEFAULT_PROJECT.
+            # An explicit slug partitions the record into that project.
+            project = str(args.get("project") or "").strip() or DEFAULT_PROJECT
             fr = self.pipeline.frs.promote(
                 target=args.get("target", ""),
                 title=args.get("title", ""),
@@ -2325,6 +2361,7 @@ class DeveloperAgent(BaseAgent):
                 concept=args.get("concept", ""),
                 classification=args.get("classification", "app"),
                 backing_papers=backing,
+                project=project,
             )
         except FRError as e:
             await self.report_gap("promote_fr", str(e))
@@ -2337,6 +2374,7 @@ class DeveloperAgent(BaseAgent):
             "target": fr.target,
             "priority": fr.priority,
             "status": fr.status,
+            "project": fr.project,
         }
 
     @handler("update_fr_status")
@@ -2465,8 +2503,13 @@ class DeveloperAgent(BaseAgent):
         status = args.get("status") or None
         target = args.get("target") or None
         include_all = bool(args.get("include_all", False))
+        # Phase 3 pass-through: empty `project` (default bus value) maps
+        # to None = "all projects" cross-project view; an explicit slug
+        # partitions the query. The store normalizes value shape.
+        project_raw = str(args.get("project") or "").strip()
+        project = project_raw or None
         frs = self.pipeline.frs.list(
-            target=target, status=status, include_all=include_all,
+            target=target, status=status, include_all=include_all, project=project,
         )
         return {
             "count": len(frs),
@@ -2523,7 +2566,11 @@ class DeveloperAgent(BaseAgent):
     @handler("next_fr_local")
     async def handle_next_fr_local(self, args):
         target = args.get("target") or None
-        fr = self.pipeline.frs.next_fr(target=target)
+        # Phase 3 pass-through: empty project → None = all projects;
+        # an explicit slug partitions the search.
+        project_raw = str(args.get("project") or "").strip()
+        project = project_raw or None
+        fr = self.pipeline.frs.next_fr(target=target, project=project)
         if fr is None:
             return {"fr": None, "reason": "no ready FRs (all in-progress, blocked, or terminal)"}
         return {"fr": fr.to_public_dict()}
@@ -3041,8 +3088,10 @@ class DeveloperAgent(BaseAgent):
     @handler("file_bug")
     async def handle_file_bug(self, args):
         from developer.bug_store import BugError
+        from developer.project_store import DEFAULT_PROJECT
 
         try:
+            project = str(args.get("project") or "").strip() or DEFAULT_PROJECT
             bug = self.pipeline.bugs.file_bug(
                 target=args.get("target", ""),
                 title=args.get("title", ""),
@@ -3051,6 +3100,7 @@ class DeveloperAgent(BaseAgent):
                 observed_entity=args.get("observed_entity", ""),
                 severity=args.get("severity", "medium"),
                 reporter=args.get("reporter", ""),
+                project=project,
             )
         except BugError as e:
             await self._safe_report_gap("file_bug", str(e))
@@ -3063,6 +3113,7 @@ class DeveloperAgent(BaseAgent):
             "target": bug.target,
             "severity": bug.severity,
             "status": bug.status,
+            "project": bug.project,
         }
 
     @handler("list_bugs")
@@ -3073,12 +3124,16 @@ class DeveloperAgent(BaseAgent):
         severity_min = args.get("severity_min", "") or ""
         status_arg = args.get("status", "")
         detail = args.get("detail", "brief")
+        # Phase 3: empty project → None = all projects; slug partitions.
+        project_raw = str(args.get("project") or "").strip()
+        project = project_raw or None
 
         try:
             bugs = self.pipeline.bugs.list_bugs(
                 target=target,
                 severity_min=severity_min,
                 status=status_arg or None,
+                project=project,
             )
         except BugError as e:
             return {"error": str(e)}
@@ -3169,14 +3224,17 @@ class DeveloperAgent(BaseAgent):
         of *capturing* friction stays near-zero.
         """
         from developer.dogfood_store import DogfoodError
+        from developer.project_store import DEFAULT_PROJECT
 
         try:
+            project = str(args.get("project") or "").strip() or DEFAULT_PROJECT
             dog = self.pipeline.dogfood.log_dogfood(
                 args.get("observation", ""),
                 kind=args.get("kind", "friction"),
                 target=args.get("target", ""),
                 context=args.get("context", ""),
                 reporter=args.get("reporter", ""),
+                project=project,
             )
         except DogfoodError as e:
             return {"error": str(e)}
@@ -3184,6 +3242,7 @@ class DeveloperAgent(BaseAgent):
             "dog_id": dog.id,
             "kind": dog.kind,
             "status": dog.status,
+            "project": dog.project,
         }
 
     @handler("list_dogfood")
@@ -3194,6 +3253,9 @@ class DeveloperAgent(BaseAgent):
         target = args.get("target", "") or ""
         since_raw = args.get("since", "")
         detail = args.get("detail", "brief")
+        # Phase 3: empty project → None = all projects; slug partitions.
+        project_raw = str(args.get("project") or "").strip()
+        project = project_raw or None
         # Preserve explicit None from the caller so the MCP surface can
         # express "no cap" — matches DogfoodStore.list_dogfood's API where
         # limit=None means unbounded. Omitted limit defaults to 20.
@@ -3228,6 +3290,7 @@ class DeveloperAgent(BaseAgent):
                 since=since,
                 status=args.get("status") or None,
                 limit=limit,
+                project=project,
             )
         except DogfoodError as e:
             return {"error": str(e)}

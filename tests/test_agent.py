@@ -1697,3 +1697,139 @@ async def test_review_staged_diff_reports_reviewer_failure(harness, git_repo):
     assert "error" in result
     assert "reviewer request failed" in result["error"]
     assert "reviewer offline" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# fr_developer_69973285 — skill-handler project pass-through
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_promote_fr_defaults_project_to_khonliang(harness):
+    from developer.project_store import DEFAULT_PROJECT
+    result = await harness.call("promote_fr", {
+        "target": "developer", "title": "default-proj-fr", "description": "d",
+    })
+    assert result["project"] == DEFAULT_PROJECT
+    # Round-trips through the store.
+    got = await harness.call("get_fr_local", {"fr_id": result["fr_id"]})
+    assert got["project"] == DEFAULT_PROJECT
+
+
+@pytest.mark.asyncio
+async def test_promote_fr_passes_project_through_to_store(harness):
+    result = await harness.call("promote_fr", {
+        "target": "developer", "title": "alpha-proj-fr", "description": "d",
+        "project": "alpha",
+    })
+    assert result["project"] == "alpha"
+    got = await harness.call("get_fr_local", {"fr_id": result["fr_id"]})
+    assert got["project"] == "alpha"
+
+
+@pytest.mark.asyncio
+async def test_list_frs_local_filters_by_project(harness):
+    # One default-project FR and one alpha FR; ensure the filter
+    # reaches the store.
+    default_fr = await harness.call("promote_fr", {
+        "target": "developer", "title": "d-fr", "description": "d",
+    })
+    alpha_fr = await harness.call("promote_fr", {
+        "target": "developer", "title": "a-fr", "description": "a",
+        "project": "alpha",
+    })
+    alpha_only = await harness.call("list_frs_local", {"project": "alpha"})
+    ids = {f["id"] for f in alpha_only["frs"]}
+    assert alpha_fr["fr_id"] in ids
+    assert default_fr["fr_id"] not in ids
+    # Empty project → all projects (None at the store).
+    all_of_them = await harness.call("list_frs_local", {})
+    all_ids = {f["id"] for f in all_of_them["frs"]}
+    assert {default_fr["fr_id"], alpha_fr["fr_id"]} <= all_ids
+
+
+@pytest.mark.asyncio
+async def test_next_fr_local_filters_by_project(harness):
+    default_fr = await harness.call("promote_fr", {
+        "target": "developer", "title": "d-next", "description": "d",
+    })
+    alpha_fr = await harness.call("promote_fr", {
+        "target": "developer", "title": "a-next", "description": "a",
+        "project": "alpha",
+    })
+    # Scoped to alpha should pick alpha_fr (only ready candidate there).
+    result = await harness.call("next_fr_local", {"project": "alpha"})
+    assert result["fr"] is not None
+    assert result["fr"]["id"] == alpha_fr["fr_id"]
+
+
+@pytest.mark.asyncio
+async def test_file_bug_passes_project_through(harness):
+    result = await harness.call("file_bug", {
+        "target": "developer", "title": "b", "description": "d",
+        "observed_entity": "x", "project": "genealogy",
+    })
+    assert result["project"] == "genealogy"
+
+
+@pytest.mark.asyncio
+async def test_list_bugs_filters_by_project(harness):
+    a = await harness.call("file_bug", {
+        "target": "developer", "title": "alpha-b", "description": "d1",
+        "observed_entity": "e1", "project": "alpha",
+    })
+    b = await harness.call("file_bug", {
+        "target": "developer", "title": "beta-b", "description": "d2",
+        "observed_entity": "e2", "project": "beta",
+    })
+    alpha_only = await harness.call("list_bugs", {"project": "alpha"})
+    ids = {bug["id"] for bug in alpha_only["bugs"]}
+    assert a["bug_id"] in ids
+    assert b["bug_id"] not in ids
+
+
+@pytest.mark.asyncio
+async def test_log_dogfood_passes_project_through(harness):
+    result = await harness.call("log_dogfood", {
+        "observation": "project-pass-obs", "project": "alpha-app",
+    })
+    assert result["project"] == "alpha-app"
+
+
+@pytest.mark.asyncio
+async def test_list_dogfood_filters_by_project(harness):
+    a = await harness.call("log_dogfood", {
+        "observation": "alpha obs", "project": "alpha",
+    })
+    b = await harness.call("log_dogfood", {
+        "observation": "beta obs", "project": "beta",
+    })
+    alpha_only = await harness.call("list_dogfood", {"project": "alpha"})
+    ids = {d["id"] for d in alpha_only["dogfood"]}
+    assert a["dog_id"] in ids
+    assert b["dog_id"] not in ids
+
+
+@pytest.mark.asyncio
+async def test_list_milestones_filters_by_project(harness):
+    # Seed two milestones with distinct fr_ids so they get separate ids,
+    # one default and one explicit.
+    def _wu(name, fr_id):
+        return {
+            "name": name,
+            "targets": ["developer"],
+            "rank": 1,
+            "frs": [{"fr_id": fr_id, "target": "developer", "title": fr_id}],
+        }
+    import json
+    default_ms = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": json.dumps(_wu("A", "fr_developer_a0000001")),
+    })
+    alpha_ms = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": json.dumps(_wu("B", "fr_developer_b0000001")),
+        "project": "alpha",
+    })
+    alpha_only = await harness.call("list_milestones", {"project": "alpha"})
+    ids = {m["id"] for m in alpha_only["milestones"]}
+    assert alpha_ms["milestone"]["id"] in ids
+    assert default_ms["milestone"]["id"] not in ids
