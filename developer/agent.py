@@ -276,7 +276,7 @@ class DeveloperAgent(BaseAgent):
                   {"slug": {"type": "string", "required": True,
                             "description": "unique project slug (1-64 chars; lowercase a-z0-9_-; must start with a letter or digit)"},
                    "repos": {"type": "string", "required": True,
-                             "description": "comma-separated repo paths, or JSON list of {path, role, install_name} dicts"},
+                             "description": "comma-separated repo paths, or JSON array of repo objects ({path, role, install_name}); bare JSON objects are rejected — wrap in an array"},
                    "name": {"type": "string", "default": ""},
                    "domain": {"type": "string", "default": "generic"},
                    "config": {"type": "string", "default": "",
