@@ -309,6 +309,25 @@ class DeveloperAgent(BaseAgent):
                   "Look up a project by slug. Returns null when missing.",
                   {"slug": {"type": "string", "required": True}},
                   since="0.19.0"),
+            # Pre-push reviewer orchestration (fr_developer_6ecd0c01).
+            # Owns the "capture raw diff → route to reviewer" plumbing so
+            # callers can't short-cut by handing the reviewer a description
+            # instead of the actual bytes.
+            Skill("review_staged_diff",
+                  "Review the currently-staged diff via reviewer.review_diff (raw bytes, not summary).",
+                  {"cwd": {"type": "string", "required": True,
+                           "description": "repo path; the diff is captured via `git diff --cached` here"},
+                   "backend": {"type": "string", "default": "",
+                               "description": "reviewer backend override (e.g. ollama, claude_cli)"},
+                   "model": {"type": "string", "default": "",
+                             "description": "reviewer model override"},
+                   "severity_floor": {"type": "string", "default": "",
+                                      "description": "minimum severity (nit|note|warn|concern|blocker); reviewer's default applies when unset"},
+                   "context": {"type": "string", "default": "",
+                               "description": "optional context string; default includes cwd + current branch"},
+                   "timeout_s": {"type": "number", "default": 120.0,
+                                 "description": "bus request timeout in seconds"}},
+                  since="0.20.0"),
             # Cross-agent skills (use self.request() via bus-lib)
             Skill("get_fr", "Look up an FR from developer's FR store",
                   {"fr_id": {"type": "string", "required": True}},
@@ -1004,6 +1023,89 @@ class DeveloperAgent(BaseAgent):
         if project is None:
             return {"project": None}
         return {"project": project.to_dict()}
+
+    # ------------------------------------------------------------------
+    # Pre-push review orchestration (fr_developer_6ecd0c01)
+    # ------------------------------------------------------------------
+
+    @handler("review_staged_diff")
+    async def handle_review_staged_diff(self, args):
+        """Review staged changes against the reviewer agent.
+
+        Captures ``git diff --cached`` locally and routes the raw bytes
+        to ``reviewer.review_diff`` via ``self.request``. Closes the
+        structural gap where pre-push reviewers were being handed
+        descriptive summaries instead of actual diff bytes — the caller
+        never touches the diff string, so they can't substitute a
+        description by accident.
+        """
+        from developer.git_client import GitClient, GitClientError
+
+        cwd = str(args.get("cwd") or "").strip()
+        if not cwd:
+            return {"error": "cwd is required"}
+
+        client = GitClient(cwd)
+        try:
+            diff = client.diff_staged()
+        except GitClientError as e:
+            await self._safe_report_gap("review_staged_diff", str(e))
+            return {"error": str(e)}
+        if not diff.strip():
+            return {"error": "no staged changes to review (git diff --cached returned empty)"}
+
+        # Forward only the tunables that callers explicitly set. An empty
+        # string is "unset" (bus string args default to "") — the reviewer
+        # has its own config-derived defaults for backend/model/severity.
+        forwarded: dict = {"diff": diff}
+        for key in ("backend", "model", "severity_floor", "context"):
+            raw = args.get(key)
+            if isinstance(raw, str) and raw.strip():
+                forwarded[key] = raw.strip()
+
+        # Provide a default context line with repo + branch so the
+        # reviewer has anchoring info even when the caller didn't set
+        # `context`. Branch fetch is best-effort; don't fail the review
+        # if git can't determine HEAD.
+        if "context" not in forwarded:
+            try:
+                branch = client.current_branch()
+            except GitClientError:
+                branch = "(unknown branch)"
+            forwarded["context"] = f"pre-push review of staged changes in {cwd} on {branch}"
+
+        # Validate timeout explicitly. `_float_arg` swallows bad input and
+        # treats numeric 0 as "unset" (because of its `or default` pattern),
+        # which would either mask caller mistakes or pipe a non-positive
+        # timeout into self.request(). Mirror handle_fr_candidates_from_concepts'
+        # validation shape so callers see one consistent error surface.
+        import math
+        raw_timeout = args.get("timeout_s", 120.0)
+        try:
+            timeout_s = float(raw_timeout) if raw_timeout not in (None, "") else 120.0
+        except (TypeError, ValueError):
+            message = f"timeout_s must be a number, got {raw_timeout!r}"
+            await self._safe_report_gap("review_staged_diff", message)
+            return {"error": message}
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            message = f"timeout_s must be a positive finite number, got {raw_timeout!r}"
+            await self._safe_report_gap("review_staged_diff", message)
+            return {"error": message}
+
+        try:
+            response = await self.request(
+                agent_type="reviewer",
+                operation="review_diff",
+                args=forwarded,
+                timeout=timeout_s,
+            )
+        except Exception as e:
+            await self._safe_report_gap(
+                "review_staged_diff", f"reviewer request failed: {e}",
+            )
+            return {"error": f"reviewer request failed: {e}"}
+
+        return (response and response.get("result")) or {"error": "no result from reviewer"}
 
     @handler("project_ecosystem")
     async def handle_project_ecosystem(self, args):
