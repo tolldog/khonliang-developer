@@ -26,14 +26,17 @@ from typing import Any, Optional
 from khonliang_bus import BaseAgent, Skill, Collaboration, handler
 
 from developer import integration_scan
-from developer.project_store import (
-    ProjectDuplicateError,
-    ProjectStore,
-)
+from developer.project_store import ProjectDuplicateError
 
 
 def _parse_repos_arg(raw):
-    """Accept comma-list, JSON list, or already-materialized list."""
+    """Accept comma-list, JSON list, or already-materialized list.
+
+    A ``[``-prefixed string is treated as **JSON-only** — if JSON decoding
+    fails or the decoded value isn't a list, raises :class:`ValueError`.
+    Falling back to comma-splitting on broken JSON would silently parse
+    fragments like ``[{"path":"/x"`` into garbage repo paths.
+    """
 
     if raw is None or raw == "":
         return []
@@ -43,15 +46,16 @@ def _parse_repos_arg(raw):
         s = raw.strip()
         if not s:
             return []
-        # JSON list wins when the string starts with '['
+        # JSON list is strict: starts with '[' → must parse as a list.
         if s.startswith("["):
             try:
                 parsed = json.loads(s)
-                if isinstance(parsed, list):
-                    return parsed
-            except json.JSONDecodeError:
-                pass
-        # Comma-separated path list fallback.
+            except json.JSONDecodeError as e:
+                raise ValueError(f"repos is not valid JSON: {e}") from e
+            if not isinstance(parsed, list):
+                raise ValueError("repos JSON must be a list")
+            return parsed
+        # Comma-separated path list fallback (no leading '[').
         return [piece.strip() for piece in s.split(",") if piece.strip()]
     # Unknown shape — delegate rejection to ProjectStore.create().
     return raw
@@ -875,18 +879,15 @@ class DeveloperAgent(BaseAgent):
         if not slug:
             return {"error": "slug is required"}
 
-        repos_raw = args.get("repos")
-        repos = _parse_repos_arg(repos_raw)
-
         name = str(args.get("name") or "").strip() or None
         domain = str(args.get("domain") or "generic").strip() or "generic"
 
-        config_raw = args.get("config")
-        config = _parse_json_object_arg(config_raw, field_name="config")
-        if isinstance(config, dict) is False and config is not None:
-            return {"error": "config must be a JSON object (got non-dict)"}
-
+        # Argument-shape parsing may raise ValueError — route it through
+        # the structured-error response path alongside downstream store
+        # validation errors, so callers see one consistent error shape.
         try:
+            repos = _parse_repos_arg(args.get("repos"))
+            config = _parse_json_object_arg(args.get("config"), field_name="config")
             project = self.pipeline.projects_store.create(
                 slug=slug,
                 repos=repos,
@@ -903,7 +904,10 @@ class DeveloperAgent(BaseAgent):
 
     @handler("list_projects")
     async def handle_list_projects(self, args):
-        include_retired = bool(args.get("include_retired", False))
+        # Use `_bool_arg` for string-boolean safety: `"false"`, `"no"`,
+        # `"0"`, and empty string all correctly stay falsey. Naive
+        # `bool(args.get(...))` would treat any non-empty string as True.
+        include_retired = _bool_arg(args, "include_retired", default=False)
         detail = str(args.get("detail") or "brief")
 
         projects = self.pipeline.projects_store.list(include_retired=include_retired)
