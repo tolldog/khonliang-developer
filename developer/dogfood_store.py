@@ -204,6 +204,13 @@ class DogfoodStore:
         Negative values are normalized to ``0`` (returns empty list) to
         match the MCP handler's normalization — callers who want no cap
         must pass ``None`` explicitly.
+
+        ``project`` (Phase 3 of fr_developer_5d0a8711): ``None`` returns
+        every project (cross-project view); any string selects a single
+        project, with ``""`` and whitespace normalized to
+        :data:`DEFAULT_PROJECT` so bus/CLI defaults that send an empty
+        string filter for the default project rather than silently
+        bypassing the filter.
         """
         allowed_statuses = _parse_status_filter(status, include_terminal=include_terminal)
         # Normalize project filter — None = all projects; anything else

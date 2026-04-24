@@ -211,8 +211,16 @@ class BugStore:
         (fixed / wontfix / duplicate). ``"all"`` overrides. ``severity_min``
         filters out anything less severe than the given cutoff (e.g.
         ``"medium"`` keeps medium / high / blocker); must be ``""`` (no
-        filter) or one of the named severities. Ordering is newest
-        ``observed_at`` first.
+        filter) or one of the named severities.
+
+        ``project`` (Phase 3 of fr_developer_5d0a8711): ``None`` returns
+        every project (cross-project view); any string selects a single
+        project, with ``""`` and whitespace normalized to
+        :data:`DEFAULT_PROJECT` so bus/CLI defaults that send an empty
+        string filter for the default project rather than silently
+        bypassing the filter.
+
+        Ordering is newest ``observed_at`` first.
         """
         allowed_statuses = _parse_status_filter(status, include_terminal=include_terminal)
         # Normalize the project filter. `None` = all projects; empty /
