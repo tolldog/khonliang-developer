@@ -821,10 +821,14 @@ class DeveloperAgent(BaseAgent):
         if detail not in allowed_detail:
             detail = "brief"
 
-        start_dir_arg = str(args.get("start_dir") or "")
-        sibling_prefix = (args.get("sibling_prefix") or "") or None
+        # Strip whitespace on the free-form string args so values like
+        # "   " don't become literal path / prefix inputs.
+        start_dir_arg = str(args.get("start_dir") or "").strip()
+        sibling_prefix = str(args.get("sibling_prefix") or "").strip() or None
         domain = str(args.get("domain") or "generic")
-        include_live = bool(args.get("include_live", True))
+        # Use `_bool_arg` for string-bool safety; naive bool() treats
+        # "false" / "0" as truthy and would fire bus fetches unintended.
+        include_live = _bool_arg(args, "include_live", default=True)
 
         # Resolve the starting dir: explicit arg wins. Otherwise prefer a
         # configured REPO path — workspace_root is the parent directory
