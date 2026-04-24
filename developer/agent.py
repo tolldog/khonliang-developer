@@ -812,9 +812,18 @@ class DeveloperAgent(BaseAgent):
         to heuristics.
         """
 
+        import asyncio
+        import json
+        import urllib.request
         from pathlib import Path
 
-        detail = str(args.get("detail") or "brief")
+        # Normalize + validate detail. Unknown values silently fall through
+        # to an undocumented response shape today; default instead.
+        allowed_detail = {"compact", "brief", "full"}
+        detail = str(args.get("detail") or "brief").strip().lower()
+        if detail not in allowed_detail:
+            detail = "brief"
+
         start_dir_arg = str(args.get("start_dir") or "")
         sibling_prefix = (args.get("sibling_prefix") or "") or None
         domain = str(args.get("domain") or "generic")
@@ -832,15 +841,19 @@ class DeveloperAgent(BaseAgent):
 
         services_payload = None
         if include_live and getattr(self, "bus_url", None):
-            # Cheap HTTP GET against the same bus this agent is registered
-            # with. Failure is not fatal — degrades to empty live overlay.
-            try:
-                import httpx
+            # Cheap GET against the same bus this agent is registered with.
+            # Uses stdlib urllib to avoid a new httpx dependency on this
+            # repo's pyproject — `urllib` is shipping-lib territory. Failure
+            # is non-fatal and degrades to an empty live overlay.
+            url = f"{self.bus_url.rstrip('/')}/v1/services"
 
-                async with httpx.AsyncClient(timeout=3.0) as client:
-                    resp = await client.get(f"{self.bus_url.rstrip('/')}/v1/services")
-                    resp.raise_for_status()
-                    services_payload = resp.json()
+            def _fetch():
+                with urllib.request.urlopen(url, timeout=3.0) as resp:
+                    charset = resp.headers.get_content_charset() or "utf-8"
+                    return json.loads(resp.read().decode(charset))
+
+            try:
+                services_payload = await asyncio.to_thread(_fetch)
             except Exception as e:
                 logger.debug("project_ecosystem live-overlay fetch failed: %s", e)
 

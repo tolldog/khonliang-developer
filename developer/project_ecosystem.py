@@ -213,17 +213,36 @@ def import_name_of(pyproject_data: dict[str, Any]) -> str:
 
 
 def extract_ecosystem_deps(pyproject_data: dict[str, Any], prefix: str) -> list[str]:
-    """Declared runtime deps whose name starts with ``prefix``.
+    """Declared runtime deps whose **distribution name** starts with ``prefix``.
 
-    Handles both ``"pkg"`` and ``"pkg @ git+..."`` dep entries.
+    Strips PEP 508 decorations so the result is comparable against discovered
+    ``install_name`` values:
+
+    - version specifiers: ``pkg>=1.2`` / ``pkg==0.3`` / ``pkg<=2`` / ``pkg~=0.1``
+    - extras: ``pkg[extra1,extra2]``
+    - environment markers: ``pkg; python_version>='3.11'``
+    - direct URL refs: ``pkg @ git+https://...``
+    - leading whitespace
     """
+
+    import re
 
     deps = pyproject_data.get("project", {}).get("dependencies") or []
     out: list[str] = []
+    # Distribution-name tokens per PEP 508: letters, digits, dot, dash,
+    # underscore. Anything after that terminates the name.
+    NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
     for raw in deps:
-        head = str(raw).split()[0].split("@")[0].strip()
-        if head.startswith(prefix):
-            out.append(head)
+        text = str(raw)
+        # `pkg @ git+...` — the name is everything before the `@`.
+        name_chunk = text.split("@", 1)[0] if "@" in text else text
+        # Strip extras / markers / versions — take only the leading name.
+        match = NAME_RE.match(name_chunk)
+        if not match:
+            continue
+        name = match.group(1).strip()
+        if name.startswith(prefix):
+            out.append(name)
     return sorted(set(out))
 
 
@@ -357,6 +376,12 @@ def parse_live_agents(services_payload: Any) -> list[LiveAgent]:
     for item in raw:
         if not isinstance(item, dict):
             continue
+        # Skip partial rows that lack both key identifiers — emitting them
+        # as empty-string agents pollutes the list and surprises callers.
+        agent_id = str(item.get("id") or "").strip()
+        agent_type = str(item.get("agent_type") or "").strip()
+        if not agent_id and not agent_type:
+            continue
         # Healthy-by-default semantics: only explicit "unhealthy" (or a
         # known-bad synonym) flips the bit off. Missing status → healthy
         # (matches the bus schema's implicit default and keeps this parser
@@ -364,12 +389,18 @@ def parse_live_agents(services_payload: Any) -> list[LiveAgent]:
         status = item.get("status")
         normalized = status.strip().lower() if isinstance(status, str) else None
         unhealthy = normalized in {"unhealthy", "failed", "down"}
+        # Guard the skill_count cast — a non-numeric value in one row
+        # shouldn't crash the whole skill. Default to 0 instead.
+        try:
+            skill_count = int(item.get("skill_count") or 0)
+        except (TypeError, ValueError):
+            skill_count = 0
         out.append(
             LiveAgent(
-                agent_id=str(item.get("id") or ""),
-                agent_type=str(item.get("agent_type") or ""),
+                agent_id=agent_id,
+                agent_type=agent_type,
                 version=str(item.get("version") or ""),
-                skill_count=int(item.get("skill_count") or 0),
+                skill_count=skill_count,
                 healthy=not unhealthy,
             )
         )

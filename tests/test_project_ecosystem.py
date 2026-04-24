@@ -211,6 +211,40 @@ class TestExtractEcosystemDeps:
         data = {"project": {"dependencies": ["khonliang-bus-lib", "khonliang-bus-lib"]}}
         assert extract_ecosystem_deps(data, "khonliang-") == ["khonliang-bus-lib"]
 
+    def test_strips_version_specifiers(self):
+        data = {
+            "project": {
+                "dependencies": [
+                    "khonliang-bus-lib>=0.1",
+                    "khonliang-researcher-lib==0.3.0",
+                    "khonliang-reviewer-lib<=1.0",
+                    "khonliang-librarian~=0.2",
+                ]
+            }
+        }
+        assert extract_ecosystem_deps(data, "khonliang-") == [
+            "khonliang-bus-lib",
+            "khonliang-librarian",
+            "khonliang-researcher-lib",
+            "khonliang-reviewer-lib",
+        ]
+
+    def test_strips_extras_and_markers(self):
+        data = {
+            "project": {
+                "dependencies": [
+                    "khonliang-bus-lib[test]",
+                    "khonliang-researcher-lib>=0.3; python_version>='3.11'",
+                    "khonliang-reviewer-lib[extra1,extra2]>=0.1",
+                ]
+            }
+        }
+        assert extract_ecosystem_deps(data, "khonliang-") == [
+            "khonliang-bus-lib",
+            "khonliang-researcher-lib",
+            "khonliang-reviewer-lib",
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Discovery
@@ -363,6 +397,24 @@ class TestParseLiveAgents:
                 item["status"] = s
             agents = parse_live_agents([item])
             assert agents[0].healthy is True, f"{s!r} should NOT flip healthy off"
+
+    def test_non_numeric_skill_count_defaults_to_zero(self):
+        # Non-int skill_count in one row shouldn't crash the skill.
+        for bad in ("many", None, "", [], {}):
+            agents = parse_live_agents([{"id": "x", "agent_type": "t", "skill_count": bad, "status": "healthy"}])
+            assert agents[0].skill_count == 0
+
+    def test_skips_rows_missing_both_identifiers(self):
+        # Partial rows with neither id nor agent_type should NOT surface
+        # as empty-string agents — they're noise.
+        payload = [
+            {"id": "good", "agent_type": "t", "status": "healthy"},
+            {"status": "healthy"},           # no id, no agent_type
+            {"id": "", "agent_type": ""},     # both empty
+            {"id": "also-good", "agent_type": "u"},
+        ]
+        agents = parse_live_agents(payload)
+        assert [a.agent_id for a in agents] == ["good", "also-good"]
 
 
 class TestApplyLiveOverlay:
