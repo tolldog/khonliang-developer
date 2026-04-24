@@ -1120,8 +1120,11 @@ class FRStore:
         around this helper.
 
         Idempotent: only touches records whose ``metadata.project`` is
-        missing or empty. Returns the number of records actually
-        rewritten so callers can log / assert the migration ran.
+        missing, empty, or whitespace-only (write-side and read-side
+        filters strip before comparing, so an unnormalized slug would
+        silently fail to match anything). Returns the number of
+        records actually rewritten so callers can log / assert the
+        migration ran.
         """
         import dataclasses
         project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT

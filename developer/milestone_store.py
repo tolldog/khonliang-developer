@@ -864,7 +864,9 @@ class MilestoneStore:
         In-place metadata patch via :func:`dataclasses.replace` — see
         :meth:`FRStore.migrate_records_to_project` for the rationale
         around not round-tripping through the dataclass serializer.
-        Idempotent; returns the number of records actually rewritten.
+        Idempotent: only touches records whose ``metadata.project`` is
+        missing, empty, or whitespace-only. Returns the number of
+        records actually rewritten.
         """
         import dataclasses
         project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
