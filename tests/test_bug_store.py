@@ -1034,3 +1034,33 @@ def test_bug_migrate_records_to_project_is_idempotent(store):
     assert store.migrate_records_to_project(DEFAULT_PROJECT) == 0
     raw = store.knowledge.get("bug_developer_legacy01")
     assert raw.metadata["project"] == DEFAULT_PROJECT
+
+
+def test_bug_migrate_preserves_unknown_metadata_keys(store):
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="bug_developer_extrakeys",
+        tier=Tier.DERIVED,
+        title="has extras",
+        content="body",
+        source="developer.bug_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["bug", "target:developer", "severity:medium", "custom:legacy"],
+        metadata={
+            "bug_status": "open",
+            "severity": "medium",
+            "target": "developer",
+            "legacy_extra": "keep_it",
+        },
+        created_at=now, updated_at=now,
+    ))
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 1
+    raw = store.knowledge.get("bug_developer_extrakeys")
+    assert raw.metadata["project"] == DEFAULT_PROJECT
+    assert raw.metadata["legacy_extra"] == "keep_it"
+    assert "custom:legacy" in raw.tags

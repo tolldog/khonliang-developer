@@ -928,3 +928,64 @@ def test_milestone_migrate_records_to_project_is_idempotent(pipeline):
     assert pipeline.milestones.migrate_records_to_project(DEFAULT_PROJECT) == 0
     raw = pipeline.knowledge.get("ms_developer_legacy01")
     assert raw.metadata["project"] == DEFAULT_PROJECT
+
+
+def test_milestone_propose_project_none_preserves_existing(pipeline):
+    first = pipeline.milestones.propose_from_work_unit(_work_unit(), project="alpha")
+    assert first.project == "alpha"
+    # Re-proposing with project=None MUST preserve "alpha".
+    second = pipeline.milestones.propose_from_work_unit(_work_unit())
+    assert second.project == "alpha"
+
+
+def test_milestone_propose_explicit_default_overrides_existing(pipeline):
+    from developer.project_store import DEFAULT_PROJECT
+    first = pipeline.milestones.propose_from_work_unit(_work_unit(), project="alpha")
+    assert first.project == "alpha"
+    # Explicit DEFAULT_PROJECT must actually override — this was the
+    # Copilot R1 finding: with project=DEFAULT_PROJECT the old default,
+    # there was no way to move a milestone back to the default project.
+    second = pipeline.milestones.propose_from_work_unit(
+        _work_unit(), project=DEFAULT_PROJECT,
+    )
+    assert second.project == DEFAULT_PROJECT
+
+
+def test_migrate_preserves_unknown_metadata_keys(pipeline):
+    # Legacy record with a metadata key the dataclass doesn't know about.
+    # A round-trip-through-serializer migration would drop it; the in-place
+    # patch approach must keep it.
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    pipeline.knowledge.add(KnowledgeEntry(
+        id="ms_legacy_with_extra",
+        tier=Tier.DERIVED,
+        title="with extras",
+        content="body",
+        source="developer.milestone_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["milestone", "target:developer", "status:proposed", "custom:tag"],
+        metadata={
+            "milestone_status": "proposed",
+            "target": "developer",
+            "fr_ids": [],
+            "work_unit": {},
+            "source": "work_unit",
+            "rank": 0,
+            # Unknown-to-dataclass keys — must survive the migration.
+            "legacy_extra": "preserve_me",
+            "legacy_number": 42,
+        },
+        created_at=now, updated_at=now,
+    ))
+    assert pipeline.milestones.migrate_records_to_project(DEFAULT_PROJECT) == 1
+    raw = pipeline.knowledge.get("ms_legacy_with_extra")
+    assert raw.metadata["project"] == DEFAULT_PROJECT
+    assert raw.metadata["legacy_extra"] == "preserve_me"
+    assert raw.metadata["legacy_number"] == 42
+    # Tags also preserved (including the custom one).
+    assert "custom:tag" in raw.tags

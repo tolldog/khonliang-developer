@@ -1141,3 +1141,38 @@ def test_migrate_records_to_project_is_idempotent(store):
     for idx in range(2):
         raw = store.knowledge.get(f"fr_developer_legacy{idx:02d}")
         assert raw.metadata["project"] == DEFAULT_PROJECT
+
+
+def test_migrate_preserves_unknown_metadata_keys(store):
+    # Legacy record with a metadata key the FR dataclass doesn't know.
+    # Round-trip-through-serializer migration would drop it; in-place
+    # patch approach keeps it.
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="fr_developer_extrakeys",
+        tier=Tier.DERIVED,
+        title="has extras",
+        content="body",
+        source="developer.fr_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["fr", "target:developer", "app", "custom:legacy"],
+        metadata={
+            "fr_status": "open",
+            "priority": "medium",
+            "target": "developer",
+            "legacy_extra": "keep",
+            "legacy_number": 7,
+        },
+        created_at=now, updated_at=now,
+    ))
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 1
+    raw = store.knowledge.get("fr_developer_extrakeys")
+    assert raw.metadata["project"] == DEFAULT_PROJECT
+    assert raw.metadata["legacy_extra"] == "keep"
+    assert raw.metadata["legacy_number"] == 7
+    assert "custom:legacy" in raw.tags

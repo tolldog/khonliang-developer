@@ -1124,3 +1124,32 @@ def test_dogfood_migrate_records_to_project_is_idempotent(store):
     assert store.migrate_records_to_project(DEFAULT_PROJECT) == 0
     raw = store.knowledge.get("dog_legacy01")
     assert raw.metadata["project"] == DEFAULT_PROJECT
+
+
+def test_dogfood_migrate_preserves_unknown_metadata_keys(store):
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="dog_extra_keys",
+        tier=Tier.DERIVED,
+        title="obs with extras",
+        content="observation body",
+        source="developer.dogfood_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["dogfood", "kind:friction", "custom:legacy"],
+        metadata={
+            "dogfood_status": "observed",
+            "kind": "friction",
+            "legacy_extra": "preserve",
+        },
+        created_at=now, updated_at=now,
+    ))
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 1
+    raw = store.knowledge.get("dog_extra_keys")
+    assert raw.metadata["project"] == DEFAULT_PROJECT
+    assert raw.metadata["legacy_extra"] == "preserve"
+    assert "custom:legacy" in raw.tags

@@ -1079,21 +1079,31 @@ class FRStore:
         writes the value into persisted metadata for callers that want
         the data canonicalized rather than fallback-interpreted.
 
+        Narrow contract: patches ONLY ``metadata["project"]``. Clones
+        the existing :class:`KnowledgeEntry` with
+        :func:`dataclasses.replace` and adds the key, preserving every
+        other field (tags, title, content, updated_at) and any unknown
+        metadata keys legacy rows may carry. Re-serializing through
+        :meth:`_store` would rewrite the entry through the current
+        shape and silently drop anything the dataclass doesn't know
+        about, which isn't what "stamp a missing key" promises.
+
         Idempotent: only touches records whose ``metadata.project`` is
         missing or empty. Returns the number of records actually
         rewritten so callers can log / assert the migration ran.
         """
+        import dataclasses
         project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
         rewritten = 0
         for entry in self.knowledge.get_by_tier(Tier.DERIVED):
             if "fr" not in (entry.tags or []):
                 continue
-            meta = entry.metadata or {}
+            meta = dict(entry.metadata or {})
             if meta.get("project"):
                 continue
-            fr = _fr_from_entry(entry)
-            fr.project = project
-            self._store(fr)
+            meta["project"] = project
+            patched = dataclasses.replace(entry, metadata=meta)
+            self.knowledge.add(patched)
             rewritten += 1
         return rewritten
 

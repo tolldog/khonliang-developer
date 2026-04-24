@@ -519,20 +519,23 @@ class DogfoodStore:
     ) -> int:
         """Stamp ``project`` onto dogfood records whose metadata lacks it.
 
+        In-place metadata patch via :func:`dataclasses.replace` — see
+        :meth:`FRStore.migrate_records_to_project` for the rationale
+        around not round-tripping through the dataclass serializer.
         Idempotent; returns the number of records actually rewritten.
-        See :meth:`FRStore.migrate_records_to_project` for rationale.
         """
+        import dataclasses
         project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
         rewritten = 0
         for entry in self.knowledge.get_by_tier(Tier.DERIVED):
             if "dogfood" not in (entry.tags or []):
                 continue
-            meta = entry.metadata or {}
+            meta = dict(entry.metadata or {})
             if meta.get("project"):
                 continue
-            dog = _dogfood_from_entry(entry)
-            dog.project = project
-            self._store(dog)
+            meta["project"] = project
+            patched = dataclasses.replace(entry, metadata=meta)
+            self.knowledge.add(patched)
             rewritten += 1
         return rewritten
 

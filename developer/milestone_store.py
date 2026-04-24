@@ -255,14 +255,21 @@ class MilestoneStore:
         title: str = "",
         summary: str = "",
         source: str = "work_unit",
-        project: str = DEFAULT_PROJECT,
+        project: Optional[str] = None,
     ) -> Milestone:
         """Create or update a proposed milestone from a ranked work unit.
 
-        ``project`` partitions the milestone into a project slug; defaults
-        to :data:`DEFAULT_PROJECT` (Phase 3 of fr_developer_5d0a8711).
-        On re-propose the existing milestone's project is preserved
-        unless the caller explicitly overrides it via this argument.
+        ``project`` partitions the milestone into a project slug (Phase 3
+        of fr_developer_5d0a8711). Semantics:
+
+        - ``None`` (default) means "preserve existing": on re-propose,
+          the stored milestone's project is retained; on first creation,
+          :data:`DEFAULT_PROJECT` is used.
+        - ``""`` normalizes to :data:`DEFAULT_PROJECT`.
+        - An explicit slug (including :data:`DEFAULT_PROJECT` itself)
+          overrides any previously-stored project — that's how callers
+          deliberately move a milestone back to the default project,
+          which a plain-string default couldn't express.
         """
         if not isinstance(work_unit, dict) or not work_unit:
             raise MilestoneError("work_unit is required")
@@ -281,7 +288,12 @@ class MilestoneStore:
                 "target is required when work_unit has missing or ambiguous targets"
             )
 
-        project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
+        # `project=None` means "preserve existing if any"; `""` and any
+        # other value normalize to a concrete slug. The preserve branch
+        # runs below once we know whether there's an existing milestone.
+        preserve_existing_project = project is None
+        if not preserve_existing_project:
+            project = project.strip() or DEFAULT_PROJECT
 
         milestone_title = title.strip() or str(work_unit.get("name") or "FR work unit").strip()
         milestone_summary = summary.strip() or _summarize_work_unit(work_unit)
@@ -298,10 +310,8 @@ class MilestoneStore:
         if existing is not None:
             notes_history = list(existing.notes_history)
             superseded_by = existing.superseded_by
-            # Preserve existing project unless the caller explicitly
-            # asked for a different one (non-default project arg).
-            if project == DEFAULT_PROJECT and existing.project:
-                project = existing.project
+            if preserve_existing_project:
+                project = existing.project or DEFAULT_PROJECT
         else:
             notes_history = [{
                 "at": now,
@@ -309,6 +319,8 @@ class MilestoneStore:
                 "notes": "proposed",
             }]
             superseded_by = ""
+            if preserve_existing_project:
+                project = DEFAULT_PROJECT
         milestone = Milestone(
             id=milestone_id,
             title=milestone_title,
@@ -839,20 +851,23 @@ class MilestoneStore:
     ) -> int:
         """Stamp ``project`` onto milestone records whose metadata lacks it.
 
+        In-place metadata patch via :func:`dataclasses.replace` — see
+        :meth:`FRStore.migrate_records_to_project` for the rationale
+        around not round-tripping through the dataclass serializer.
         Idempotent; returns the number of records actually rewritten.
-        See :meth:`FRStore.migrate_records_to_project` for rationale.
         """
+        import dataclasses
         project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
         rewritten = 0
         for entry in self.knowledge.get_by_tier(Tier.DERIVED):
             if "milestone" not in (entry.tags or []):
                 continue
-            meta = entry.metadata or {}
+            meta = dict(entry.metadata or {})
             if meta.get("project"):
                 continue
-            milestone = _milestone_from_entry(entry)
-            milestone.project = project
-            self._store(milestone)
+            meta["project"] = project
+            patched = dataclasses.replace(entry, metadata=meta)
+            self.knowledge.add(patched)
             rewritten += 1
         return rewritten
 
