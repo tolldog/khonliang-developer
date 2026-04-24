@@ -21,6 +21,8 @@ from khonliang.knowledge.store import (
     Tier,
 )
 
+from developer.project_store import DEFAULT_PROJECT, normalize_project
+
 # The FR store is passed into :meth:`MilestoneStore.delete` as an
 # argument rather than imported here so milestone_store stays free of
 # any hard dependency on fr_store. The only place we need FR state is
@@ -139,6 +141,10 @@ class Milestone:
     superseded_by: str = ""
     created_at: float = 0.0
     updated_at: float = 0.0
+    # Phase 3 of fr_developer_5d0a8711: project as a first-class dimension.
+    # Read-time fallback to DEFAULT_PROJECT keeps pre-existing records
+    # valid; migrate_records_to_project() canonicalizes the metadata.
+    project: str = DEFAULT_PROJECT
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -147,6 +153,7 @@ class Milestone:
             "target": self.target,
             "status": self.status,
             "summary": self.summary,
+            "project": self.project,
             "fr_ids": list(self.fr_ids),
             "work_unit": dict(self.work_unit),
             "source": self.source,
@@ -177,9 +184,21 @@ class MilestoneStore:
         target: str = "",
         status: str = "",
         include_archived: bool = False,
+        project: Optional[str] = None,
     ) -> list[Milestone]:
         if status and status not in ALL_MILESTONE_STATUSES:
             raise MilestoneError(f"status must be one of: {sorted(ALL_MILESTONE_STATUSES)}")
+
+        # Normalize the project filter up front. `None` = all projects;
+        # any string routes through `normalize_project` so "" /
+        # whitespace / padded slugs all behave like the canonical form
+        # rather than disabling the filter or failing to match padded
+        # stored values.
+        normalized_project: Optional[str]
+        if project is None:
+            normalized_project = None
+        else:
+            normalized_project = normalize_project(project)
 
         # Mirror ``update_status``' write-time normalization on the read
         # path: ``archived`` is the legacy synonym for ``abandoned``, so
@@ -206,6 +225,8 @@ class MilestoneStore:
                 continue
             milestone = _milestone_from_entry(entry)
             if target and milestone.target != target:
+                continue
+            if normalized_project is not None and milestone.project != normalized_project:
                 continue
             if status_match and milestone.status not in status_match:
                 continue
@@ -245,8 +266,22 @@ class MilestoneStore:
         title: str = "",
         summary: str = "",
         source: str = "work_unit",
+        project: Optional[str] = None,
     ) -> Milestone:
-        """Create or update a proposed milestone from a ranked work unit."""
+        """Create or update a proposed milestone from a ranked work unit.
+
+        ``project`` partitions the milestone into a project slug (Phase 3
+        of fr_developer_5d0a8711). Semantics:
+
+        - ``None`` (default) means "preserve existing": on re-propose,
+          the stored milestone's project is retained; on first creation,
+          :data:`DEFAULT_PROJECT` is used.
+        - ``""`` normalizes to :data:`DEFAULT_PROJECT`.
+        - An explicit slug (including :data:`DEFAULT_PROJECT` itself)
+          overrides any previously-stored project — that's how callers
+          deliberately move a milestone back to the default project,
+          which a plain-string default couldn't express.
+        """
         if not isinstance(work_unit, dict) or not work_unit:
             raise MilestoneError("work_unit is required")
 
@@ -264,6 +299,15 @@ class MilestoneStore:
                 "target is required when work_unit has missing or ambiguous targets"
             )
 
+        # `project=None` means "preserve existing if any"; any other
+        # value (including `""` / whitespace) routes through
+        # `normalize_project` to get a canonical slug. The preserve
+        # branch runs below once we know whether there's an existing
+        # milestone.
+        preserve_existing_project = project is None
+        if not preserve_existing_project:
+            project = normalize_project(project)
+
         milestone_title = title.strip() or str(work_unit.get("name") or "FR work unit").strip()
         milestone_summary = summary.strip() or _summarize_work_unit(work_unit)
         rank = int(work_unit.get("rank") or 0)
@@ -279,6 +323,8 @@ class MilestoneStore:
         if existing is not None:
             notes_history = list(existing.notes_history)
             superseded_by = existing.superseded_by
+            if preserve_existing_project:
+                project = existing.project or DEFAULT_PROJECT
         else:
             notes_history = [{
                 "at": now,
@@ -286,6 +332,8 @@ class MilestoneStore:
                 "notes": "proposed",
             }]
             superseded_by = ""
+            if preserve_existing_project:
+                project = DEFAULT_PROJECT
         milestone = Milestone(
             id=milestone_id,
             title=milestone_title,
@@ -305,6 +353,7 @@ class MilestoneStore:
             ),
             notes_history=notes_history,
             superseded_by=superseded_by,
+            project=project,
             created_at=created_at,
             updated_at=now,
         )
@@ -788,6 +837,7 @@ class MilestoneStore:
             metadata={
                 "milestone_status": milestone.status,
                 "target": milestone.target,
+                "project": milestone.project or DEFAULT_PROJECT,
                 "fr_ids": list(milestone.fr_ids),
                 "work_unit": dict(milestone.work_unit),
                 "source": milestone.source,
@@ -804,6 +854,44 @@ class MilestoneStore:
         if stored is not None:
             milestone.created_at = stored.created_at
             milestone.updated_at = stored.updated_at
+
+    # ------------------------------------------------------------------
+    # fr_developer_1c5178d2 — project-dimension migration helper
+    # ------------------------------------------------------------------
+
+    def migrate_records_to_project(
+        self, project: str = DEFAULT_PROJECT
+    ) -> int:
+        """Stamp ``project`` onto milestone records whose metadata lacks it.
+
+        In-place metadata patch via :func:`dataclasses.replace` — see
+        :meth:`FRStore.migrate_records_to_project` for the rationale
+        around not round-tripping through the dataclass serializer.
+        Idempotent: only touches records whose ``metadata.project`` is
+        missing, empty, or whitespace-only. Returns the number of
+        records actually rewritten.
+        """
+        import dataclasses
+        project = normalize_project(project)
+        rewritten = 0
+        for entry in self.knowledge.get_by_tier(Tier.DERIVED):
+            if "milestone" not in (entry.tags or []):
+                continue
+            meta = dict(entry.metadata or {})
+            # Match write-side normalization: treat whitespace-only
+            # project values as effectively empty so the migration
+            # doesn't leave records that read-side filters (also
+            # strip-normalized) won't match.
+            existing = meta.get("project")
+            if isinstance(existing, str) and existing.strip():
+                continue
+            if existing is not None and not isinstance(existing, str) and existing:
+                continue
+            meta["project"] = project
+            patched = dataclasses.replace(entry, metadata=meta)
+            self.knowledge.add(patched)
+            rewritten += 1
+        return rewritten
 
 
 def _milestone_from_entry(entry: KnowledgeEntry) -> Milestone:
@@ -824,6 +912,7 @@ def _milestone_from_entry(entry: KnowledgeEntry) -> Milestone:
         draft_spec=meta.get("draft_spec", ""),
         notes_history=list(meta.get("notes_history") or []),
         superseded_by=meta.get("superseded_by", "") or "",
+        project=normalize_project(meta.get("project")),
         created_at=entry.created_at,
         updated_at=entry.updated_at,
     )

@@ -850,3 +850,198 @@ def test_audit_flag_named_force_override_not_force_rollback(pipeline):
     last = jumped.notes_history[-1]
     assert last.get("force_override") is True
     assert "force_rollback" not in last
+
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 of fr_developer_5d0a8711 — project dimension
+# ---------------------------------------------------------------------------
+
+
+def test_milestone_project_defaults_to_khonliang(pipeline):
+    from developer.project_store import DEFAULT_PROJECT
+    m = pipeline.milestones.propose_from_work_unit(_work_unit())
+    assert m.project == DEFAULT_PROJECT
+    raw = pipeline.knowledge.get(m.id)
+    assert raw.metadata["project"] == DEFAULT_PROJECT
+
+
+def test_milestone_project_passes_through_propose(pipeline):
+    m = pipeline.milestones.propose_from_work_unit(
+        _work_unit(), project="sibling-app",
+    )
+    assert m.project == "sibling-app"
+    raw = pipeline.knowledge.get(m.id)
+    assert raw.metadata["project"] == "sibling-app"
+
+
+def test_milestone_list_filters_by_project(pipeline):
+    def _wu(name, fr_ids):
+        return {
+            "name": name,
+            "targets": ["developer"],
+            "rank": 1,
+            "frs": [{"fr_id": fid, "target": "developer", "title": fid} for fid in fr_ids],
+        }
+    alpha = pipeline.milestones.propose_from_work_unit(
+        _wu("A", ["fr_developer_alpha01"]), project="alpha",
+    )
+    beta = pipeline.milestones.propose_from_work_unit(
+        _wu("B", ["fr_developer_beta01"]), project="beta",
+    )
+    alpha_only = pipeline.milestones.list(project="alpha")
+    ids = {m.id for m in alpha_only}
+    assert alpha.id in ids
+    assert beta.id not in ids
+
+
+def test_milestone_migrate_records_to_project_is_idempotent(pipeline):
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    # Legacy milestone missing `project`.
+    pipeline.knowledge.add(KnowledgeEntry(
+        id="ms_developer_legacy01",
+        tier=Tier.DERIVED,
+        title="Legacy MS",
+        content="body",
+        source="developer.milestone_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["milestone", "target:developer", "status:proposed"],
+        metadata={
+            "milestone_status": "proposed",
+            "target": "developer",
+            "fr_ids": [],
+            "work_unit": {},
+            "source": "work_unit",
+            "rank": 0,
+        },
+        created_at=now, updated_at=now,
+    ))
+    # Current entry already has project.
+    pipeline.milestones.propose_from_work_unit(_work_unit())
+
+    assert pipeline.milestones.migrate_records_to_project(DEFAULT_PROJECT) == 1
+    assert pipeline.milestones.migrate_records_to_project(DEFAULT_PROJECT) == 0
+    raw = pipeline.knowledge.get("ms_developer_legacy01")
+    assert raw.metadata["project"] == DEFAULT_PROJECT
+
+
+def test_milestone_propose_project_none_preserves_existing(pipeline):
+    first = pipeline.milestones.propose_from_work_unit(_work_unit(), project="alpha")
+    assert first.project == "alpha"
+    # Re-proposing with project=None MUST preserve "alpha".
+    second = pipeline.milestones.propose_from_work_unit(_work_unit())
+    assert second.project == "alpha"
+
+
+def test_milestone_propose_explicit_default_overrides_existing(pipeline):
+    from developer.project_store import DEFAULT_PROJECT
+    first = pipeline.milestones.propose_from_work_unit(_work_unit(), project="alpha")
+    assert first.project == "alpha"
+    # Explicit DEFAULT_PROJECT must actually override — this was the
+    # Copilot R1 finding: with project=DEFAULT_PROJECT the old default,
+    # there was no way to move a milestone back to the default project.
+    second = pipeline.milestones.propose_from_work_unit(
+        _work_unit(), project=DEFAULT_PROJECT,
+    )
+    assert second.project == DEFAULT_PROJECT
+
+
+def test_migrate_preserves_unknown_metadata_keys(pipeline):
+    # Legacy record with a metadata key the dataclass doesn't know about.
+    # A round-trip-through-serializer migration would drop it; the in-place
+    # patch approach must keep it.
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    pipeline.knowledge.add(KnowledgeEntry(
+        id="ms_legacy_with_extra",
+        tier=Tier.DERIVED,
+        title="with extras",
+        content="body",
+        source="developer.milestone_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["milestone", "target:developer", "status:proposed", "custom:tag"],
+        metadata={
+            "milestone_status": "proposed",
+            "target": "developer",
+            "fr_ids": [],
+            "work_unit": {},
+            "source": "work_unit",
+            "rank": 0,
+            # Unknown-to-dataclass keys — must survive the migration.
+            "legacy_extra": "preserve_me",
+            "legacy_number": 42,
+        },
+        created_at=now, updated_at=now,
+    ))
+    assert pipeline.milestones.migrate_records_to_project(DEFAULT_PROJECT) == 1
+    raw = pipeline.knowledge.get("ms_legacy_with_extra")
+    assert raw.metadata["project"] == DEFAULT_PROJECT
+    assert raw.metadata["legacy_extra"] == "preserve_me"
+    assert raw.metadata["legacy_number"] == 42
+    # Tags also preserved (including the custom one).
+    assert "custom:tag" in raw.tags
+
+
+def test_milestone_legacy_record_reads_as_default_project(pipeline):
+    # Legacy milestone written without a `project` key in metadata — reader
+    # must surface it as DEFAULT_PROJECT without requiring the migration
+    # helper to run first.
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    pipeline.knowledge.add(KnowledgeEntry(
+        id="ms_legacy_read",
+        tier=Tier.DERIVED,
+        title="legacy readback",
+        content="body",
+        source="developer.milestone_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["milestone", "target:developer", "status:proposed"],
+        metadata={
+            "milestone_status": "proposed",
+            "target": "developer",
+            "fr_ids": [],
+            "work_unit": {},
+            "source": "work_unit",
+            "rank": 0,
+        },
+        created_at=now, updated_at=now,
+    ))
+    ms = pipeline.milestones.get("ms_legacy_read")
+    assert ms is not None
+    assert ms.project == DEFAULT_PROJECT
+    # list() also surfaces it.
+    assert any(m.id == "ms_legacy_read" and m.project == DEFAULT_PROJECT
+               for m in pipeline.milestones.list())
+
+
+def test_milestone_list_empty_string_project_filters_for_default(pipeline):
+    default_ms = pipeline.milestones.propose_from_work_unit(_work_unit())
+    # Make a second milestone with a distinct fr_ids set so it gets a
+    # separate id, and pin it to a non-default project.
+    def _wu(fr_id):
+        return {
+            "name": f"WU for {fr_id}",
+            "targets": ["developer"],
+            "rank": 1,
+            "frs": [{"fr_id": fr_id, "target": "developer", "title": fr_id}],
+        }
+    alpha_ms = pipeline.milestones.propose_from_work_unit(
+        _wu("fr_developer_alphafilter"), project="alpha",
+    )
+    filtered = pipeline.milestones.list(project="")
+    ids = {m.id for m in filtered}
+    assert default_ms.id in ids
+    assert alpha_ms.id not in ids

@@ -54,6 +54,8 @@ from khonliang.knowledge.store import (
     Tier,
 )
 
+from developer.project_store import DEFAULT_PROJECT, normalize_project
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -117,6 +119,8 @@ class Bug:
     updated_at: float = 0.0
     notes_history: list[dict] = field(default_factory=list)
     source: Optional[dict[str, Any]] = None
+    # Phase 3 of fr_developer_5d0a8711: project as a first-class dimension.
+    project: str = DEFAULT_PROJECT
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -129,6 +133,7 @@ class Bug:
             "severity": self.severity,
             "status": self.status,
             "reporter": self.reporter,
+            "project": self.project,
             "linked_frs": list(self.linked_frs),
             "linked_pr": self.linked_pr,
             "duplicate_of": self.duplicate_of,
@@ -197,6 +202,7 @@ class BugStore:
         severity_min: str = "",
         status: Optional[Iterable[str] | str] = None,
         include_terminal: bool = False,
+        project: Optional[str] = None,
     ) -> list[Bug]:
         """List bugs in the store.
 
@@ -205,10 +211,24 @@ class BugStore:
         (fixed / wontfix / duplicate). ``"all"`` overrides. ``severity_min``
         filters out anything less severe than the given cutoff (e.g.
         ``"medium"`` keeps medium / high / blocker); must be ``""`` (no
-        filter) or one of the named severities. Ordering is newest
-        ``observed_at`` first.
+        filter) or one of the named severities.
+
+        ``project`` (Phase 3 of fr_developer_5d0a8711): ``None`` returns
+        every project (cross-project view); any string selects a single
+        project, with ``""`` and whitespace normalized to
+        :data:`DEFAULT_PROJECT` so bus/CLI defaults that send an empty
+        string filter for the default project rather than silently
+        bypassing the filter.
+
+        Ordering is newest ``observed_at`` first.
         """
         allowed_statuses = _parse_status_filter(status, include_terminal=include_terminal)
+        # Normalize the project filter. `None` = all projects; any
+        # string routes through `normalize_project` so "" / whitespace
+        # / padded slugs behave like the canonical form rather than
+        # disabling the filter or missing padded stored values.
+        if project is not None:
+            project = normalize_project(project)
         if severity_min:
             if severity_min not in ALLOWED_SEVERITIES:
                 raise BugError(
@@ -226,6 +246,8 @@ class BugStore:
                 continue
             bug = _bug_from_entry(entry)
             if target and bug.target != target:
+                continue
+            if project is not None and bug.project != project:
                 continue
             if allowed_statuses is not None and bug.status not in allowed_statuses:
                 continue
@@ -253,6 +275,7 @@ class BugStore:
         reporter: str = "",
         source: Optional[dict[str, Any]] = None,
         observed_at: Optional[float] = None,
+        project: str = DEFAULT_PROJECT,
     ) -> Bug:
         """File a new bug. Returns the stored :class:`Bug`.
 
@@ -271,7 +294,10 @@ class BugStore:
                 f"severity must be one of {sorted(ALLOWED_SEVERITIES)}, got {severity!r}"
             )
 
-        bug_id = _derive_bug_id(target, title, description, observed_entity)
+        project = normalize_project(project)
+        bug_id = _derive_bug_id(
+            target, title, description, observed_entity, project=project,
+        )
         existing = self.knowledge.get(bug_id)
         if existing is not None:
             # Refuse to overwrite ANY pre-existing entry at this id, not just
@@ -300,6 +326,7 @@ class BugStore:
             severity=severity,
             status=BUG_STATUS_OPEN,
             reporter=reporter,
+            project=project,
             linked_frs=[],
             linked_pr="",
             duplicate_of="",
@@ -538,6 +565,7 @@ class BugStore:
                 "bug_status": bug.status,
                 "severity": bug.severity,
                 "target": bug.target,
+                "project": bug.project or DEFAULT_PROJECT,
                 "reproduction": bug.reproduction,
                 "observed_entity": bug.observed_entity,
                 "observed_at": bug.observed_at,
@@ -556,6 +584,44 @@ class BugStore:
         if stored is not None:
             bug.created_at = stored.created_at
             bug.updated_at = stored.updated_at
+
+    # ------------------------------------------------------------------
+    # fr_developer_1c5178d2 — project-dimension migration helper
+    # ------------------------------------------------------------------
+
+    def migrate_records_to_project(
+        self, project: str = DEFAULT_PROJECT
+    ) -> int:
+        """Stamp ``project`` onto bug records whose metadata lacks it.
+
+        In-place metadata patch via :func:`dataclasses.replace` — see
+        :meth:`FRStore.migrate_records_to_project` for the rationale
+        around not round-tripping through the dataclass serializer.
+        Idempotent: only touches records whose ``metadata.project`` is
+        missing, empty, or whitespace-only. Returns the number of
+        records actually rewritten.
+        """
+        import dataclasses
+        project = normalize_project(project)
+        rewritten = 0
+        for entry in self.knowledge.get_by_tier(Tier.DERIVED):
+            if "bug" not in (entry.tags or []):
+                continue
+            meta = dict(entry.metadata or {})
+            # Match write-side normalization: treat whitespace-only
+            # project values as effectively empty so migration
+            # canonicalizes them instead of leaving rows with a project
+            # that read-side filters won't match.
+            existing = meta.get("project")
+            if isinstance(existing, str) and existing.strip():
+                continue
+            if existing is not None and not isinstance(existing, str) and existing:
+                continue
+            meta["project"] = project
+            patched = dataclasses.replace(entry, metadata=meta)
+            self.knowledge.add(patched)
+            rewritten += 1
+        return rewritten
 
     def _count_bugs(self) -> int:
         count = 0
@@ -621,6 +687,7 @@ def _bug_from_entry(entry: KnowledgeEntry) -> Bug:
         severity=meta.get("severity", BUG_SEVERITY_MEDIUM),
         status=meta.get("bug_status", BUG_STATUS_OPEN),
         reporter=meta.get("reporter", ""),
+        project=normalize_project(meta.get("project")),
         linked_frs=list(meta.get("linked_frs") or []),
         linked_pr=meta.get("linked_pr", ""),
         duplicate_of=meta.get("duplicate_of", ""),
@@ -636,13 +703,30 @@ def _bug_from_entry(entry: KnowledgeEntry) -> Bug:
     )
 
 
-def _derive_bug_id(target: str, title: str, description: str, observed_entity: str) -> str:
-    """Stable bug id per (target, title, description, observed_entity).
+def _derive_bug_id(
+    target: str, title: str, description: str, observed_entity: str,
+    *, project: str = DEFAULT_PROJECT,
+) -> str:
+    """Stable bug id per (target, title, description, observed_entity, project).
 
-    Same content → same id, so re-filing the exact same bug is detected
-    as a collision rather than silently duplicating rows.
+    Same content + same project → same id, so re-filing the exact same
+    bug is detected as a collision rather than silently duplicating rows.
+    Same content in a DIFFERENT project produces a distinct id so
+    multi-project fleets don't cross-contaminate (Phase 3 of
+    fr_developer_5d0a8711).
+
+    ``project`` is only mixed into the hash when it isn't
+    :data:`DEFAULT_PROJECT`. This preserves id stability for existing
+    records (all implicitly at DEFAULT_PROJECT) so legacy dedup keeps
+    working; non-default projects get a namespaced id space.
     """
-    payload = f"{target}:{title}:{description}:{observed_entity}".encode("utf-8")
+    project = normalize_project(project)
+    if project == DEFAULT_PROJECT:
+        payload = f"{target}:{title}:{description}:{observed_entity}".encode("utf-8")
+    else:
+        payload = (
+            f"{target}:{title}:{description}:{observed_entity}:project={project}"
+        ).encode("utf-8")
     digest = hashlib.sha256(payload).hexdigest()[:8]
     return f"bug_{target}_{digest}"
 

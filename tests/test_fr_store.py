@@ -1036,3 +1036,268 @@ def test_to_public_dict_includes_all_fields(store):
     assert d["merged_into"] is None
     assert d["merged_from"] == []
     assert "redirected_from" in d
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 of fr_developer_5d0a8711 — project dimension
+# ---------------------------------------------------------------------------
+
+
+def test_project_defaults_to_khonliang_on_promote(store):
+    from developer.project_store import DEFAULT_PROJECT
+    fr = store.promote(target="developer", title="default proj", description="d")
+    assert fr.project == DEFAULT_PROJECT
+    # Round-trips through the store: the second get sees the same value.
+    assert store.get(fr.id).project == DEFAULT_PROJECT
+
+
+def test_project_is_persisted_in_metadata(store):
+    fr = store.promote(
+        target="developer", title="tag-check", description="d",
+        project="sibling-app",
+    )
+    assert fr.project == "sibling-app"
+    raw = store.knowledge.get(fr.id)
+    assert raw.metadata["project"] == "sibling-app"
+
+
+def test_pre_phase3_record_reads_as_default_project(store):
+    # Simulate a record written before Phase 3 by crafting the
+    # KnowledgeEntry directly without a `project` metadata key.
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="fr_developer_legacy01",
+        tier=Tier.DERIVED,
+        title="Legacy FR",
+        content="legacy body",
+        source="developer.fr_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["fr", "target:developer", "app"],
+        metadata={
+            "fr_status": "open",
+            "priority": "medium",
+            "concept": "",
+            "classification": "app",
+            "target": "developer",
+            # Deliberately no "project" key — simulates pre-Phase-3 data.
+        },
+        created_at=now, updated_at=now,
+    ))
+    fr = store.get("fr_developer_legacy01")
+    assert fr.project == DEFAULT_PROJECT, (
+        "reader should default missing project metadata to DEFAULT_PROJECT"
+    )
+
+
+def test_list_filters_by_project(store):
+    a = store.promote(target="developer", title="a", description="d", project="alpha")
+    b = store.promote(target="developer", title="b", description="d", project="beta")
+    both = store.list()
+    assert {fr.id for fr in both} >= {a.id, b.id}
+    alpha_only = store.list(project="alpha")
+    ids = {fr.id for fr in alpha_only}
+    assert a.id in ids
+    assert b.id not in ids
+
+
+def test_migrate_records_to_project_is_idempotent(store):
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    # Two legacy-shaped entries missing `project`, plus a current entry
+    # written through the normal path (already has the field).
+    for idx in range(2):
+        store.knowledge.add(KnowledgeEntry(
+            id=f"fr_developer_legacy{idx:02d}",
+            tier=Tier.DERIVED,
+            title=f"legacy {idx}",
+            content="body",
+            source="developer.fr_store",
+            scope="development",
+            confidence=1.0,
+            status=EntryStatus.DISTILLED,
+            tags=["fr", "target:developer", "app"],
+            metadata={
+                "fr_status": "open",
+                "priority": "medium",
+                "target": "developer",
+            },
+            created_at=now, updated_at=now,
+        ))
+    current = store.promote(target="developer", title="current", description="d")
+    assert current.project == DEFAULT_PROJECT
+
+    # First run stamps only the 2 legacy ones.
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 2
+    # Idempotent — second run touches nothing.
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 0
+    # All records now carry the project in persisted metadata.
+    for idx in range(2):
+        raw = store.knowledge.get(f"fr_developer_legacy{idx:02d}")
+        assert raw.metadata["project"] == DEFAULT_PROJECT
+
+
+def test_migrate_preserves_unknown_metadata_keys(store):
+    # Legacy record with a metadata key the FR dataclass doesn't know.
+    # Round-trip-through-serializer migration would drop it; in-place
+    # patch approach keeps it.
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="fr_developer_extrakeys",
+        tier=Tier.DERIVED,
+        title="has extras",
+        content="body",
+        source="developer.fr_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["fr", "target:developer", "app", "custom:legacy"],
+        metadata={
+            "fr_status": "open",
+            "priority": "medium",
+            "target": "developer",
+            "legacy_extra": "keep",
+            "legacy_number": 7,
+        },
+        created_at=now, updated_at=now,
+    ))
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 1
+    raw = store.knowledge.get("fr_developer_extrakeys")
+    assert raw.metadata["project"] == DEFAULT_PROJECT
+    assert raw.metadata["legacy_extra"] == "keep"
+    assert raw.metadata["legacy_number"] == 7
+    assert "custom:legacy" in raw.tags
+
+
+def test_merge_propagates_shared_project(store):
+    a = store.promote(target="developer", title="A", description="a", project="alpha")
+    b = store.promote(target="developer", title="B", description="b", project="alpha")
+    merged = store.merge(
+        source_ids=[a.id, b.id],
+        title="A+B",
+        description="combined",
+    )
+    assert merged.project == "alpha", (
+        "merge must inherit project from sources instead of silently "
+        "defaulting to DEFAULT_PROJECT"
+    )
+
+
+def test_merge_rejects_cross_project_sources(store):
+    a = store.promote(target="developer", title="A", description="a", project="alpha")
+    b = store.promote(target="developer", title="B", description="b", project="beta")
+    with pytest.raises(FRError, match="different projects"):
+        store.merge(
+            source_ids=[a.id, b.id],
+            title="A+B",
+            description="combined",
+        )
+
+
+def test_list_empty_string_project_filters_for_default_not_all(store):
+    from developer.project_store import DEFAULT_PROJECT
+    default_fr = store.promote(
+        target="developer", title="default-proj", description="d",
+    )
+    other = store.promote(
+        target="developer", title="other-proj", description="d", project="alpha",
+    )
+    # `project=""` is a common bus/CLI default. Treating it as
+    # "no filter" silently mis-scopes the call to all projects.
+    # Expect: "" normalizes to DEFAULT_PROJECT and scopes to it.
+    filtered = store.list(project="")
+    ids = {f.id for f in filtered}
+    assert default_fr.id in ids
+    assert other.id not in ids
+    # Whitespace normalizes the same way.
+    filtered_ws = store.list(project="   ")
+    ids_ws = {f.id for f in filtered_ws}
+    assert default_fr.id in ids_ws
+    assert other.id not in ids_ws
+    # None still means "all projects".
+    assert {f.id for f in store.list(project=None)} >= {default_fr.id, other.id}
+
+
+def test_migrate_stamps_whitespace_only_project(store):
+    # Legacy record whose metadata has a whitespace-only `project`
+    # value (possible if a previous code path wrote an unnormalized
+    # string). The old `if meta.get("project"): continue` guard would
+    # have left it unfilterable; the current guard treats whitespace
+    # as effectively empty and stamps the canonical default.
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="fr_developer_wsonly",
+        tier=Tier.DERIVED,
+        title="ws only",
+        content="body",
+        source="developer.fr_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["fr", "target:developer", "app"],
+        metadata={
+            "fr_status": "open",
+            "priority": "medium",
+            "target": "developer",
+            "project": "   ",
+        },
+        created_at=now, updated_at=now,
+    ))
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 1
+    raw = store.knowledge.get("fr_developer_wsonly")
+    assert raw.metadata["project"] == DEFAULT_PROJECT
+    # Read-path also surfaces the canonical default because the reader
+    # passes persisted metadata through normalize_project(), which
+    # strips surrounding whitespace and falls back to DEFAULT_PROJECT
+    # for empty/whitespace-only values. The migration then persists
+    # the canonical value so downstream filters work on raw metadata
+    # too.
+    fr = store.get("fr_developer_wsonly")
+    assert fr.project == DEFAULT_PROJECT
+
+
+def test_read_path_strips_padded_project(store):
+    # A record whose persisted metadata is "alpha " (or "\talpha")
+    # must surface through the reader as "alpha" so list(project="alpha")
+    # matches it. Without strip-on-read the stored value stays padded
+    # and no normalized filter will ever find it.
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="fr_developer_padded",
+        tier=Tier.DERIVED,
+        title="padded",
+        content="body",
+        source="developer.fr_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["fr", "target:developer", "app"],
+        metadata={
+            "fr_status": "open",
+            "priority": "medium",
+            "target": "developer",
+            "project": "  alpha\t",
+        },
+        created_at=now, updated_at=now,
+    ))
+    fr = store.get("fr_developer_padded")
+    assert fr.project == "alpha", (
+        "read-path must normalize padded project slugs so filters match"
+    )
+    # And the filter round-trip works too.
+    found = store.list(project="alpha")
+    assert any(f.id == "fr_developer_padded" for f in found)

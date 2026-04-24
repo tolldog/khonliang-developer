@@ -968,3 +968,173 @@ def test_report_gap_bug_propagates_cancellation(pipeline):
         ))
 
 
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 of fr_developer_5d0a8711 — project dimension
+# ---------------------------------------------------------------------------
+
+
+def test_bug_project_defaults_to_khonliang(store):
+    from developer.project_store import DEFAULT_PROJECT
+    bug = store.file_bug(
+        target="developer", title="t", description="d", observed_entity="x",
+    )
+    assert bug.project == DEFAULT_PROJECT
+    assert store.knowledge.get(bug.id).metadata["project"] == DEFAULT_PROJECT
+
+
+def test_bug_project_passes_through_file_bug(store):
+    bug = store.file_bug(
+        target="developer", title="t", description="d",
+        observed_entity="x", project="genealogy",
+    )
+    assert bug.project == "genealogy"
+    assert store.knowledge.get(bug.id).metadata["project"] == "genealogy"
+
+
+def test_bug_list_filters_by_project(store):
+    a = store.file_bug(
+        target="developer", title="A", description="a",
+        observed_entity="x", project="alpha",
+    )
+    b = store.file_bug(
+        target="developer", title="B", description="b",
+        observed_entity="y", project="beta",
+    )
+    alpha_only = store.list_bugs(project="alpha")
+    ids = {bug.id for bug in alpha_only}
+    assert a.id in ids
+    assert b.id not in ids
+
+
+def test_bug_migrate_records_to_project_is_idempotent(store):
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="bug_developer_legacy01",
+        tier=Tier.DERIVED,
+        title="Legacy Bug",
+        content="body",
+        source="developer.bug_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["bug", "target:developer", "severity:medium"],
+        metadata={
+            "bug_status": "open",
+            "severity": "medium",
+            "target": "developer",
+        },
+        created_at=now, updated_at=now,
+    ))
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 1
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 0
+    raw = store.knowledge.get("bug_developer_legacy01")
+    assert raw.metadata["project"] == DEFAULT_PROJECT
+
+
+def test_bug_migrate_preserves_unknown_metadata_keys(store):
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="bug_developer_extrakeys",
+        tier=Tier.DERIVED,
+        title="has extras",
+        content="body",
+        source="developer.bug_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["bug", "target:developer", "severity:medium", "custom:legacy"],
+        metadata={
+            "bug_status": "open",
+            "severity": "medium",
+            "target": "developer",
+            "legacy_extra": "keep_it",
+        },
+        created_at=now, updated_at=now,
+    ))
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 1
+    raw = store.knowledge.get("bug_developer_extrakeys")
+    assert raw.metadata["project"] == DEFAULT_PROJECT
+    assert raw.metadata["legacy_extra"] == "keep_it"
+    assert "custom:legacy" in raw.tags
+
+
+def test_bug_legacy_record_reads_as_default_project(store):
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="bug_developer_legacyread",
+        tier=Tier.DERIVED,
+        title="legacy bug",
+        content="body",
+        source="developer.bug_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["bug", "target:developer", "severity:medium"],
+        metadata={
+            "bug_status": "open",
+            "severity": "medium",
+            "target": "developer",
+        },
+        created_at=now, updated_at=now,
+    ))
+    bug = store.get_bug("bug_developer_legacyread")
+    assert bug is not None
+    assert bug.project == DEFAULT_PROJECT
+    assert any(b.id == "bug_developer_legacyread" and b.project == DEFAULT_PROJECT
+               for b in store.list_bugs())
+
+
+def test_list_bugs_empty_string_project_filters_for_default(store):
+    from developer.project_store import DEFAULT_PROJECT
+    default_bug = store.file_bug(
+        target="developer", title="A", description="d1", observed_entity="e1",
+    )
+    other = store.file_bug(
+        target="developer", title="B", description="d2",
+        observed_entity="e2", project="alpha",
+    )
+    filtered = store.list_bugs(project="")
+    ids = {b.id for b in filtered}
+    assert default_bug.id in ids
+    assert other.id not in ids
+
+
+def test_same_content_across_projects_gets_distinct_ids(store):
+    # Without project in the hash, filing the same content in two
+    # different projects would collide on bug id. Phase 3 partitions
+    # non-default projects so multi-project fleets don't cross-contam.
+    alpha = store.file_bug(
+        target="developer", title="same", description="same",
+        observed_entity="e", project="alpha",
+    )
+    beta = store.file_bug(
+        target="developer", title="same", description="same",
+        observed_entity="e", project="beta",
+    )
+    assert alpha.id != beta.id, (
+        "same content in different projects must produce distinct ids"
+    )
+
+
+def test_default_project_id_stable_across_phase3(store):
+    # A record filed with explicit project=DEFAULT_PROJECT must
+    # produce the SAME id as one filed without the project arg. This
+    # preserves dedup against pre-Phase-3 records that used the old
+    # 4-arg hash.
+    from developer.project_store import DEFAULT_PROJECT
+    from developer.bug_store import _derive_bug_id
+    a = _derive_bug_id("developer", "t", "d", "e")
+    b = _derive_bug_id("developer", "t", "d", "e", project=DEFAULT_PROJECT)
+    c = _derive_bug_id("developer", "t", "d", "e", project="  ")  # normalizes
+    assert a == b == c

@@ -44,6 +44,8 @@ from khonliang.knowledge.store import (
     EntryStatus,
 )
 
+from developer.project_store import DEFAULT_PROJECT, normalize_project
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -123,6 +125,12 @@ class FR:
     created_at: float = 0.0
     updated_at: float = 0.0
     redirected_from: Optional[str] = None
+    # Phase 3 of fr_developer_5d0a8711: project as a first-class dimension.
+    # Records pre-dating this field read back as "khonliang" via the default
+    # in `_fr_from_entry`, so old data keeps working without an explicit
+    # migration pass (though `migrate_records_to_project` is provided to
+    # tidy the metadata once and for all).
+    project: str = DEFAULT_PROJECT
 
     def to_public_dict(self) -> dict[str, Any]:
         """Serializable representation for MCP / JSON consumers."""
@@ -135,6 +143,7 @@ class FR:
             "priority": self.priority,
             "concept": self.concept,
             "classification": self.classification,
+            "project": self.project,
             "backing_papers": list(self.backing_papers),
             "depends_on": list(self.depends_on),
             "branch": self.branch,
@@ -258,6 +267,7 @@ class FRStore:
         target: Optional[str] = None,
         status: Optional[str] = None,
         include_all: bool = False,
+        project: Optional[str] = None,
     ) -> list[FR]:
         """List FRs in the store.
 
@@ -266,7 +276,19 @@ class FRStore:
         (completed, archived, merged).
         Pass ``status=<name>`` to filter to a single status
         (ignores ``include_all`` since it's more specific).
+        Pass ``project=<slug>`` to restrict to one project; ``None``
+        returns every project (cross-project view). Empty / whitespace
+        strings normalize to :data:`DEFAULT_PROJECT` — matches writer
+        normalization and avoids bus/CLI defaults (where ``""`` is
+        common) silently bypassing the filter.
         """
+        # Normalize the project filter once, up front. `None` means
+        # "all projects"; anything else routes through the shared
+        # `normalize_project` helper so `""` / whitespace / padded
+        # slugs all behave like the canonical form rather than
+        # disabling the filter or failing to match.
+        if project is not None:
+            project = normalize_project(project)
         entries = self.knowledge.get_by_tier(Tier.DERIVED)
         frs: list[FR] = []
         for entry in entries:
@@ -274,6 +296,8 @@ class FRStore:
                 continue
             fr = _fr_from_entry(entry)
             if target and fr.target != target:
+                continue
+            if project is not None and fr.project != project:
                 continue
             if status:
                 if fr.status != status:
@@ -300,12 +324,18 @@ class FRStore:
         concept: str = "",
         classification: str = "app",
         backing_papers: Optional[Iterable[str]] = None,
+        project: str = DEFAULT_PROJECT,
     ) -> FR:
         """Create a new FR. Returns the stored :class:`FR`.
 
         ``id`` is derived deterministically from (target, title, concept)
         so re-promoting the same content yields the same id (collision
         detection via pre-existing entry).
+
+        ``project`` partitions the record into a project slug; defaults
+        to :data:`DEFAULT_PROJECT` so pre-Phase-3 callers keep working
+        without changes. See fr_developer_1c5178d2 (Phase 3) for the
+        full rollout plan.
         """
         if not target or not title:
             raise FRError("promote_fr requires non-empty target and title")
@@ -313,6 +343,7 @@ class FRStore:
             raise FRError(
                 f"priority must be one of {sorted(ALLOWED_PRIORITIES)}, got {priority!r}"
             )
+        project = normalize_project(project)
         backing = list(backing_papers or [])
 
         fr_id = _derive_fr_id(target, title, concept)
@@ -331,6 +362,7 @@ class FRStore:
             priority=priority,
             concept=concept,
             classification=classification,
+            project=project,
             backing_papers=backing,
             depends_on=[],
             branch="",
@@ -508,14 +540,30 @@ class FRStore:
                 f"got {len(resolved_sources)}"
             )
 
-        # All sources must target the same project — merging across targets
-        # is almost always a mistake and has no clean semantic.
+        # All sources must target the same target — merging across targets
+        # is almost always a mistake and has no clean semantic. (The word
+        # "target" here is the FR's target agent/app, not the Phase 3
+        # `project` dimension — see the project check right below.)
         targets = {fr.target for fr in resolved_sources}
         if len(targets) > 1:
             raise FRError(
                 f"cannot merge sources with different targets: {sorted(targets)}"
             )
         target = resolved_sources[0].target
+
+        # Phase 3 of fr_developer_5d0a8711: merging across projects has no
+        # clean semantic either. If sources span projects the merge would
+        # silently drop the project dimension (the new FR would default
+        # to DEFAULT_PROJECT regardless of where its inputs came from).
+        # Reject instead, matching the same-target rule's spirit. Source
+        # FRs come from _fr_from_entry, which already normalizes project,
+        # so this set operation compares canonical slugs.
+        projects = {fr.project for fr in resolved_sources}
+        if len(projects) > 1:
+            raise FRError(
+                f"cannot merge sources with different projects: {sorted(projects)}"
+            )
+        project = next(iter(projects))
 
         # Derive priority from sources if not explicit — take the highest.
         effective_priority = priority or _max_priority(
@@ -573,7 +621,9 @@ class FRStore:
 
         now = time.time()
         # New FR starts `open`; the merge doesn't imply the combined work is
-        # planned or in-progress yet.
+        # planned or in-progress yet. `project` inherits from the sources
+        # (they must all agree by the check above) so merged FRs stay in
+        # their originating project's partition.
         new_fr = FR(
             id=new_id,
             target=target,
@@ -583,6 +633,7 @@ class FRStore:
             priority=effective_priority,
             concept=concept,
             classification=classification,
+            project=project,
             backing_papers=combined_papers,
             depends_on=combined_deps,
             branch="",
@@ -893,6 +944,7 @@ class FRStore:
                 "concept": fr.concept,
                 "classification": fr.classification,
                 "target": fr.target,
+                "project": fr.project or DEFAULT_PROJECT,
                 "backing_papers": list(fr.backing_papers),
                 "depends_on": list(fr.depends_on),
                 "branch": fr.branch,
@@ -1042,6 +1094,66 @@ class FRStore:
             fr.updated_at = time.time()
             self._store(fr)
 
+    # ------------------------------------------------------------------
+    # fr_developer_1c5178d2 — project-dimension migration helper
+    # ------------------------------------------------------------------
+
+    def migrate_records_to_project(
+        self, project: str = DEFAULT_PROJECT
+    ) -> int:
+        """Stamp ``project`` onto FR records whose metadata lacks it.
+
+        Read-time fallback in :func:`_fr_from_entry` already surfaces
+        pre-Phase-3 records as ``project=DEFAULT_PROJECT``; this helper
+        writes the value into persisted metadata for callers that want
+        the data canonicalized rather than fallback-interpreted.
+
+        Narrow contract: patches ONLY ``metadata["project"]``. Clones
+        the existing :class:`KnowledgeEntry` with
+        :func:`dataclasses.replace` and adds the key, preserving tags,
+        title, content, and any unknown metadata keys legacy rows may
+        carry. Re-serializing through :meth:`_store` would rewrite the
+        entry through the current shape and silently drop anything the
+        dataclass doesn't know about, which isn't what "stamp a missing
+        key" promises.
+
+        ``updated_at`` is not preserved: ``KnowledgeStore.add`` refreshes
+        its own clock on write to guarantee monotonic timestamps. If the
+        caller needs the original ``updated_at`` retained they must go
+        around this helper.
+
+        Idempotent: only touches records whose ``metadata.project`` is
+        missing, empty, or whitespace-only (write-side and read-side
+        filters strip before comparing, so an unnormalized slug would
+        silently fail to match anything). Returns the number of
+        records actually rewritten so callers can log / assert the
+        migration ran.
+        """
+        import dataclasses
+        project = normalize_project(project)
+        rewritten = 0
+        for entry in self.knowledge.get_by_tier(Tier.DERIVED):
+            if "fr" not in (entry.tags or []):
+                continue
+            meta = dict(entry.metadata or {})
+            # Skip records that already carry an intentional project
+            # slug; stamp the ones whose value is missing, empty, or
+            # whitespace-only so they match read-side filters (which
+            # normalize the same way). We look at the raw stored value
+            # here — not `normalize_project(existing)` — so a record
+            # already pinned to DEFAULT_PROJECT isn't rewritten as a
+            # no-op; only truly-unset records get touched.
+            existing = meta.get("project")
+            if isinstance(existing, str) and existing.strip():
+                continue
+            if existing is not None and not isinstance(existing, str) and existing:
+                continue
+            meta["project"] = project
+            patched = dataclasses.replace(entry, metadata=meta)
+            self.knowledge.add(patched)
+            rewritten += 1
+        return rewritten
+
 
 # ---------------------------------------------------------------------------
 # Module helpers
@@ -1049,7 +1161,19 @@ class FRStore:
 
 
 def _fr_from_entry(entry: KnowledgeEntry) -> FR:
-    """Convert a KnowledgeEntry back into an :class:`FR`."""
+    """Convert a KnowledgeEntry back into an :class:`FR`.
+
+    Records written before fr_developer_1c5178d2 don't have ``project``
+    in their metadata, and records with empty / whitespace-only /
+    non-string ``project`` values are normalized the same way:
+    :func:`normalize_project` coerces the raw metadata value, strips
+    whitespace, and falls back to :data:`DEFAULT_PROJECT` when the
+    result is empty. Readers, writers, list filters, and migration all
+    route through the same helper so filters work regardless of how
+    the stored value was produced. ``migrate_records_to_project`` can
+    stamp the field onto the persisted data once the caller is ready
+    to tidy up.
+    """
     meta = entry.metadata or {}
     return FR(
         id=entry.id,
@@ -1060,6 +1184,7 @@ def _fr_from_entry(entry: KnowledgeEntry) -> FR:
         priority=meta.get("priority", "medium"),
         concept=meta.get("concept", ""),
         classification=meta.get("classification", "app"),
+        project=normalize_project(meta.get("project")),
         backing_papers=list(meta.get("backing_papers") or []),
         depends_on=list(meta.get("depends_on") or []),
         branch=meta.get("branch", ""),

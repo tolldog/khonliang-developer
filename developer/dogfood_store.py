@@ -45,6 +45,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
+from developer.project_store import DEFAULT_PROJECT, normalize_project
 from khonliang.knowledge.store import (
     EntryStatus,
     KnowledgeEntry,
@@ -110,6 +111,8 @@ class Dogfood:
     duplicate_of: str = ""
     notes_history: list[dict] = field(default_factory=list)
     source: Optional[dict[str, Any]] = None
+    # Phase 3 of fr_developer_5d0a8711: project as a first-class dimension.
+    project: str = DEFAULT_PROJECT
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -120,6 +123,7 @@ class Dogfood:
             "context": self.context,
             "reporter": self.reporter,
             "status": self.status,
+            "project": self.project,
             "observed_at": self.observed_at,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -189,6 +193,7 @@ class DogfoodStore:
         status: Optional[Iterable[str] | str] = None,
         include_terminal: bool = False,
         limit: Optional[int] = 20,
+        project: Optional[str] = None,
     ) -> list[Dogfood]:
         """List dogfood entries, newest ``observed_at`` first.
 
@@ -199,8 +204,20 @@ class DogfoodStore:
         Negative values are normalized to ``0`` (returns empty list) to
         match the MCP handler's normalization — callers who want no cap
         must pass ``None`` explicitly.
+
+        ``project`` (Phase 3 of fr_developer_5d0a8711): ``None`` returns
+        every project (cross-project view); any string selects a single
+        project, with ``""`` and whitespace normalized to
+        :data:`DEFAULT_PROJECT` so bus/CLI defaults that send an empty
+        string filter for the default project rather than silently
+        bypassing the filter.
         """
         allowed_statuses = _parse_status_filter(status, include_terminal=include_terminal)
+        # Normalize project filter — None = all projects; any string
+        # routes through `normalize_project` so "" / whitespace /
+        # padded slugs behave like the canonical form.
+        if project is not None:
+            project = normalize_project(project)
         if kind and kind not in ALLOWED_KINDS:
             raise DogfoodError(
                 f"kind must be one of {sorted(ALLOWED_KINDS)}, got {kind!r}"
@@ -215,6 +232,8 @@ class DogfoodStore:
             if kind and d.kind != kind:
                 continue
             if target and d.target != target:
+                continue
+            if project is not None and d.project != project:
                 continue
             if since is not None and d.observed_at < since:
                 continue
@@ -296,6 +315,7 @@ class DogfoodStore:
         reporter: str = "",
         source: Optional[dict[str, Any]] = None,
         observed_at: Optional[float] = None,
+        project: str = DEFAULT_PROJECT,
     ) -> Dogfood:
         """Record a single dogfood observation.
 
@@ -311,9 +331,10 @@ class DogfoodStore:
                 f"kind must be one of {sorted(ALLOWED_KINDS)}, got {kind!r}"
             )
 
+        project = normalize_project(project)
         now = time.time()
         observed = observed_at if observed_at is not None else now
-        dog_id = _derive_dog_id(observation, observed)
+        dog_id = _derive_dog_id(observation, observed, project=project)
         existing = self.knowledge.get(dog_id)
         if existing is not None:
             # Refuse to overwrite ANY pre-existing entry at this id, not just
@@ -323,7 +344,7 @@ class DogfoodStore:
             if "dogfood" in (existing.tags or []):
                 raise DogfoodError(
                     f"dogfood already exists with id {dog_id} "
-                    "(same observation+observed_at as an existing entry)"
+                    "(same observation+observed_at+project as an existing entry)"
                 )
             raise DogfoodError(
                 f"id collision with non-dogfood entry at {dog_id} "
@@ -338,6 +359,7 @@ class DogfoodStore:
             context=context,
             reporter=reporter,
             status=DOGFOOD_STATUS_OBSERVED,
+            project=project,
             observed_at=observed,
             created_at=now,
             updated_at=now,
@@ -482,6 +504,7 @@ class DogfoodStore:
                 "dogfood_status": dog.status,
                 "kind": dog.kind,
                 "target": dog.target,
+                "project": dog.project or DEFAULT_PROJECT,
                 "context": dog.context,
                 "reporter": dog.reporter,
                 "observed_at": dog.observed_at,
@@ -498,6 +521,44 @@ class DogfoodStore:
         if stored is not None:
             dog.created_at = stored.created_at
             dog.updated_at = stored.updated_at
+
+    # ------------------------------------------------------------------
+    # fr_developer_1c5178d2 — project-dimension migration helper
+    # ------------------------------------------------------------------
+
+    def migrate_records_to_project(
+        self, project: str = DEFAULT_PROJECT
+    ) -> int:
+        """Stamp ``project`` onto dogfood records whose metadata lacks it.
+
+        In-place metadata patch via :func:`dataclasses.replace` — see
+        :meth:`FRStore.migrate_records_to_project` for the rationale
+        around not round-tripping through the dataclass serializer.
+        Idempotent: only touches records whose ``metadata.project`` is
+        missing, empty, or whitespace-only. Returns the number of
+        records actually rewritten.
+        """
+        import dataclasses
+        project = normalize_project(project)
+        rewritten = 0
+        for entry in self.knowledge.get_by_tier(Tier.DERIVED):
+            if "dogfood" not in (entry.tags or []):
+                continue
+            meta = dict(entry.metadata or {})
+            # Match write-side normalization: treat whitespace-only
+            # project values as effectively empty so the migration
+            # canonicalizes them instead of leaving rows with a project
+            # that read-side filters won't match.
+            existing = meta.get("project")
+            if isinstance(existing, str) and existing.strip():
+                continue
+            if existing is not None and not isinstance(existing, str) and existing:
+                continue
+            meta["project"] = project
+            patched = dataclasses.replace(entry, metadata=meta)
+            self.knowledge.add(patched)
+            rewritten += 1
+        return rewritten
 
     def _count_dogfood(self) -> int:
         count = 0
@@ -596,6 +657,7 @@ def _dogfood_from_entry(entry: KnowledgeEntry) -> Dogfood:
         context=meta.get("context", ""),
         reporter=meta.get("reporter", ""),
         status=meta.get("dogfood_status", DOGFOOD_STATUS_OBSERVED),
+        project=normalize_project(meta.get("project")),
         observed_at=float(
             meta["observed_at"]
             if meta.get("observed_at") is not None
@@ -610,14 +672,27 @@ def _dogfood_from_entry(entry: KnowledgeEntry) -> Dogfood:
     )
 
 
-def _derive_dog_id(observation: str, observed_at: float) -> str:
-    """Stable dogfood id per (observation, observed_at).
+def _derive_dog_id(
+    observation: str, observed_at: float, *, project: str = DEFAULT_PROJECT,
+) -> str:
+    """Stable dogfood id per (observation, observed_at, project).
 
     ``observed_at`` is included so the same observation logged at two
     distinct moments (e.g. recurring friction) yields distinct ids —
     the store's job is to capture every occurrence, not dedupe.
+    ``project`` is mixed into the hash only when it isn't
+    :data:`DEFAULT_PROJECT`, so existing default-project ids stay
+    stable; non-default projects get a namespaced id space that won't
+    collide with default records that happen to share observation +
+    timestamp. Phase 3 of fr_developer_5d0a8711.
     """
-    payload = f"{observation}|{observed_at:.6f}".encode("utf-8")
+    project = normalize_project(project)
+    if project == DEFAULT_PROJECT:
+        payload = f"{observation}|{observed_at:.6f}".encode("utf-8")
+    else:
+        payload = (
+            f"{observation}|{observed_at:.6f}|project={project}"
+        ).encode("utf-8")
     digest = hashlib.sha256(payload).hexdigest()[:8]
     return f"dog_{digest}"
 

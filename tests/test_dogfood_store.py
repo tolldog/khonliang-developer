@@ -1069,3 +1069,144 @@ def test_dogfood_triage_queue_default_detail_is_compact(pipeline):
     first = result["dogfood"][0]
     assert "kind" in first
     assert "target" in first
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 of fr_developer_5d0a8711 — project dimension
+# ---------------------------------------------------------------------------
+
+
+def test_dogfood_project_defaults_to_khonliang(store):
+    from developer.project_store import DEFAULT_PROJECT
+    dog = store.log_dogfood("first friction")
+    assert dog.project == DEFAULT_PROJECT
+    assert store.knowledge.get(dog.id).metadata["project"] == DEFAULT_PROJECT
+
+
+def test_dogfood_project_passes_through_log(store):
+    dog = store.log_dogfood("alpha friction", project="alpha-app")
+    assert dog.project == "alpha-app"
+    assert store.knowledge.get(dog.id).metadata["project"] == "alpha-app"
+
+
+def test_dogfood_list_filters_by_project(store):
+    import time
+    a = store.log_dogfood("alpha thing", project="alpha", observed_at=time.time() - 1)
+    b = store.log_dogfood("beta thing", project="beta", observed_at=time.time())
+    alpha_only = store.list_dogfood(project="alpha")
+    ids = {d.id for d in alpha_only}
+    assert a.id in ids
+    assert b.id not in ids
+
+
+def test_dogfood_migrate_records_to_project_is_idempotent(store):
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="dog_legacy01",
+        tier=Tier.DERIVED,
+        title="legacy obs",
+        content="legacy obs",
+        source="developer.dogfood_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["dogfood", "kind:friction"],
+        metadata={
+            "dogfood_status": "observed",
+            "kind": "friction",
+        },
+        created_at=now, updated_at=now,
+    ))
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 1
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 0
+    raw = store.knowledge.get("dog_legacy01")
+    assert raw.metadata["project"] == DEFAULT_PROJECT
+
+
+def test_dogfood_migrate_preserves_unknown_metadata_keys(store):
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="dog_extra_keys",
+        tier=Tier.DERIVED,
+        title="obs with extras",
+        content="observation body",
+        source="developer.dogfood_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["dogfood", "kind:friction", "custom:legacy"],
+        metadata={
+            "dogfood_status": "observed",
+            "kind": "friction",
+            "legacy_extra": "preserve",
+        },
+        created_at=now, updated_at=now,
+    ))
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 1
+    raw = store.knowledge.get("dog_extra_keys")
+    assert raw.metadata["project"] == DEFAULT_PROJECT
+    assert raw.metadata["legacy_extra"] == "preserve"
+    assert "custom:legacy" in raw.tags
+
+
+def test_dogfood_legacy_record_reads_as_default_project(store):
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="dog_legacyread",
+        tier=Tier.DERIVED,
+        title="legacy obs",
+        content="legacy obs body",
+        source="developer.dogfood_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["dogfood", "kind:friction"],
+        metadata={
+            "dogfood_status": "observed",
+            "kind": "friction",
+        },
+        created_at=now, updated_at=now,
+    ))
+    d = store.get_dogfood("dog_legacyread")
+    assert d is not None
+    assert d.project == DEFAULT_PROJECT
+    assert any(x.id == "dog_legacyread" and x.project == DEFAULT_PROJECT
+               for x in store.list_dogfood())
+
+
+def test_list_dogfood_empty_string_project_filters_for_default(store):
+    from developer.project_store import DEFAULT_PROJECT
+    import time
+    default_d = store.log_dogfood("default obs", observed_at=time.time() - 1)
+    other = store.log_dogfood("alpha obs", project="alpha", observed_at=time.time())
+    filtered = store.list_dogfood(project="")
+    ids = {d.id for d in filtered}
+    assert default_d.id in ids
+    assert other.id not in ids
+
+
+def test_dogfood_same_obs_across_projects_gets_distinct_ids(store):
+    import time
+    ts = time.time()
+    alpha = store.log_dogfood("friction A", project="alpha", observed_at=ts)
+    beta = store.log_dogfood("friction A", project="beta", observed_at=ts)
+    assert alpha.id != beta.id
+
+
+def test_dogfood_default_project_id_stable_across_phase3():
+    from developer.project_store import DEFAULT_PROJECT
+    from developer.dogfood_store import _derive_dog_id
+    ts = 1234.5
+    a = _derive_dog_id("obs", ts)
+    b = _derive_dog_id("obs", ts, project=DEFAULT_PROJECT)
+    c = _derive_dog_id("obs", ts, project="")
+    assert a == b == c
