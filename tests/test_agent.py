@@ -27,7 +27,9 @@ def test_skill_count(harness):
     #   supersede / update_frs / delete = 4.
     # + integration-point scanner (fr_developer_82fe7309): suggest +
     #   distill = 2.
-    assert len(harness.skills) == 71
+    # + project lifecycle (fr_developer_5d0a8711 Phase 2):
+    #   project_init / list_projects / get_project = 3.
+    assert len(harness.skills) == 74
 
 
 def test_skills_registered(harness):
@@ -75,6 +77,8 @@ def test_skills_registered(harness):
         "update_milestone_frs", "delete_milestone",
         # integration-point scanner (fr_developer_82fe7309)
         "suggest_integration_points", "distill_integration_points",
+        # project lifecycle (fr_developer_5d0a8711 Phase 2)
+        "project_init", "list_projects", "get_project",
     }
     assert harness.skill_names == expected
 
@@ -490,7 +494,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 71
+    assert len(reg.skills) == 74
     assert len(reg.collaborations) == 1
 
 
@@ -1175,3 +1179,121 @@ def test_main_version_flag_prints_and_exits(capsys):
     version_part = out.strip().split(" ", 1)[1]
     assert version_part, "version suffix empty"
     assert version_part != "<unknown>", "resolve_version failed unexpectedly"
+
+
+# -- project lifecycle (fr_developer_5d0a8711 Phase 2) ------------------
+
+
+def test_project_lifecycle_skills_registered(harness):
+    harness.assert_skill_exists("project_init", description="Register")
+    harness.assert_skill_exists("list_projects", description="List")
+    harness.assert_skill_exists("get_project", description="Look up")
+
+
+@pytest.mark.asyncio
+async def test_project_init_creates_record(harness):
+    result = await harness.call("project_init", {
+        "slug": "demo",
+        "repos": "/tmp/a,/tmp/b",
+        "name": "Demo Project",
+        "domain": "software-engineering",
+    })
+    assert result["slug"] == "demo"
+    assert result["name"] == "Demo Project"
+    assert result["domain"] == "software-engineering"
+    assert len(result["repos"]) == 2
+    assert result["status"] == "active"
+    assert result["created_at"] > 0
+
+
+@pytest.mark.asyncio
+async def test_project_init_accepts_json_repos(harness):
+    result = await harness.call("project_init", {
+        "slug": "json-repos",
+        "repos": '[{"path": "/x", "role": "library"}, {"path": "/y", "role": "agent"}]',
+    })
+    roles = [r["role"] for r in result["repos"]]
+    assert roles == ["library", "agent"]
+
+
+@pytest.mark.asyncio
+async def test_project_init_rejects_missing_slug(harness):
+    result = await harness.call("project_init", {"slug": "", "repos": ""})
+    assert "error" in result
+    assert "slug" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_project_init_rejects_duplicate(harness):
+    await harness.call("project_init", {"slug": "dup", "repos": "/a"})
+    result = await harness.call("project_init", {"slug": "dup", "repos": "/b"})
+    assert "error" in result
+    assert "duplicate" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_project_init_rejects_bad_slug(harness):
+    result = await harness.call("project_init", {"slug": "BAD SLUG", "repos": ""})
+    assert "error" in result
+    assert "invalid" in result["error"].lower() or "slug" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_project_init_rejects_bad_config_json(harness):
+    result = await harness.call("project_init", {
+        "slug": "cfg",
+        "repos": "/a",
+        "config": "{ malformed",
+    })
+    assert "error" in result
+    assert "config" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_list_projects_empty(harness):
+    result = await harness.call("list_projects", {})
+    assert result == {"count": 0, "projects": []}
+
+
+@pytest.mark.asyncio
+async def test_list_projects_compact(harness):
+    await harness.call("project_init", {"slug": "alpha", "repos": "/a"})
+    await harness.call("project_init", {"slug": "bravo", "repos": "/b"})
+    result = await harness.call("list_projects", {"detail": "compact"})
+    assert result["count"] == 2
+    assert result["slugs"] == ["alpha", "bravo"]
+
+
+@pytest.mark.asyncio
+async def test_list_projects_full(harness):
+    await harness.call("project_init", {
+        "slug": "full-one",
+        "repos": '[{"path": "/r", "role": "library"}]',
+        "domain": "se",
+    })
+    result = await harness.call("list_projects", {"detail": "full"})
+    assert result["count"] == 1
+    row = result["projects"][0]
+    assert row["slug"] == "full-one"
+    assert row["repos"][0]["role"] == "library"
+    assert row["domain"] == "se"
+
+
+@pytest.mark.asyncio
+async def test_get_project_found(harness):
+    await harness.call("project_init", {"slug": "hit", "repos": "/a"})
+    result = await harness.call("get_project", {"slug": "hit"})
+    assert result["project"]["slug"] == "hit"
+
+
+@pytest.mark.asyncio
+async def test_get_project_missing_returns_none(harness):
+    result = await harness.call("get_project", {"slug": "ghost"})
+    assert result == {"project": None}
+
+
+@pytest.mark.asyncio
+async def test_get_project_rejects_bad_slug(harness):
+    result = await harness.call("get_project", {"slug": "BAD"})
+    assert "error" in result
+    assert "slug" in result["error"].lower()

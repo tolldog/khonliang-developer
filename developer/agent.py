@@ -26,6 +26,53 @@ from typing import Any, Optional
 from khonliang_bus import BaseAgent, Skill, Collaboration, handler
 
 from developer import integration_scan
+from developer.project_store import (
+    ProjectDuplicateError,
+    ProjectStore,
+)
+
+
+def _parse_repos_arg(raw):
+    """Accept comma-list, JSON list, or already-materialized list."""
+
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return []
+        # JSON list wins when the string starts with '['
+        if s.startswith("["):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+        # Comma-separated path list fallback.
+        return [piece.strip() for piece in s.split(",") if piece.strip()]
+    # Unknown shape — delegate rejection to ProjectStore.create().
+    return raw
+
+
+def _parse_json_object_arg(raw, *, field_name: str):
+    """Accept already-dict or JSON-string-encoded dict; empty → None."""
+
+    if raw is None or raw == "" or raw == {}:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"{field_name} is not valid JSON: {e}") from e
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{field_name} must be a JSON object")
+        return parsed
+    raise ValueError(f"{field_name} must be a JSON-encoded object or dict")
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +256,31 @@ class DeveloperAgent(BaseAgent):
                   since="0.1.0"),
             Skill("developer_guide", "Development workflow guide",
                   since="0.1.0"),
+            # Project lifecycle (fr_developer_5d0a8711 Phase 2). Thin
+            # wrappers over ProjectStore; cross-store migration (adding
+            # `project` dimension to FR / milestone / spec / bug / dogfood)
+            # lands in Phase 3.
+            Skill("project_init",
+                  "Register a new project: name, repos, optional domain + config.",
+                  {"slug": {"type": "string", "required": True,
+                            "description": "unique project slug (lowercase a-z0-9 _-)"},
+                   "repos": {"type": "string", "required": True,
+                             "description": "comma-separated repo paths, or JSON list of {path, role, install_name} dicts"},
+                   "name": {"type": "string", "default": ""},
+                   "domain": {"type": "string", "default": "generic"},
+                   "config": {"type": "string", "default": "",
+                              "description": "optional JSON object with project-scoped config overrides"}},
+                  since="0.19.0"),
+            Skill("list_projects",
+                  "List registered projects. Filters retired by default.",
+                  {"include_retired": {"type": "boolean", "default": False},
+                   "detail": {"type": "string", "default": "brief",
+                              "description": "compact / brief / full"}},
+                  since="0.19.0"),
+            Skill("get_project",
+                  "Look up a project by slug. Returns null when missing.",
+                  {"slug": {"type": "string", "required": True}},
+                  since="0.19.0"),
             # Cross-agent skills (use self.request() via bus-lib)
             Skill("get_fr", "Look up an FR from developer's FR store",
                   {"fr_id": {"type": "string", "required": True}},
@@ -784,6 +856,93 @@ class DeveloperAgent(BaseAgent):
     @handler("developer_guide")
     async def handle_developer_guide(self, args):
         return {"guide": self.pipeline.developer_guide_text}
+
+    # ------------------------------------------------------------------
+    # Project lifecycle (fr_developer_5d0a8711 Phase 2)
+    # ------------------------------------------------------------------
+
+    @handler("project_init")
+    async def handle_project_init(self, args):
+        """Create a new project record via ProjectStore.
+
+        Accepts ``repos`` as either a comma-separated string of paths or a
+        JSON-encoded list of dicts. ``config`` is an optional JSON object
+        (string) for per-project overrides. Other fields flow straight
+        through to :meth:`ProjectStore.create`.
+        """
+
+        slug = str(args.get("slug") or "").strip()
+        if not slug:
+            return {"error": "slug is required"}
+
+        repos_raw = args.get("repos")
+        repos = _parse_repos_arg(repos_raw)
+
+        name = str(args.get("name") or "").strip() or None
+        domain = str(args.get("domain") or "generic").strip() or "generic"
+
+        config_raw = args.get("config")
+        config = _parse_json_object_arg(config_raw, field_name="config")
+        if isinstance(config, dict) is False and config is not None:
+            return {"error": "config must be a JSON object (got non-dict)"}
+
+        try:
+            project = self.pipeline.projects_store.create(
+                slug=slug,
+                repos=repos,
+                name=name,
+                domain=domain,
+                config=config or {},
+            )
+        except ProjectDuplicateError as e:
+            return {"error": f"duplicate: {e}"}
+        except (ValueError, TypeError) as e:
+            return {"error": f"invalid argument: {e}"}
+
+        return project.to_dict()
+
+    @handler("list_projects")
+    async def handle_list_projects(self, args):
+        include_retired = bool(args.get("include_retired", False))
+        detail = str(args.get("detail") or "brief")
+
+        projects = self.pipeline.projects_store.list(include_retired=include_retired)
+
+        if detail == "compact":
+            return {
+                "count": len(projects),
+                "slugs": [p.slug for p in projects],
+            }
+        # brief + full share a base shape; full adds the repos[] array.
+        rows = []
+        for p in projects:
+            row = {
+                "slug": p.slug,
+                "name": p.name or p.slug,
+                "domain": p.domain,
+                "status": p.status,
+                "repo_count": len(p.repos),
+            }
+            if detail == "full":
+                row["repos"] = [r.to_dict() for r in p.repos]
+                row["config"] = dict(p.config)
+                row["created_at"] = p.created_at
+                row["updated_at"] = p.updated_at
+            rows.append(row)
+        return {"count": len(rows), "projects": rows}
+
+    @handler("get_project")
+    async def handle_get_project(self, args):
+        slug = str(args.get("slug") or "").strip()
+        if not slug:
+            return {"error": "slug is required"}
+        try:
+            project = self.pipeline.projects_store.get(slug)
+        except ValueError as e:
+            return {"error": f"invalid slug: {e}"}
+        if project is None:
+            return {"project": None}
+        return {"project": project.to_dict()}
 
     # -- researcher evidence/concept skills (via bus-lib self.request) --
 

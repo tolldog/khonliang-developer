@@ -26,6 +26,7 @@ from developer.config import Config
 from developer.dogfood_store import DogfoodStore
 from developer.fr_store import FRStore
 from developer.milestone_store import MilestoneStore
+from developer.project_store import ProjectStore
 from developer.researcher_client import ResearcherClient
 from developer.specs import FR_ID_PATTERN, SpecReader
 
@@ -55,6 +56,7 @@ class Pipeline:
     milestones: MilestoneStore
     bugs: BugStore
     dogfood: DogfoodStore
+    projects_store: ProjectStore
 
     @classmethod
     def from_config(cls, config: Config) -> "Pipeline":
@@ -109,6 +111,12 @@ class Pipeline:
         bugs = BugStore(knowledge=knowledge)
         dogfood = DogfoodStore(knowledge=knowledge)
 
+        # Project store (fr_developer_5d0a8711 Phase 2). Landed empty; the
+        # multi-project productization path populates it via project_init
+        # skills. Existing FR / milestone / spec / bug / dogfood records
+        # remain project-implicit — Phase 3 migrates them.
+        projects_store = ProjectStore(knowledge_store=knowledge)
+
         return cls(
             config=config,
             knowledge=knowledge,
@@ -122,6 +130,7 @@ class Pipeline:
             milestones=milestones,
             bugs=bugs,
             dogfood=dogfood,
+            projects_store=projects_store,
         )
 
 
