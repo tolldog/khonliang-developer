@@ -27,7 +27,7 @@ from khonliang_bus import BaseAgent, Skill, Collaboration, handler
 
 from developer import integration_scan
 from developer import project_ecosystem as _project_ecosystem
-from developer.project_store import ProjectDuplicateError
+from developer.project_store import DEFAULT_PROJECT, ProjectDuplicateError
 
 
 # Forward reference — `_parse_json_dict` is defined further down in this
@@ -393,7 +393,7 @@ class DeveloperAgent(BaseAgent):
                    "work_unit": {"type": "string", "default": "",
                                  "description": "optional JSON work unit; omitted uses next_work_unit"},
                    "project": {"type": "string", "default": "",
-                               "description": "project slug (Phase 3); empty preserves existing on re-propose, defaults to khonliang for new milestones"}},
+                               "description": f"project slug (Phase 3); empty preserves existing on re-propose, defaults to {DEFAULT_PROJECT!r} for new milestones"}},
                   since="0.8.0"),
             Skill("get_milestone", "Look up a developer milestone by id",
                   {"milestone_id": {"type": "string", "required": True}},
@@ -526,7 +526,7 @@ class DeveloperAgent(BaseAgent):
                    "classification": {"type": "string", "default": "app"},
                    "backing_papers": {"type": "string", "default": ""},
                    "project": {"type": "string", "default": "",
-                               "description": "project slug (Phase 3); empty defaults to khonliang"}},
+                               "description": f"project slug (Phase 3); empty defaults to {DEFAULT_PROJECT!r}"}},
                   since="0.4.0"),
             Skill("update_fr_status", "Advance an FR's lifecycle status",
                   {"fr_id": {"type": "string", "required": True},
@@ -701,7 +701,7 @@ class DeveloperAgent(BaseAgent):
                    "severity": {"type": "string", "default": "medium"},
                    "reporter": {"type": "string", "default": ""},
                    "project": {"type": "string", "default": "",
-                               "description": "project slug (Phase 3); empty defaults to khonliang"}},
+                               "description": f"project slug (Phase 3); empty defaults to {DEFAULT_PROJECT!r}"}},
                   since="0.15.0"),
             Skill("list_bugs", "List bugs. Default filters terminal statuses.",
                   {"target": {"type": "string", "default": ""},
@@ -739,7 +739,7 @@ class DeveloperAgent(BaseAgent):
                    "context": {"type": "string", "default": ""},
                    "reporter": {"type": "string", "default": ""},
                    "project": {"type": "string", "default": "",
-                               "description": "project slug (Phase 3); empty defaults to khonliang"}},
+                               "description": f"project slug (Phase 3); empty defaults to {DEFAULT_PROJECT!r}"}},
                   since="0.15.0"),
             Skill("list_dogfood", "List dogfood observations, newest first. "
                   "Default filters terminal statuses.",
@@ -1993,7 +1993,8 @@ class DeveloperAgent(BaseAgent):
             milestones = self.pipeline.milestones.list(
                 target=args.get("target", ""),
                 status=args.get("status", ""),
-                include_archived=bool(args.get("include_archived", False)),
+                # `_bool_arg` — naive bool() treats "false" as True.
+                include_archived=_bool_arg(args, "include_archived", default=False),
                 project=project,
             )
         except MilestoneError as e:
@@ -2344,7 +2345,6 @@ class DeveloperAgent(BaseAgent):
     @handler("promote_fr")
     async def handle_promote_fr(self, args):
         from developer.fr_store import FRError
-        from developer.project_store import DEFAULT_PROJECT
 
         try:
             backing = [p.strip() for p in (args.get("backing_papers") or "").split(",") if p.strip()]
@@ -2502,7 +2502,9 @@ class DeveloperAgent(BaseAgent):
     async def handle_list_frs_local(self, args):
         status = args.get("status") or None
         target = args.get("target") or None
-        include_all = bool(args.get("include_all", False))
+        # `_bool_arg` instead of `bool(...)` — naive bool() treats
+        # "false" / "0" / "no" as True on the bus/CLI string boundary.
+        include_all = _bool_arg(args, "include_all", default=False)
         # Phase 3 pass-through: empty `project` (default bus value) maps
         # to None = "all projects" cross-project view; an explicit slug
         # partitions the query. The store normalizes value shape.
@@ -3088,7 +3090,6 @@ class DeveloperAgent(BaseAgent):
     @handler("file_bug")
     async def handle_file_bug(self, args):
         from developer.bug_store import BugError
-        from developer.project_store import DEFAULT_PROJECT
 
         try:
             project = str(args.get("project") or "").strip() or DEFAULT_PROJECT
@@ -3224,7 +3225,6 @@ class DeveloperAgent(BaseAgent):
         of *capturing* friction stays near-zero.
         """
         from developer.dogfood_store import DogfoodError
-        from developer.project_store import DEFAULT_PROJECT
 
         try:
             project = str(args.get("project") or "").strip() or DEFAULT_PROJECT
