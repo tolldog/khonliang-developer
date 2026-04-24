@@ -30,7 +30,9 @@ def test_skill_count(harness):
     # + project ecosystem introspection (fr_developer_5564b81f): 1.
     # + project lifecycle (fr_developer_5d0a8711 Phase 2):
     #   project_init / list_projects / get_project = 3.
-    assert len(harness.skills) == 75
+    # + pre-push review orchestration (fr_developer_6ecd0c01):
+    #   review_staged_diff = 1.
+    assert len(harness.skills) == 76
 
 
 def test_skills_registered(harness):
@@ -82,6 +84,8 @@ def test_skills_registered(harness):
         "project_ecosystem",
         # project lifecycle (fr_developer_5d0a8711 Phase 2)
         "project_init", "list_projects", "get_project",
+        # pre-push review orchestration (fr_developer_6ecd0c01)
+        "review_staged_diff",
     }
     assert harness.skill_names == expected
 
@@ -568,7 +572,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 75
+    assert len(reg.skills) == 76
     assert len(reg.collaborations) == 1
 
 
@@ -1537,3 +1541,129 @@ async def test_get_project_rejects_bad_slug(harness):
     result = await harness.call("get_project", {"slug": "BAD"})
     assert "error" in result
     assert "slug" in result["error"].lower()
+
+
+# -- review_staged_diff (fr_developer_6ecd0c01) --
+
+
+def test_review_staged_diff_skill_registered(harness):
+    harness.assert_skill_exists("review_staged_diff", description="staged")
+
+
+@pytest.mark.asyncio
+async def test_review_staged_diff_requires_cwd(harness):
+    result = await harness.call("review_staged_diff", {"cwd": ""})
+    assert "error" in result
+    assert "cwd is required" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_review_staged_diff_rejects_empty_staged(harness, git_repo):
+    # Clean git_repo has nothing staged; handler must refuse rather
+    # than calling the reviewer with an empty string.
+    called = {"count": 0}
+
+    async def mock_request(**kwargs):
+        called["count"] += 1
+        return {"result": {}}
+
+    harness.agent.request = mock_request
+    result = await harness.call("review_staged_diff", {"cwd": str(git_repo)})
+    assert "error" in result
+    assert "no staged changes" in result["error"]
+    assert called["count"] == 0, "reviewer must not be invoked when there's no diff"
+
+
+@pytest.mark.asyncio
+async def test_review_staged_diff_forwards_raw_diff(harness, git_repo):
+    # Stage a file mutation so git diff --cached returns real content.
+    # The handler must pipe those raw bytes — not a summary — into
+    # reviewer.review_diff.
+    (git_repo / "a.txt").write_text("first\nsecond line\n")
+    import subprocess
+    subprocess.run(["git", "add", "a.txt"], cwd=str(git_repo), check=True)
+
+    captured: dict = {}
+    fake_review = {
+        "result": {
+            "findings": [],
+            "disposition": "approved",
+            "model": "fake-model",
+        }
+    }
+
+    async def mock_request(**kwargs):
+        captured.update(kwargs)
+        return fake_review
+
+    harness.agent.request = mock_request
+
+    result = await harness.call("review_staged_diff", {
+        "cwd": str(git_repo),
+        "backend": "ollama",
+        "model": "qwen2.5-coder:14b",
+        "severity_floor": "note",
+        "timeout_s": 45,
+    })
+
+    assert result == fake_review["result"]
+
+    # Routing shape: agent_type + operation + timeout.
+    assert captured["agent_type"] == "reviewer"
+    assert captured["operation"] == "review_diff"
+    assert captured["timeout"] == 45
+
+    # Payload: raw diff bytes (not a summary), plus forwarded tunables.
+    forwarded = captured["args"]
+    assert "diff" in forwarded
+    assert forwarded["diff"].startswith("diff --git"), (
+        "review_staged_diff must forward raw `git diff --cached` output; "
+        f"got leading {forwarded['diff'][:40]!r}"
+    )
+    assert "second line" in forwarded["diff"]
+    assert forwarded["backend"] == "ollama"
+    assert forwarded["model"] == "qwen2.5-coder:14b"
+    assert forwarded["severity_floor"] == "note"
+    # context default includes cwd + branch.
+    assert str(git_repo) in forwarded["context"]
+    assert "main" in forwarded["context"]
+
+
+@pytest.mark.asyncio
+async def test_review_staged_diff_caller_context_wins(harness, git_repo):
+    # If the caller sets context explicitly, the handler must not overwrite
+    # it with the cwd/branch default.
+    (git_repo / "a.txt").write_text("first\nb\n")
+    import subprocess
+    subprocess.run(["git", "add", "a.txt"], cwd=str(git_repo), check=True)
+
+    captured: dict = {}
+
+    async def mock_request(**kwargs):
+        captured.update(kwargs)
+        return {"result": {"findings": []}}
+
+    harness.agent.request = mock_request
+
+    await harness.call("review_staged_diff", {
+        "cwd": str(git_repo),
+        "context": "pre-push review for PR #123 (caller-supplied)",
+    })
+    assert captured["args"]["context"] == "pre-push review for PR #123 (caller-supplied)"
+
+
+@pytest.mark.asyncio
+async def test_review_staged_diff_reports_reviewer_failure(harness, git_repo):
+    (git_repo / "a.txt").write_text("first\nb\n")
+    import subprocess
+    subprocess.run(["git", "add", "a.txt"], cwd=str(git_repo), check=True)
+
+    async def mock_request(**kwargs):
+        raise RuntimeError("reviewer offline")
+
+    harness.agent.request = mock_request
+
+    result = await harness.call("review_staged_diff", {"cwd": str(git_repo)})
+    assert "error" in result
+    assert "reviewer request failed" in result["error"]
+    assert "reviewer offline" in result["error"]

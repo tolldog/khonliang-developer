@@ -336,6 +336,19 @@ class GitClient:
         except Exception as e:
             raise GitClientError(f"diff failed: {e}") from e
 
+    def diff_staged(self) -> str:
+        """Return the unified diff of staged changes (``git diff --cached``).
+
+        Feeds review_staged_diff — the "review what I'm about to commit"
+        skill that closes fr_developer_6ecd0c01. Empty string when nothing
+        is staged; callers decide whether that's an error.
+        """
+        repo = self._get_repo()
+        try:
+            return repo.git.diff("--cached")
+        except Exception as e:
+            raise GitClientError(f"diff --cached failed: {e}") from e
+
     # ------------------------------------------------------------------
     # Mutating operations — with guardrails on destructive ones
     # ------------------------------------------------------------------
