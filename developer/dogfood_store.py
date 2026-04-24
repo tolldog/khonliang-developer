@@ -45,7 +45,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
-from developer.project_store import DEFAULT_PROJECT
+from developer.project_store import DEFAULT_PROJECT, normalize_project
 from khonliang.knowledge.store import (
     EntryStatus,
     KnowledgeEntry,
@@ -213,11 +213,11 @@ class DogfoodStore:
         bypassing the filter.
         """
         allowed_statuses = _parse_status_filter(status, include_terminal=include_terminal)
-        # Normalize project filter — None = all projects; anything else
-        # maps ""/whitespace to DEFAULT_PROJECT so bus/CLI defaults
-        # don't silently bypass the filter.
+        # Normalize project filter — None = all projects; any string
+        # routes through `normalize_project` so "" / whitespace /
+        # padded slugs behave like the canonical form.
         if project is not None:
-            project = project.strip() or DEFAULT_PROJECT
+            project = normalize_project(project)
         if kind and kind not in ALLOWED_KINDS:
             raise DogfoodError(
                 f"kind must be one of {sorted(ALLOWED_KINDS)}, got {kind!r}"
@@ -350,7 +350,7 @@ class DogfoodStore:
                 f"(existing tags: {sorted(existing.tags or [])}); refusing to overwrite"
             )
 
-        project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
+        project = normalize_project(project)
         dog = Dogfood(
             id=dog_id,
             observation=observation,
@@ -539,7 +539,7 @@ class DogfoodStore:
         records actually rewritten.
         """
         import dataclasses
-        project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
+        project = normalize_project(project)
         rewritten = 0
         for entry in self.knowledge.get_by_tier(Tier.DERIVED):
             if "dogfood" not in (entry.tags or []):
@@ -657,7 +657,7 @@ def _dogfood_from_entry(entry: KnowledgeEntry) -> Dogfood:
         context=meta.get("context", ""),
         reporter=meta.get("reporter", ""),
         status=meta.get("dogfood_status", DOGFOOD_STATUS_OBSERVED),
-        project=meta.get("project") or DEFAULT_PROJECT,
+        project=normalize_project(meta.get("project")),
         observed_at=float(
             meta["observed_at"]
             if meta.get("observed_at") is not None

@@ -86,6 +86,31 @@ ENTRY_TAG = "project"
 DEFAULT_PROJECT = "khonliang"
 
 
+def normalize_project(value: Any) -> str:
+    """Canonicalize a project slug for read/write/filter consistency.
+
+    Every surface that touches the project dimension routes through
+    this helper so writers, readers, list-filter inputs, and migration
+    checks agree on what counts as "effectively empty". Without it, a
+    record whose persisted metadata is ``"alpha "`` would round-trip
+    through a reader unstripped, while the list filter strips its
+    input — the record becomes unfilterable.
+
+    Rules:
+    - ``None`` or missing → :data:`DEFAULT_PROJECT`.
+    - Any string, including ``""`` or whitespace-only: stripped; if
+      the result is empty, falls back to :data:`DEFAULT_PROJECT`.
+    - Non-string / non-None → coerced via :func:`str`, then stripped.
+      Defensive but not expected in practice; metadata values for
+      ``project`` should always be strings.
+    """
+    if value is None:
+        return DEFAULT_PROJECT
+    if isinstance(value, str):
+        return value.strip() or DEFAULT_PROJECT
+    return str(value).strip() or DEFAULT_PROJECT
+
+
 # ---------------------------------------------------------------------------
 # Domain objects
 # ---------------------------------------------------------------------------

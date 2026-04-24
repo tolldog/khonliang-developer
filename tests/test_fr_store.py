@@ -1265,3 +1265,38 @@ def test_migrate_stamps_whitespace_only_project(store):
     # migration normalizes it so downstream filters work.)
     fr = store.get("fr_developer_wsonly")
     assert fr.project == DEFAULT_PROJECT
+
+
+def test_read_path_strips_padded_project(store):
+    # A record whose persisted metadata is "alpha " (or "\talpha")
+    # must surface through the reader as "alpha" so list(project="alpha")
+    # matches it. Without strip-on-read the stored value stays padded
+    # and no normalized filter will ever find it.
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="fr_developer_padded",
+        tier=Tier.DERIVED,
+        title="padded",
+        content="body",
+        source="developer.fr_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["fr", "target:developer", "app"],
+        metadata={
+            "fr_status": "open",
+            "priority": "medium",
+            "target": "developer",
+            "project": "  alpha\t",
+        },
+        created_at=now, updated_at=now,
+    ))
+    fr = store.get("fr_developer_padded")
+    assert fr.project == "alpha", (
+        "read-path must normalize padded project slugs so filters match"
+    )
+    # And the filter round-trip works too.
+    found = store.list(project="alpha")
+    assert any(f.id == "fr_developer_padded" for f in found)

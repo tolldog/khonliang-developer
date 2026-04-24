@@ -44,7 +44,7 @@ from khonliang.knowledge.store import (
     EntryStatus,
 )
 
-from developer.project_store import DEFAULT_PROJECT
+from developer.project_store import DEFAULT_PROJECT, normalize_project
 
 
 # ---------------------------------------------------------------------------
@@ -283,11 +283,12 @@ class FRStore:
         common) silently bypassing the filter.
         """
         # Normalize the project filter once, up front. `None` means
-        # "all projects"; anything else maps an empty/whitespace value
-        # to DEFAULT_PROJECT so `""` behaves like the documented
-        # default slug rather than disabling the filter.
+        # "all projects"; anything else routes through the shared
+        # `normalize_project` helper so `""` / whitespace / padded
+        # slugs all behave like the canonical form rather than
+        # disabling the filter or failing to match.
         if project is not None:
-            project = project.strip() or DEFAULT_PROJECT
+            project = normalize_project(project)
         entries = self.knowledge.get_by_tier(Tier.DERIVED)
         frs: list[FR] = []
         for entry in entries:
@@ -342,7 +343,7 @@ class FRStore:
             raise FRError(
                 f"priority must be one of {sorted(ALLOWED_PRIORITIES)}, got {priority!r}"
             )
-        project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
+        project = normalize_project(project)
         backing = list(backing_papers or [])
 
         fr_id = _derive_fr_id(target, title, concept)
@@ -554,8 +555,10 @@ class FRStore:
         # clean semantic either. If sources span projects the merge would
         # silently drop the project dimension (the new FR would default
         # to DEFAULT_PROJECT regardless of where its inputs came from).
-        # Reject instead, matching the same-target rule's spirit.
-        projects = {fr.project or DEFAULT_PROJECT for fr in resolved_sources}
+        # Reject instead, matching the same-target rule's spirit. Source
+        # FRs come from _fr_from_entry, which already normalizes project,
+        # so this set operation compares canonical slugs.
+        projects = {fr.project for fr in resolved_sources}
         if len(projects) > 1:
             raise FRError(
                 f"cannot merge sources with different projects: {sorted(projects)}"
@@ -1127,16 +1130,19 @@ class FRStore:
         migration ran.
         """
         import dataclasses
-        project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
+        project = normalize_project(project)
         rewritten = 0
         for entry in self.knowledge.get_by_tier(Tier.DERIVED):
             if "fr" not in (entry.tags or []):
                 continue
             meta = dict(entry.metadata or {})
-            # Match write-side normalization: a whitespace-only value
-            # is effectively empty and should still be stamped,
-            # otherwise the migration leaves records that read-side
-            # filters (normalized via strip+default) can't match.
+            # Skip records that already carry an intentional project
+            # slug; stamp the ones whose value is missing, empty, or
+            # whitespace-only so they match read-side filters (which
+            # normalize the same way). We look at the raw stored value
+            # here — not `normalize_project(existing)` — so a record
+            # already pinned to DEFAULT_PROJECT isn't rewritten as a
+            # no-op; only truly-unset records get touched.
             existing = meta.get("project")
             if isinstance(existing, str) and existing.strip():
                 continue
@@ -1175,7 +1181,7 @@ def _fr_from_entry(entry: KnowledgeEntry) -> FR:
         priority=meta.get("priority", "medium"),
         concept=meta.get("concept", ""),
         classification=meta.get("classification", "app"),
-        project=meta.get("project") or DEFAULT_PROJECT,
+        project=normalize_project(meta.get("project")),
         backing_papers=list(meta.get("backing_papers") or []),
         depends_on=list(meta.get("depends_on") or []),
         branch=meta.get("branch", ""),

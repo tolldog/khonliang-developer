@@ -54,7 +54,7 @@ from khonliang.knowledge.store import (
     Tier,
 )
 
-from developer.project_store import DEFAULT_PROJECT
+from developer.project_store import DEFAULT_PROJECT, normalize_project
 
 
 # ---------------------------------------------------------------------------
@@ -223,12 +223,12 @@ class BugStore:
         Ordering is newest ``observed_at`` first.
         """
         allowed_statuses = _parse_status_filter(status, include_terminal=include_terminal)
-        # Normalize the project filter. `None` = all projects; empty /
-        # whitespace strings map to DEFAULT_PROJECT so bus/CLI defaults
-        # that send "" filter for the default project rather than
-        # silently bypassing the filter.
+        # Normalize the project filter. `None` = all projects; any
+        # string routes through `normalize_project` so "" / whitespace
+        # / padded slugs behave like the canonical form rather than
+        # disabling the filter or missing padded stored values.
         if project is not None:
-            project = project.strip() or DEFAULT_PROJECT
+            project = normalize_project(project)
         if severity_min:
             if severity_min not in ALLOWED_SEVERITIES:
                 raise BugError(
@@ -311,7 +311,7 @@ class BugStore:
                 f"(existing tags: {sorted(existing.tags or [])}); refusing to overwrite"
             )
 
-        project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
+        project = normalize_project(project)
         now = time.time()
         observed = observed_at if observed_at is not None else now
         bug = Bug(
@@ -600,7 +600,7 @@ class BugStore:
         records actually rewritten.
         """
         import dataclasses
-        project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
+        project = normalize_project(project)
         rewritten = 0
         for entry in self.knowledge.get_by_tier(Tier.DERIVED):
             if "bug" not in (entry.tags or []):
@@ -685,7 +685,7 @@ def _bug_from_entry(entry: KnowledgeEntry) -> Bug:
         severity=meta.get("severity", BUG_SEVERITY_MEDIUM),
         status=meta.get("bug_status", BUG_STATUS_OPEN),
         reporter=meta.get("reporter", ""),
-        project=meta.get("project") or DEFAULT_PROJECT,
+        project=normalize_project(meta.get("project")),
         linked_frs=list(meta.get("linked_frs") or []),
         linked_pr=meta.get("linked_pr", ""),
         duplicate_of=meta.get("duplicate_of", ""),

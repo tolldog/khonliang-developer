@@ -21,7 +21,7 @@ from khonliang.knowledge.store import (
     Tier,
 )
 
-from developer.project_store import DEFAULT_PROJECT
+from developer.project_store import DEFAULT_PROJECT, normalize_project
 
 # The FR store is passed into :meth:`MilestoneStore.delete` as an
 # argument rather than imported here so milestone_store stays free of
@@ -190,14 +190,15 @@ class MilestoneStore:
             raise MilestoneError(f"status must be one of: {sorted(ALL_MILESTONE_STATUSES)}")
 
         # Normalize the project filter up front. `None` = all projects;
-        # any string (including "" or whitespace) maps to a concrete
-        # slug, so bus/CLI defaults that send "" filter for the default
-        # project rather than silently disabling the filter.
+        # any string routes through `normalize_project` so "" /
+        # whitespace / padded slugs all behave like the canonical form
+        # rather than disabling the filter or failing to match padded
+        # stored values.
         normalized_project: Optional[str]
         if project is None:
             normalized_project = None
         else:
-            normalized_project = project.strip() or DEFAULT_PROJECT
+            normalized_project = normalize_project(project)
 
         # Mirror ``update_status``' write-time normalization on the read
         # path: ``archived`` is the legacy synonym for ``abandoned``, so
@@ -298,12 +299,14 @@ class MilestoneStore:
                 "target is required when work_unit has missing or ambiguous targets"
             )
 
-        # `project=None` means "preserve existing if any"; `""` and any
-        # other value normalize to a concrete slug. The preserve branch
-        # runs below once we know whether there's an existing milestone.
+        # `project=None` means "preserve existing if any"; any other
+        # value (including `""` / whitespace) routes through
+        # `normalize_project` to get a canonical slug. The preserve
+        # branch runs below once we know whether there's an existing
+        # milestone.
         preserve_existing_project = project is None
         if not preserve_existing_project:
-            project = project.strip() or DEFAULT_PROJECT
+            project = normalize_project(project)
 
         milestone_title = title.strip() or str(work_unit.get("name") or "FR work unit").strip()
         milestone_summary = summary.strip() or _summarize_work_unit(work_unit)
@@ -869,7 +872,7 @@ class MilestoneStore:
         records actually rewritten.
         """
         import dataclasses
-        project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
+        project = normalize_project(project)
         rewritten = 0
         for entry in self.knowledge.get_by_tier(Tier.DERIVED):
             if "milestone" not in (entry.tags or []):
@@ -909,7 +912,7 @@ def _milestone_from_entry(entry: KnowledgeEntry) -> Milestone:
         draft_spec=meta.get("draft_spec", ""),
         notes_history=list(meta.get("notes_history") or []),
         superseded_by=meta.get("superseded_by", "") or "",
-        project=meta.get("project") or DEFAULT_PROJECT,
+        project=normalize_project(meta.get("project")),
         created_at=entry.created_at,
         updated_at=entry.updated_at,
     )
