@@ -1233,7 +1233,10 @@ async def test_project_init_rejects_duplicate(harness):
 
 @pytest.mark.asyncio
 async def test_project_init_rejects_bad_slug(harness):
-    result = await harness.call("project_init", {"slug": "BAD SLUG", "repos": ""})
+    # Provide valid repos so the slug-validation path is what fails.
+    # (After the 'repos required' check landed, passing empty repos would
+    # trip THAT guard first and mask the slug test.)
+    result = await harness.call("project_init", {"slug": "BAD SLUG", "repos": "/a"})
     assert "error" in result
     assert "invalid" in result["error"].lower() or "slug" in result["error"].lower()
 
@@ -1277,23 +1280,40 @@ async def test_project_init_rejects_non_repoable_json_entries(harness):
 
 @pytest.mark.asyncio
 async def test_project_init_rejects_json_object_repos(harness):
-    # A JSON object (not a list) passed as repos should error cleanly,
-    # not fall back to CSV parsing.
+    # A JSON object (not a list) passed as repos MUST error cleanly —
+    # not silently CSV-split into `['{"path":"/x"}']` as a path.
     result = await harness.call("project_init", {
         "slug": "obj-repos",
-        "repos": '[{"path": "/ok"}]',  # sanity: valid list succeeds
+        "repos": '{"path":"/x"}',
     })
-    assert "error" not in result
-    # Now the real check — a bare JSON object as repos (the '['-prefixed
-    # input that decodes to a non-list would hit the strict check).
-    # json.loads('[x]') always decodes to a list, so construct a scenario
-    # where the parse succeeds but normalization rejects it.
+    assert "error" in result
+    err = result["error"].lower()
+    assert "invalid" in err or "json" in err or "list" in err
+
+
+@pytest.mark.asyncio
+async def test_project_init_rejects_empty_repos(harness):
+    # Skill schema says repos is required. Empty after normalization
+    # (empty string, comma-only string, empty JSON list) must error.
+    for empty in ("", "   ", ",,,", "[]"):
+        result = await harness.call("project_init", {
+            "slug": f"empty-{hash(empty) & 0xffff:04x}",
+            "repos": empty,
+        })
+        assert "error" in result, f"empty repos {empty!r} was accepted"
+        assert "repos" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_project_init_accepts_valid_list_repos(harness):
+    # Sanity pair for the rejection tests — the happy path still works.
     result = await harness.call("project_init", {
         "slug": "dict-entries-ok",
-        # Nested list of dicts is legal; test is a sanity pair for above.
         "repos": '[{"path":"/a","role":"library"},{"path":"/b","role":"agent"}]',
     })
     assert "error" not in result
+    roles = [r["role"] for r in result["repos"]]
+    assert roles == ["library", "agent"]
 
 
 @pytest.mark.asyncio

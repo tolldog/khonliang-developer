@@ -32,10 +32,10 @@ from developer.project_store import ProjectDuplicateError
 def _parse_repos_arg(raw):
     """Accept comma-list, JSON list, or already-materialized list.
 
-    A ``[``-prefixed string is treated as **JSON-only** — if JSON decoding
-    fails or the decoded value isn't a list, raises :class:`ValueError`.
-    Falling back to comma-splitting on broken JSON would silently parse
-    fragments like ``[{"path":"/x"`` into garbage repo paths.
+    Strict on JSON-shaped input: any string whose first non-space char is
+    ``[`` or ``{`` is parsed as JSON. If decoding fails OR the decoded
+    value isn't a list, raises :class:`ValueError`. Silently CSV-splitting
+    a JSON object like ``{"path":"/x"}`` would persist a garbage path.
     """
 
     if raw is None or raw == "":
@@ -46,16 +46,21 @@ def _parse_repos_arg(raw):
         s = raw.strip()
         if not s:
             return []
-        # JSON list is strict: starts with '[' → must parse as a list.
-        if s.startswith("["):
+        # Any JSON-shaped string is parsed strictly; both '[...]' and
+        # '{...}' must decode to a list or we raise. Prevents a JSON
+        # object from silently falling through to CSV and producing a
+        # single-element list with the raw object string as a path.
+        if s.startswith("[") or s.startswith("{"):
             try:
                 parsed = json.loads(s)
             except json.JSONDecodeError as e:
                 raise ValueError(f"repos is not valid JSON: {e}") from e
             if not isinstance(parsed, list):
-                raise ValueError("repos JSON must be a list")
+                raise ValueError(
+                    f"repos JSON must be a list (got {type(parsed).__name__})"
+                )
             return parsed
-        # Comma-separated path list fallback (no leading '[').
+        # Comma-separated path list fallback (non-JSON-shaped string).
         return [piece.strip() for piece in s.split(",") if piece.strip()]
     # Unknown shape — delegate rejection to ProjectStore.create().
     return raw
@@ -887,6 +892,11 @@ class DeveloperAgent(BaseAgent):
         # validation errors, so callers see one consistent error shape.
         try:
             repos = _parse_repos_arg(args.get("repos"))
+            # Skill schema marks `repos` required; enforce at least one
+            # repo after normalization. Empty list → {error}, consistent
+            # with the docs and the project-as-1..N-repos contract.
+            if not repos:
+                return {"error": "repos is required (provide at least one path)"}
             config = _parse_json_object_arg(args.get("config"), field_name="config")
             project = self.pipeline.projects_store.create(
                 slug=slug,
