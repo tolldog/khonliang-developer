@@ -331,9 +331,10 @@ class DogfoodStore:
                 f"kind must be one of {sorted(ALLOWED_KINDS)}, got {kind!r}"
             )
 
+        project = normalize_project(project)
         now = time.time()
         observed = observed_at if observed_at is not None else now
-        dog_id = _derive_dog_id(observation, observed)
+        dog_id = _derive_dog_id(observation, observed, project=project)
         existing = self.knowledge.get(dog_id)
         if existing is not None:
             # Refuse to overwrite ANY pre-existing entry at this id, not just
@@ -343,14 +344,13 @@ class DogfoodStore:
             if "dogfood" in (existing.tags or []):
                 raise DogfoodError(
                     f"dogfood already exists with id {dog_id} "
-                    "(same observation+observed_at as an existing entry)"
+                    "(same observation+observed_at+project as an existing entry)"
                 )
             raise DogfoodError(
                 f"id collision with non-dogfood entry at {dog_id} "
                 f"(existing tags: {sorted(existing.tags or [])}); refusing to overwrite"
             )
 
-        project = normalize_project(project)
         dog = Dogfood(
             id=dog_id,
             observation=observation,
@@ -672,14 +672,27 @@ def _dogfood_from_entry(entry: KnowledgeEntry) -> Dogfood:
     )
 
 
-def _derive_dog_id(observation: str, observed_at: float) -> str:
-    """Stable dogfood id per (observation, observed_at).
+def _derive_dog_id(
+    observation: str, observed_at: float, *, project: str = DEFAULT_PROJECT,
+) -> str:
+    """Stable dogfood id per (observation, observed_at, project).
 
     ``observed_at`` is included so the same observation logged at two
     distinct moments (e.g. recurring friction) yields distinct ids —
     the store's job is to capture every occurrence, not dedupe.
+    ``project`` is mixed into the hash only when it isn't
+    :data:`DEFAULT_PROJECT`, so existing default-project ids stay
+    stable; non-default projects get a namespaced id space that won't
+    collide with default records that happen to share observation +
+    timestamp. Phase 3 of fr_developer_5d0a8711.
     """
-    payload = f"{observation}|{observed_at:.6f}".encode("utf-8")
+    project = normalize_project(project)
+    if project == DEFAULT_PROJECT:
+        payload = f"{observation}|{observed_at:.6f}".encode("utf-8")
+    else:
+        payload = (
+            f"{observation}|{observed_at:.6f}|project={project}"
+        ).encode("utf-8")
     digest = hashlib.sha256(payload).hexdigest()[:8]
     return f"dog_{digest}"
 

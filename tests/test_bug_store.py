@@ -1108,3 +1108,33 @@ def test_list_bugs_empty_string_project_filters_for_default(store):
     ids = {b.id for b in filtered}
     assert default_bug.id in ids
     assert other.id not in ids
+
+
+def test_same_content_across_projects_gets_distinct_ids(store):
+    # Without project in the hash, filing the same content in two
+    # different projects would collide on bug id. Phase 3 partitions
+    # non-default projects so multi-project fleets don't cross-contam.
+    alpha = store.file_bug(
+        target="developer", title="same", description="same",
+        observed_entity="e", project="alpha",
+    )
+    beta = store.file_bug(
+        target="developer", title="same", description="same",
+        observed_entity="e", project="beta",
+    )
+    assert alpha.id != beta.id, (
+        "same content in different projects must produce distinct ids"
+    )
+
+
+def test_default_project_id_stable_across_phase3(store):
+    # A record filed with explicit project=DEFAULT_PROJECT must
+    # produce the SAME id as one filed without the project arg. This
+    # preserves dedup against pre-Phase-3 records that used the old
+    # 4-arg hash.
+    from developer.project_store import DEFAULT_PROJECT
+    from developer.bug_store import _derive_bug_id
+    a = _derive_bug_id("developer", "t", "d", "e")
+    b = _derive_bug_id("developer", "t", "d", "e", project=DEFAULT_PROJECT)
+    c = _derive_bug_id("developer", "t", "d", "e", project="  ")  # normalizes
+    assert a == b == c

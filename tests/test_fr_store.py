@@ -1258,11 +1258,12 @@ def test_migrate_stamps_whitespace_only_project(store):
     assert store.migrate_records_to_project(DEFAULT_PROJECT) == 1
     raw = store.knowledge.get("fr_developer_wsonly")
     assert raw.metadata["project"] == DEFAULT_PROJECT
-    # Read-path also surfaces the canonical default (reader uses
-    # `meta.get("project") or DEFAULT_PROJECT`; whitespace is falsy
-    # via `.strip()` but `"   "` is truthy as a string — the read-side
-    # default still kicks in only when the string is falsy. The
-    # migration normalizes it so downstream filters work.)
+    # Read-path also surfaces the canonical default because the reader
+    # passes persisted metadata through normalize_project(), which
+    # strips surrounding whitespace and falls back to DEFAULT_PROJECT
+    # for empty/whitespace-only values. The migration then persists
+    # the canonical value so downstream filters work on raw metadata
+    # too.
     fr = store.get("fr_developer_wsonly")
     assert fr.project == DEFAULT_PROJECT
 

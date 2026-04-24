@@ -294,7 +294,10 @@ class BugStore:
                 f"severity must be one of {sorted(ALLOWED_SEVERITIES)}, got {severity!r}"
             )
 
-        bug_id = _derive_bug_id(target, title, description, observed_entity)
+        project = normalize_project(project)
+        bug_id = _derive_bug_id(
+            target, title, description, observed_entity, project=project,
+        )
         existing = self.knowledge.get(bug_id)
         if existing is not None:
             # Refuse to overwrite ANY pre-existing entry at this id, not just
@@ -311,7 +314,6 @@ class BugStore:
                 f"(existing tags: {sorted(existing.tags or [])}); refusing to overwrite"
             )
 
-        project = normalize_project(project)
         now = time.time()
         observed = observed_at if observed_at is not None else now
         bug = Bug(
@@ -701,13 +703,30 @@ def _bug_from_entry(entry: KnowledgeEntry) -> Bug:
     )
 
 
-def _derive_bug_id(target: str, title: str, description: str, observed_entity: str) -> str:
-    """Stable bug id per (target, title, description, observed_entity).
+def _derive_bug_id(
+    target: str, title: str, description: str, observed_entity: str,
+    *, project: str = DEFAULT_PROJECT,
+) -> str:
+    """Stable bug id per (target, title, description, observed_entity, project).
 
-    Same content → same id, so re-filing the exact same bug is detected
-    as a collision rather than silently duplicating rows.
+    Same content + same project → same id, so re-filing the exact same
+    bug is detected as a collision rather than silently duplicating rows.
+    Same content in a DIFFERENT project produces a distinct id so
+    multi-project fleets don't cross-contaminate (Phase 3 of
+    fr_developer_5d0a8711).
+
+    ``project`` is only mixed into the hash when it isn't
+    :data:`DEFAULT_PROJECT`. This preserves id stability for existing
+    records (all implicitly at DEFAULT_PROJECT) so legacy dedup keeps
+    working; non-default projects get a namespaced id space.
     """
-    payload = f"{target}:{title}:{description}:{observed_entity}".encode("utf-8")
+    project = normalize_project(project)
+    if project == DEFAULT_PROJECT:
+        payload = f"{target}:{title}:{description}:{observed_entity}".encode("utf-8")
+    else:
+        payload = (
+            f"{target}:{title}:{description}:{observed_entity}:project={project}"
+        ).encode("utf-8")
     digest = hashlib.sha256(payload).hexdigest()[:8]
     return f"bug_{target}_{digest}"
 

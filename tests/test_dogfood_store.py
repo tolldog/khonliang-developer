@@ -1192,3 +1192,21 @@ def test_list_dogfood_empty_string_project_filters_for_default(store):
     ids = {d.id for d in filtered}
     assert default_d.id in ids
     assert other.id not in ids
+
+
+def test_dogfood_same_obs_across_projects_gets_distinct_ids(store):
+    import time
+    ts = time.time()
+    alpha = store.log_dogfood("friction A", project="alpha", observed_at=ts)
+    beta = store.log_dogfood("friction A", project="beta", observed_at=ts)
+    assert alpha.id != beta.id
+
+
+def test_dogfood_default_project_id_stable_across_phase3():
+    from developer.project_store import DEFAULT_PROJECT
+    from developer.dogfood_store import _derive_dog_id
+    ts = 1234.5
+    a = _derive_dog_id("obs", ts)
+    b = _derive_dog_id("obs", ts, project=DEFAULT_PROJECT)
+    c = _derive_dog_id("obs", ts, project="")
+    assert a == b == c
