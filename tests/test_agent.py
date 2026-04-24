@@ -1837,20 +1837,38 @@ async def test_list_milestones_filters_by_project(harness):
 
 @pytest.mark.asyncio
 async def test_list_frs_local_string_false_include_all_not_truthy(harness):
-    # Regression: naive bool("false") == True would include terminal
-    # states when a caller sends a JSON/CLI string. _bool_arg treats
-    # "false" / "0" / "no" / "" as falsey.
-    fr = await harness.call("promote_fr", {
+    # Regression: naive bool("false") == True would silently include
+    # terminal-state FRs when a caller sends a JSON/CLI string.
+    # _bool_arg correctly treats "false" / "0" / "no" / "" as falsey.
+    # Seeding a terminal FR and asserting visibility is how this test
+    # actually detects the bug — without a terminal row, include_all
+    # flipping True would go unnoticed.
+    active = await harness.call("promote_fr", {
         "target": "developer", "title": "active", "description": "d",
     })
+    archived = await harness.call("promote_fr", {
+        "target": "developer", "title": "stale", "description": "d",
+    })
+    archived_result = await harness.call("update_fr_status", {
+        "fr_id": archived["fr_id"], "status": "archived",
+    })
+    assert archived_result["status"] == "archived"
+
+    # include_all=True → terminal FR is visible.
+    with_archived = await harness.call("list_frs_local", {"include_all": True})
+    with_ids = {f["id"] for f in with_archived["frs"]}
+    assert archived["fr_id"] in with_ids
+    assert active["fr_id"] in with_ids
+
+    # Falsy string variants must HIDE the terminal FR. If _bool_arg
+    # regressed to naive bool(), "false" would show the archived row.
     for falsey in ("false", "0", "no", "", "FALSE", "  false  "):
         result = await harness.call("list_frs_local", {"include_all": falsey})
         ids = {f["id"] for f in result["frs"]}
-        # active FR stays visible either way; the test asserts the call
-        # didn't flip to include-terminal mode. A terminal FR would only
-        # appear if include_all flipped True. No terminal FRs exist here
-        # so we just validate no crash + shape.
-        assert isinstance(result.get("frs"), list)
+        assert archived["fr_id"] not in ids, (
+            f"include_all={falsey!r} leaked a terminal FR"
+        )
+        assert active["fr_id"] in ids
 
 
 @pytest.mark.asyncio
@@ -1861,10 +1879,32 @@ async def test_list_milestones_string_false_include_archived_not_truthy(harness)
             "frs": [{"fr_id": fr_id, "target": "developer", "title": fr_id}],
         }
     import json
-    # Seed a milestone and leave it proposed (non-archived).
-    await harness.call("propose_milestone_from_work_unit", {
-        "work_unit": json.dumps(_wu("ms", "fr_developer_msa00001")),
+    # Seed one active and one abandoned milestone so the test
+    # actually measures filter behavior, not just call shape.
+    active = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": json.dumps(_wu("active-ms", "fr_developer_msa00001")),
     })
+    to_abandon = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": json.dumps(_wu("abandon-ms", "fr_developer_msb00002")),
+    })
+    abandoned = await harness.call("update_milestone_status", {
+        "milestone_id": to_abandon["milestone"]["id"],
+        "status": "abandoned",
+    })
+    assert abandoned.get("milestone", {}).get("status") == "abandoned" or \
+        abandoned.get("status") == "abandoned"
+
+    # include_archived=True → abandoned milestone visible.
+    with_arc = await harness.call("list_milestones", {"include_archived": True})
+    with_ids = {m["id"] for m in with_arc["milestones"]}
+    assert to_abandon["milestone"]["id"] in with_ids
+    assert active["milestone"]["id"] in with_ids
+
+    # Falsy string variants must HIDE the abandoned milestone.
     for falsey in ("false", "0", "no", ""):
         result = await harness.call("list_milestones", {"include_archived": falsey})
-        assert isinstance(result.get("milestones"), list)
+        ids = {m["id"] for m in result["milestones"]}
+        assert to_abandon["milestone"]["id"] not in ids, (
+            f"include_archived={falsey!r} leaked an abandoned milestone"
+        )
+        assert active["milestone"]["id"] in ids
