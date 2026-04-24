@@ -1476,6 +1476,50 @@ async def test_list_projects_full(harness):
 
 
 @pytest.mark.asyncio
+async def test_list_projects_detail_normalizes_case_and_whitespace(harness):
+    # `  FULL  ` and `BRIEF` must normalize to their lowercase variants so
+    # the response shape matches the declared contract instead of silently
+    # falling back to the brief default for unexpected casing.
+    await harness.call("project_init", {
+        "slug": "normalize-case",
+        "repos": '[{"path": "/r", "role": "library"}]',
+    })
+    result_full = await harness.call("list_projects", {"detail": "  FULL  "})
+    assert result_full["count"] == 1
+    assert "repos" in result_full["projects"][0]  # full shape
+
+    result_compact = await harness.call("list_projects", {"detail": "Compact"})
+    assert "slugs" in result_compact  # compact shape
+
+
+@pytest.mark.asyncio
+async def test_list_projects_unknown_detail_falls_back_to_brief(harness):
+    await harness.call("project_init", {"slug": "unknown-detail", "repos": "/a"})
+    result = await harness.call("list_projects", {"detail": "nonsense"})
+    assert result["count"] == 1
+    row = result["projects"][0]
+    assert "repos" not in row  # not full
+    assert "slugs" not in result  # not compact
+    assert row["slug"] == "unknown-detail"
+
+
+@pytest.mark.asyncio
+async def test_project_init_accepts_config_with_error_key(harness):
+    # Regression: the `_parse_json_dict` helper uses a one-key
+    # `{"error": ...}` dict as its parse-failure sentinel, which conflates
+    # with a user config that legitimately has an "error" key (e.g.
+    # `{"error": "warn"}`). project_init inlines its own JSON parse to
+    # avoid this collision.
+    result = await harness.call("project_init", {
+        "slug": "error-key-config",
+        "repos": "/a",
+        "config": '{"error": "warn"}',
+    })
+    assert "error" not in result
+    assert result["config"] == {"error": "warn"}
+
+
+@pytest.mark.asyncio
 async def test_get_project_found(harness):
     await harness.call("project_init", {"slug": "hit", "repos": "/a"})
     result = await harness.call("get_project", {"slug": "hit"})

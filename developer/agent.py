@@ -909,6 +909,14 @@ class DeveloperAgent(BaseAgent):
         # Argument-shape parsing may raise ValueError — route it through
         # the structured-error response path alongside downstream store
         # validation errors, so callers see one consistent error shape.
+        #
+        # Config parsing is inlined here (rather than using the shared
+        # `_parse_json_dict`) so a legitimate config value like
+        # `{"error": "warn"}` cannot collide with the helper's
+        # one-key `{"error": ...}` parse-failure sentinel. All other
+        # `_parse_json_dict` callers work with opaque dicts where that
+        # collision is vanishingly unlikely; config is user-facing and
+        # `"error"` is a plausible key name.
         try:
             repos = _parse_repos_arg(args.get("repos"))
             # Skill schema marks `repos` required; enforce at least one
@@ -916,17 +924,26 @@ class DeveloperAgent(BaseAgent):
             # with the docs and the project-as-1..N-repos contract.
             if not repos:
                 return {"error": "repos is required (provide at least one path)"}
-            config = _parse_json_dict(args.get("config"))
-            # `_parse_json_dict` returns a one-key {"error": ...} dict on
-            # parse failure. Translate to the handler's structured error.
-            if isinstance(config, dict) and set(config.keys()) == {"error"}:
-                return {"error": f"invalid argument: config: {config['error']}"}
+            raw_config = args.get("config")
+            if raw_config in (None, "", {}):
+                config = {}
+            elif isinstance(raw_config, dict):
+                config = raw_config
+            elif isinstance(raw_config, str):
+                try:
+                    config = json.loads(raw_config)
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"config must be a JSON object: {e.msg}") from e
+                if not isinstance(config, dict):
+                    raise ValueError("config must be a JSON object")
+            else:
+                raise TypeError("config must be a JSON object or JSON-encoded object string")
             project = self.pipeline.projects.create(
                 slug=slug,
                 repos=repos,
                 name=name,
                 domain=domain,
-                config=config or {},
+                config=config,
             )
         except ProjectDuplicateError as e:
             return {"error": f"duplicate: {e}"}
@@ -941,9 +958,14 @@ class DeveloperAgent(BaseAgent):
         # `"0"`, and empty string all correctly stay falsey. Naive
         # `bool(args.get(...))` would treat any non-empty string as True.
         include_retired = _bool_arg(args, "include_retired", default=False)
-        # Strip detail — consistent with other handlers (e.g.
-        # suggest_integration_points). `' full '` → `'full'`.
-        detail = str(args.get("detail") or "brief").strip()
+        # Normalize + clamp detail — match project_ecosystem's behavior so
+        # `' FULL '` → `'full'` and unknown values fall back to `'brief'`
+        # instead of silently producing the brief shape for unrecognized
+        # inputs. Keeps the brief/compact/full contract consistent
+        # across project-scoped skills.
+        detail = str(args.get("detail") or "brief").strip().lower()
+        if detail not in {"compact", "brief", "full"}:
+            detail = "brief"
 
         projects = self.pipeline.projects.list(include_retired=include_retired)
 
