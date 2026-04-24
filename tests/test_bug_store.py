@@ -1064,3 +1064,32 @@ def test_bug_migrate_preserves_unknown_metadata_keys(store):
     assert raw.metadata["project"] == DEFAULT_PROJECT
     assert raw.metadata["legacy_extra"] == "keep_it"
     assert "custom:legacy" in raw.tags
+
+
+def test_bug_legacy_record_reads_as_default_project(store):
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="bug_developer_legacyread",
+        tier=Tier.DERIVED,
+        title="legacy bug",
+        content="body",
+        source="developer.bug_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["bug", "target:developer", "severity:medium"],
+        metadata={
+            "bug_status": "open",
+            "severity": "medium",
+            "target": "developer",
+        },
+        created_at=now, updated_at=now,
+    ))
+    bug = store.get_bug("bug_developer_legacyread")
+    assert bug is not None
+    assert bug.project == DEFAULT_PROJECT
+    assert any(b.id == "bug_developer_legacyread" and b.project == DEFAULT_PROJECT
+               for b in store.list_bugs())

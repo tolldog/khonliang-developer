@@ -1153,3 +1153,31 @@ def test_dogfood_migrate_preserves_unknown_metadata_keys(store):
     assert raw.metadata["project"] == DEFAULT_PROJECT
     assert raw.metadata["legacy_extra"] == "preserve"
     assert "custom:legacy" in raw.tags
+
+
+def test_dogfood_legacy_record_reads_as_default_project(store):
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="dog_legacyread",
+        tier=Tier.DERIVED,
+        title="legacy obs",
+        content="legacy obs body",
+        source="developer.dogfood_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["dogfood", "kind:friction"],
+        metadata={
+            "dogfood_status": "observed",
+            "kind": "friction",
+        },
+        created_at=now, updated_at=now,
+    ))
+    d = store.get_dogfood("dog_legacyread")
+    assert d is not None
+    assert d.project == DEFAULT_PROJECT
+    assert any(x.id == "dog_legacyread" and x.project == DEFAULT_PROJECT
+               for x in store.list_dogfood())

@@ -989,3 +989,39 @@ def test_migrate_preserves_unknown_metadata_keys(pipeline):
     assert raw.metadata["legacy_number"] == 42
     # Tags also preserved (including the custom one).
     assert "custom:tag" in raw.tags
+
+
+def test_milestone_legacy_record_reads_as_default_project(pipeline):
+    # Legacy milestone written without a `project` key in metadata — reader
+    # must surface it as DEFAULT_PROJECT without requiring the migration
+    # helper to run first.
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    pipeline.knowledge.add(KnowledgeEntry(
+        id="ms_legacy_read",
+        tier=Tier.DERIVED,
+        title="legacy readback",
+        content="body",
+        source="developer.milestone_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["milestone", "target:developer", "status:proposed"],
+        metadata={
+            "milestone_status": "proposed",
+            "target": "developer",
+            "fr_ids": [],
+            "work_unit": {},
+            "source": "work_unit",
+            "rank": 0,
+        },
+        created_at=now, updated_at=now,
+    ))
+    ms = pipeline.milestones.get("ms_legacy_read")
+    assert ms is not None
+    assert ms.project == DEFAULT_PROJECT
+    # list() also surfaces it.
+    assert any(m.id == "ms_legacy_read" and m.project == DEFAULT_PROJECT
+               for m in pipeline.milestones.list())

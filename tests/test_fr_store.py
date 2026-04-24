@@ -1176,3 +1176,28 @@ def test_migrate_preserves_unknown_metadata_keys(store):
     assert raw.metadata["legacy_extra"] == "keep"
     assert raw.metadata["legacy_number"] == 7
     assert "custom:legacy" in raw.tags
+
+
+def test_merge_propagates_shared_project(store):
+    a = store.promote(target="developer", title="A", description="a", project="alpha")
+    b = store.promote(target="developer", title="B", description="b", project="alpha")
+    merged = store.merge(
+        source_ids=[a.id, b.id],
+        title="A+B",
+        description="combined",
+    )
+    assert merged.project == "alpha", (
+        "merge must inherit project from sources instead of silently "
+        "defaulting to DEFAULT_PROJECT"
+    )
+
+
+def test_merge_rejects_cross_project_sources(store):
+    a = store.promote(target="developer", title="A", description="a", project="alpha")
+    b = store.promote(target="developer", title="B", description="b", project="beta")
+    with pytest.raises(FRError, match="different projects"):
+        store.merge(
+            source_ids=[a.id, b.id],
+            title="A+B",
+            description="combined",
+        )

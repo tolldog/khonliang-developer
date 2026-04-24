@@ -530,14 +530,28 @@ class FRStore:
                 f"got {len(resolved_sources)}"
             )
 
-        # All sources must target the same project — merging across targets
-        # is almost always a mistake and has no clean semantic.
+        # All sources must target the same target — merging across targets
+        # is almost always a mistake and has no clean semantic. (The word
+        # "target" here is the FR's target agent/app, not the Phase 3
+        # `project` dimension — see the project check right below.)
         targets = {fr.target for fr in resolved_sources}
         if len(targets) > 1:
             raise FRError(
                 f"cannot merge sources with different targets: {sorted(targets)}"
             )
         target = resolved_sources[0].target
+
+        # Phase 3 of fr_developer_5d0a8711: merging across projects has no
+        # clean semantic either. If sources span projects the merge would
+        # silently drop the project dimension (the new FR would default
+        # to DEFAULT_PROJECT regardless of where its inputs came from).
+        # Reject instead, matching the same-target rule's spirit.
+        projects = {fr.project or DEFAULT_PROJECT for fr in resolved_sources}
+        if len(projects) > 1:
+            raise FRError(
+                f"cannot merge sources with different projects: {sorted(projects)}"
+            )
+        project = next(iter(projects))
 
         # Derive priority from sources if not explicit — take the highest.
         effective_priority = priority or _max_priority(
@@ -595,7 +609,9 @@ class FRStore:
 
         now = time.time()
         # New FR starts `open`; the merge doesn't imply the combined work is
-        # planned or in-progress yet.
+        # planned or in-progress yet. `project` inherits from the sources
+        # (they must all agree by the check above) so merged FRs stay in
+        # their originating project's partition.
         new_fr = FR(
             id=new_id,
             target=target,
@@ -605,6 +621,7 @@ class FRStore:
             priority=effective_priority,
             concept=concept,
             classification=classification,
+            project=project,
             backing_papers=combined_papers,
             depends_on=combined_deps,
             branch="",
@@ -1081,12 +1098,17 @@ class FRStore:
 
         Narrow contract: patches ONLY ``metadata["project"]``. Clones
         the existing :class:`KnowledgeEntry` with
-        :func:`dataclasses.replace` and adds the key, preserving every
-        other field (tags, title, content, updated_at) and any unknown
-        metadata keys legacy rows may carry. Re-serializing through
-        :meth:`_store` would rewrite the entry through the current
-        shape and silently drop anything the dataclass doesn't know
-        about, which isn't what "stamp a missing key" promises.
+        :func:`dataclasses.replace` and adds the key, preserving tags,
+        title, content, and any unknown metadata keys legacy rows may
+        carry. Re-serializing through :meth:`_store` would rewrite the
+        entry through the current shape and silently drop anything the
+        dataclass doesn't know about, which isn't what "stamp a missing
+        key" promises.
+
+        ``updated_at`` is not preserved: ``KnowledgeStore.add`` refreshes
+        its own clock on write to guarantee monotonic timestamps. If the
+        caller needs the original ``updated_at`` retained they must go
+        around this helper.
 
         Idempotent: only touches records whose ``metadata.project`` is
         missing or empty. Returns the number of records actually
