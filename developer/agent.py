@@ -855,7 +855,15 @@ class DeveloperAgent(BaseAgent):
             client = getattr(self, "_http", None)
             if client is not None:
                 try:
-                    response = await client.get(f"{self.bus_url.rstrip('/')}/v1/services")
+                    # Explicit 3s timeout per the PR's stated contract —
+                    # don't inherit whatever default `self._http` happens
+                    # to carry, which may be generous (or absent) and let
+                    # this skill hang longer than advertised. Timeout is
+                    # non-fatal just like HTTP 5xx / connect errors.
+                    response = await client.get(
+                        f"{self.bus_url.rstrip('/')}/v1/services",
+                        timeout=3.0,
+                    )
                     response.raise_for_status()
                     services_payload = response.json()
                 except Exception as e:

@@ -256,18 +256,32 @@ def discover_siblings(
 
     ``anchor_dir`` is the directory CONTAINING the starting repo. Returns
     repo root paths (dirs, not pyprojects), sorted alphabetically.
+
+    Read-only introspection — degrades cleanly on filesystem errors
+    (``PermissionError`` / ``OSError`` on ``iterdir``, or on per-child
+    ``is_dir`` / ``is_file`` checks) by returning whatever was collected
+    so far rather than propagating the exception.
     """
 
     if not anchor_dir.is_dir():
         return []
+    try:
+        children = sorted(anchor_dir.iterdir())
+    except (PermissionError, OSError):
+        # Can't list — treat as no siblings. Don't fail the whole skill.
+        return []
     hits: list[Path] = []
-    for child in sorted(anchor_dir.iterdir()):
-        if not child.is_dir():
+    for child in children:
+        try:
+            if not child.is_dir():
+                continue
+            if not child.name.startswith(prefix):
+                continue
+            if (child / "pyproject.toml").is_file():
+                hits.append(child.resolve())
+        except (PermissionError, OSError):
+            # Per-entry stat failure — skip this one, keep going.
             continue
-        if not child.name.startswith(prefix):
-            continue
-        if (child / "pyproject.toml").is_file():
-            hits.append(child.resolve())
         if len(hits) >= max_repos:
             break
     return hits

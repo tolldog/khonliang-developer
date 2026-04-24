@@ -281,6 +281,16 @@ class TestDiscoverSiblings:
     def test_empty_on_missing_anchor(self, tmp_path):
         assert discover_siblings(tmp_path / "does-not-exist", prefix="x-") == []
 
+    def test_degrades_on_permission_error(self, tmp_path, monkeypatch):
+        # Simulate a dir that's stat-able but not listable — read-only
+        # introspection should swallow the error and return [].
+        def boom(self):
+            raise PermissionError("no list for you")
+
+        monkeypatch.setattr(Path, "iterdir", boom)
+        # Anchor doesn't matter — iterdir is the failure point.
+        assert discover_siblings(tmp_path, prefix="x-") == []
+
     def test_respects_max_repos(self, tmp_path):
         for i in range(5):
             _mk_repo(tmp_path, f"foo-{i}", f"foo-{i}")
