@@ -272,14 +272,36 @@ class TestDiscoverProject:
         view = discover_project(anchor)
         assert {r.install_name for r in view.repos} == {"foo-bar", "foo-baz"}
 
-    def test_handles_no_pyproject(self, tmp_path):
+    def test_handles_no_pyproject(self, tmp_path, monkeypatch):
+        # Walk `find_pyproject` only within a controlled subtree so
+        # ancestor pyprojects on the real filesystem don't leak into
+        # the test. Monkeypatch Path.resolve to pin the anchor so
+        # walk-up terminates inside tmp_path.
+        from developer import project_ecosystem as pe
+
+        original_find = pe.find_pyproject
+
+        def bounded_find(start: Path):
+            # Only walk within tmp_path; anything outside returns None,
+            # simulating "no pyproject anywhere up the chain."
+            cur = start.resolve()
+            while True:
+                if tmp_path not in cur.parents and cur != tmp_path:
+                    return None
+                candidate = cur / "pyproject.toml"
+                if candidate.is_file():
+                    return candidate
+                if cur.parent == cur:
+                    return None
+                cur = cur.parent
+
+        monkeypatch.setattr(pe, "find_pyproject", bounded_find)
+
         sub = tmp_path / "nothing-here"
         sub.mkdir()
-        # Anchor has no pyproject at all
         view = discover_project(sub)
-        # Either returns "unknown" (no pyproject found anywhere), or returns
-        # a real project if the walk-up hit one in a parent — accept both.
-        assert view.project in ("unknown", "khonliang-developer", "ecosystem-developer") or isinstance(view.project, str)
+        assert view.project == "unknown"
+        assert "no pyproject" in view.health_summary.lower()
 
     def test_infers_roles_from_name_suffix(self, tmp_path):
         _mk_repo(tmp_path, "es-bus", "es-bus", include="bus")
@@ -325,9 +347,22 @@ class TestParseLiveAgents:
         agents = parse_live_agents(payload)
         assert [a.agent_id for a in agents] == ["good"]
 
-    def test_non_healthy_status(self):
-        agents = parse_live_agents([{"id": "x", "agent_type": "t", "status": "degraded"}])
-        assert agents[0].healthy is False
+    def test_explicit_unhealthy_flips_healthy(self):
+        for bad in ("unhealthy", "failed", "down", "UNHEALTHY", "  Down  "):
+            agents = parse_live_agents([{"id": "x", "agent_type": "t", "status": bad}])
+            assert agents[0].healthy is False, f"{bad!r} should flip healthy off"
+
+    def test_unknown_status_stays_healthy(self):
+        # Healthy-by-default: only the explicit unhealthy-ish set turns the
+        # flag off. "degraded" / "starting" / missing are treated as healthy
+        # — matches the bus schema's implicit default and keeps the parser
+        # forward-compatible with future shapes that omit the field.
+        for s in ("degraded", "starting", "", None, "weird"):
+            item = {"id": "x", "agent_type": "t"}
+            if s is not None:
+                item["status"] = s
+            agents = parse_live_agents([item])
+            assert agents[0].healthy is True, f"{s!r} should NOT flip healthy off"
 
 
 class TestApplyLiveOverlay:

@@ -30,7 +30,6 @@ Role inference rules (heuristic):
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -187,11 +186,13 @@ def install_name_of(pyproject_data: dict[str, Any]) -> str:
 
 
 def import_name_of(pyproject_data: dict[str, Any]) -> str:
-    """Best-effort import-name from setuptools find.include or find.where.
+    """Best-effort import-name from setuptools ``find.include``.
 
     setuptools' ``find.include = ['foo*']`` → import name is ``foo``.
     Falls back to install_name with dashes replaced by underscores when
-    no find config is present.
+    no ``find.include`` config is present. ``find.where`` is intentionally
+    not consulted — the first include pattern is sufficient for every
+    khonliang-style package laid out as ``<pkg>/`` at the repo root.
     """
 
     find = (
@@ -356,17 +357,20 @@ def parse_live_agents(services_payload: Any) -> list[LiveAgent]:
     for item in raw:
         if not isinstance(item, dict):
             continue
+        # Healthy-by-default semantics: only explicit "unhealthy" (or a
+        # known-bad synonym) flips the bit off. Missing status → healthy
+        # (matches the bus schema's implicit default and keeps this parser
+        # forward-compatible with future shapes that may omit the field).
+        status = item.get("status")
+        normalized = status.strip().lower() if isinstance(status, str) else None
+        unhealthy = normalized in {"unhealthy", "failed", "down"}
         out.append(
             LiveAgent(
                 agent_id=str(item.get("id") or ""),
                 agent_type=str(item.get("agent_type") or ""),
                 version=str(item.get("version") or ""),
                 skill_count=int(item.get("skill_count") or 0),
-                healthy=bool(
-                    item.get("status", "").lower() == "healthy"
-                    if isinstance(item.get("status"), str)
-                    else True
-                ),
+                healthy=not unhealthy,
             )
         )
     return out
