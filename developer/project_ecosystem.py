@@ -212,6 +212,18 @@ def import_name_of(pyproject_data: dict[str, Any]) -> str:
     return install.replace("-", "_") if install else ""
 
 
+def _pep503_normalize(name: str) -> str:
+    """Canonicalize a Python distribution name per PEP 503.
+
+    Lowercases and collapses runs of ``-``/``_``/``.`` into a single ``-``.
+    Standard for case-insensitive distribution matching.
+    """
+
+    import re
+
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
 def extract_ecosystem_deps(pyproject_data: dict[str, Any], prefix: str) -> list[str]:
     """Declared runtime deps whose **distribution name** starts with ``prefix``.
 
@@ -223,15 +235,23 @@ def extract_ecosystem_deps(pyproject_data: dict[str, Any], prefix: str) -> list[
     - environment markers: ``pkg; python_version>='3.11'``
     - direct URL refs: ``pkg @ git+https://...``
     - leading whitespace
+
+    Matching is case-insensitive + PEP 503 normalized: ``Khonliang_Bus-Lib``
+    and ``khonliang-bus-lib`` are the same distribution, and a prefix of
+    ``khonliang-`` matches both. Returned names preserve the original
+    casing from pyproject (so round-trips stay readable).
     """
 
     import re
 
     deps = pyproject_data.get("project", {}).get("dependencies") or []
-    out: list[str] = []
     # Distribution-name tokens per PEP 508: letters, digits, dot, dash,
     # underscore. Anything after that terminates the name.
     NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+    prefix_norm = _pep503_normalize(prefix) if prefix else ""
+    # Map normalized → first original-casing seen (preserve original form
+    # on output; dedup on the normalized form).
+    first_original: dict[str, str] = {}
     for raw in deps:
         text = str(raw)
         # `pkg @ git+...` — the name is everything before the `@`.
@@ -241,9 +261,14 @@ def extract_ecosystem_deps(pyproject_data: dict[str, Any], prefix: str) -> list[
         if not match:
             continue
         name = match.group(1).strip()
-        if name.startswith(prefix):
-            out.append(name)
-    return sorted(set(out))
+        if not name:
+            continue
+        norm = _pep503_normalize(name)
+        if prefix_norm and not norm.startswith(prefix_norm):
+            continue
+        first_original.setdefault(norm, name)
+    # Sort by normalized form for stable ordering; emit originals.
+    return [first_original[n] for n in sorted(first_original)]
 
 
 def discover_siblings(

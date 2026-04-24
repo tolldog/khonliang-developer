@@ -822,10 +822,12 @@ class DeveloperAgent(BaseAgent):
             detail = "brief"
 
         # Strip whitespace on the free-form string args so values like
-        # "   " don't become literal path / prefix inputs.
+        # "   " don't become literal path / prefix / domain inputs. For
+        # `domain`, a whitespace-only arg falls back to the default
+        # (matches the schema's stated `default: generic`).
         start_dir_arg = str(args.get("start_dir") or "").strip()
         sibling_prefix = str(args.get("sibling_prefix") or "").strip() or None
-        domain = str(args.get("domain") or "generic")
+        domain = str(args.get("domain") or "generic").strip() or "generic"
         # Use `_bool_arg` for string-bool safety; naive bool() treats
         # "false" / "0" as truthy and would fire bus fetches unintended.
         include_live = _bool_arg(args, "include_live", default=True)

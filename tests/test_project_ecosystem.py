@@ -245,6 +245,42 @@ class TestExtractEcosystemDeps:
             "khonliang-reviewer-lib",
         ]
 
+    def test_case_insensitive_prefix_match(self):
+        # PEP 503 name normalization: dist names are case-insensitive and
+        # `_` / `.` / `-` collapse. Prefix match must follow.
+        data = {
+            "project": {
+                "dependencies": [
+                    "Khonliang-Bus-Lib>=0.1",      # mixed case
+                    "khonliang_researcher_lib",     # underscores
+                    "KHONLIANG.REVIEWER-LIB",       # dot + upper
+                    "unrelated-pkg",
+                ]
+            }
+        }
+        # Prefix itself can be mixed-case; normalizes to `khonliang-`.
+        result = extract_ecosystem_deps(data, "Khonliang-")
+        # Originals are preserved (ordered by normalized form).
+        assert result == [
+            "Khonliang-Bus-Lib",
+            "khonliang_researcher_lib",
+            "KHONLIANG.REVIEWER-LIB",
+        ]
+
+    def test_dedup_uses_normalized_form(self):
+        # Same normalized name written three ways must dedup to ONE entry
+        # (the first one seen, preserving its casing).
+        data = {
+            "project": {
+                "dependencies": [
+                    "Foo-Bar>=0.1",
+                    "foo-bar==0.2",
+                    "FOO_BAR",
+                ]
+            }
+        }
+        assert extract_ecosystem_deps(data, "foo-") == ["Foo-Bar"]
+
 
 # ---------------------------------------------------------------------------
 # Discovery
