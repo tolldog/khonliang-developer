@@ -1653,6 +1653,36 @@ async def test_review_staged_diff_caller_context_wins(harness, git_repo):
 
 
 @pytest.mark.asyncio
+async def test_review_staged_diff_rejects_invalid_timeout(harness, git_repo):
+    # Stage a file so we'd otherwise reach the reviewer-call site; the
+    # handler must refuse before calling self.request() for any timeout
+    # that isn't a positive finite number.
+    (git_repo / "a.txt").write_text("first\nb\n")
+    import subprocess
+    subprocess.run(["git", "add", "a.txt"], cwd=str(git_repo), check=True)
+
+    invocations = {"count": 0}
+
+    async def mock_request(**kwargs):
+        invocations["count"] += 1
+        return {"result": {"findings": []}}
+
+    harness.agent.request = mock_request
+
+    for bad in ("slow", 0, -5, float("inf"), float("nan")):
+        result = await harness.call("review_staged_diff", {
+            "cwd": str(git_repo),
+            "timeout_s": bad,
+        })
+        assert "error" in result, f"timeout_s={bad!r} must be rejected, got {result!r}"
+        assert "timeout_s" in result["error"].lower()
+
+    assert invocations["count"] == 0, (
+        "review_staged_diff must not call reviewer on invalid timeout_s"
+    )
+
+
+@pytest.mark.asyncio
 async def test_review_staged_diff_reports_reviewer_failure(harness, git_repo):
     (git_repo / "a.txt").write_text("first\nb\n")
     import subprocess

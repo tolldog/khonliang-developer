@@ -1074,7 +1074,23 @@ class DeveloperAgent(BaseAgent):
                 branch = "(unknown branch)"
             forwarded["context"] = f"pre-push review of staged changes in {cwd} on {branch}"
 
-        timeout_s = _float_arg(args, "timeout_s", default=120.0)
+        # Validate timeout explicitly. `_float_arg` swallows bad input and
+        # treats numeric 0 as "unset" (because of its `or default` pattern),
+        # which would either mask caller mistakes or pipe a non-positive
+        # timeout into self.request(). Mirror handle_fr_candidates_from_concepts'
+        # validation shape so callers see one consistent error surface.
+        import math
+        raw_timeout = args.get("timeout_s", 120.0)
+        try:
+            timeout_s = float(raw_timeout) if raw_timeout not in (None, "") else 120.0
+        except (TypeError, ValueError):
+            message = f"timeout_s must be a number, got {raw_timeout!r}"
+            await self._safe_report_gap("review_staged_diff", message)
+            return {"error": message}
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            message = f"timeout_s must be a positive finite number, got {raw_timeout!r}"
+            await self._safe_report_gap("review_staged_diff", message)
+            return {"error": message}
 
         try:
             response = await self.request(
