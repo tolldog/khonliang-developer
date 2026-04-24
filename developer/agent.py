@@ -67,7 +67,15 @@ def _parse_repos_arg(raw):
             return parsed
         # Comma-separated path list fallback (non-JSON-shaped string).
         return [piece.strip() for piece in s.split(",") if piece.strip()]
-    # Unknown shape — delegate rejection to ProjectStore.create().
+    # Explicitly reject a dict — ProjectStore.create iterates its arg, and
+    # iterating a dict yields the keys as "paths", persisting garbage.
+    if isinstance(raw, dict):
+        raise ValueError(
+            "repos must be a list of paths / dicts, not a bare dict "
+            "(pass a JSON list or wrap in [...])"
+        )
+    # Unknown shape — delegate rejection to ProjectStore.create() which
+    # raises TypeError for non-str/dict/RepoRef entries.
     return raw
 
 
@@ -266,7 +274,7 @@ class DeveloperAgent(BaseAgent):
             Skill("project_init",
                   "Register a new project: name, repos, optional domain + config.",
                   {"slug": {"type": "string", "required": True,
-                            "description": "unique project slug (lowercase a-z0-9 _-)"},
+                            "description": "unique project slug (1-64 chars; lowercase a-z0-9_-; must start with a letter or digit)"},
                    "repos": {"type": "string", "required": True,
                              "description": "comma-separated repo paths, or JSON list of {path, role, install_name} dicts"},
                    "name": {"type": "string", "default": ""},

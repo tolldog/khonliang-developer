@@ -1292,6 +1292,20 @@ async def test_project_init_rejects_json_object_repos(harness):
 
 
 @pytest.mark.asyncio
+async def test_project_init_rejects_bare_dict_repos(harness):
+    # Bare dict (not a JSON string — actual dict) gets iterated as keys
+    # by ProjectStore unless we intercept. Explicit rejection keeps
+    # the error surface consistent with the JSON-object-as-string case.
+    result = await harness.call("project_init", {
+        "slug": "dict-repos",
+        "repos": {"path": "/x", "role": "library"},  # real dict, not JSON string
+    })
+    assert "error" in result
+    err = result["error"].lower()
+    assert "invalid" in err or "list" in err or "dict" in err
+
+
+@pytest.mark.asyncio
 async def test_project_init_rejects_empty_repos(harness):
     # Skill schema says repos is required. Empty after normalization
     # (empty string, comma-only string, empty JSON list) must error.
