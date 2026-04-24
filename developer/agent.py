@@ -961,7 +961,7 @@ class DeveloperAgent(BaseAgent):
         try:
             project = self.pipeline.projects.get(slug)
         except ValueError as e:
-            return {"error": f"invalid slug: {e}"}
+            return {"error": f"invalid argument: {e}"}
         if project is None:
             return {"project": None}
         return {"project": project.to_dict()}

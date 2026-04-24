@@ -1309,9 +1309,9 @@ async def test_project_init_rejects_bare_dict_repos(harness):
 async def test_project_init_rejects_empty_repos(harness):
     # Skill schema says repos is required. Empty after normalization
     # (empty string, comma-only string, empty JSON list) must error.
-    for empty in ("", "   ", ",,,", "[]"):
+    for index, empty in enumerate(("", "   ", ",,,", "[]")):
         result = await harness.call("project_init", {
-            "slug": f"empty-{hash(empty) & 0xffff:04x}",
+            "slug": f"empty-{index}",
             "repos": empty,
         })
         assert "error" in result, f"empty repos {empty!r} was accepted"
