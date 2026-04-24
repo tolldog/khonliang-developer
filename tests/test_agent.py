@@ -1344,7 +1344,7 @@ async def test_list_projects_include_retired_string_false_not_truthy(harness):
         created_at=1.0,
         updated_at=1.0,
     )
-    pipeline.projects_store._put(retired)
+    pipeline.projects._put(retired)
 
     # Sanity: default hides the retired one.
     default = await harness.call("list_projects", {})

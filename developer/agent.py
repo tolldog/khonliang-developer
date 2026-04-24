@@ -29,6 +29,11 @@ from developer import integration_scan
 from developer.project_store import ProjectDuplicateError
 
 
+# Forward reference — `_parse_json_dict` is defined further down in this
+# module (lifecycle skills land ahead of it in source order). Imported via
+# late name-lookup at call time, so the forward reference is fine.
+
+
 def _parse_repos_arg(raw):
     """Accept comma-list, JSON list, or already-materialized list.
 
@@ -66,22 +71,11 @@ def _parse_repos_arg(raw):
     return raw
 
 
-def _parse_json_object_arg(raw, *, field_name: str):
-    """Accept already-dict or JSON-string-encoded dict; empty → None."""
-
-    if raw is None or raw == "" or raw == {}:
-        return None
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"{field_name} is not valid JSON: {e}") from e
-        if not isinstance(parsed, dict):
-            raise ValueError(f"{field_name} must be a JSON object")
-        return parsed
-    raise ValueError(f"{field_name} must be a JSON-encoded object or dict")
+# (Removed duplicate `_parse_json_object_arg` — use `_parse_json_dict`
+# defined later in this file. That helper returns either a parsed dict
+# or a one-key {"error": "..."} dict; handlers translate the error-shape
+# into the structured {error: ...} response path. One JSON-object-parse
+# convention for the whole module.)
 
 logger = logging.getLogger(__name__)
 
@@ -897,8 +891,12 @@ class DeveloperAgent(BaseAgent):
             # with the docs and the project-as-1..N-repos contract.
             if not repos:
                 return {"error": "repos is required (provide at least one path)"}
-            config = _parse_json_object_arg(args.get("config"), field_name="config")
-            project = self.pipeline.projects_store.create(
+            config = _parse_json_dict(args.get("config"))
+            # `_parse_json_dict` returns a one-key {"error": ...} dict on
+            # parse failure. Translate to the handler's structured error.
+            if isinstance(config, dict) and set(config.keys()) == {"error"}:
+                return {"error": f"invalid argument: config: {config['error']}"}
+            project = self.pipeline.projects.create(
                 slug=slug,
                 repos=repos,
                 name=name,
@@ -918,9 +916,11 @@ class DeveloperAgent(BaseAgent):
         # `"0"`, and empty string all correctly stay falsey. Naive
         # `bool(args.get(...))` would treat any non-empty string as True.
         include_retired = _bool_arg(args, "include_retired", default=False)
-        detail = str(args.get("detail") or "brief")
+        # Strip detail — consistent with other handlers (e.g.
+        # suggest_integration_points). `' full '` → `'full'`.
+        detail = str(args.get("detail") or "brief").strip()
 
-        projects = self.pipeline.projects_store.list(include_retired=include_retired)
+        projects = self.pipeline.projects.list(include_retired=include_retired)
 
         if detail == "compact":
             return {
@@ -951,7 +951,7 @@ class DeveloperAgent(BaseAgent):
         if not slug:
             return {"error": "slug is required"}
         try:
-            project = self.pipeline.projects_store.get(slug)
+            project = self.pipeline.projects.get(slug)
         except ValueError as e:
             return {"error": f"invalid slug: {e}"}
         if project is None:

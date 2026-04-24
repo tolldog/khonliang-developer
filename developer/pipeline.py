@@ -56,7 +56,7 @@ class Pipeline:
     milestones: MilestoneStore
     bugs: BugStore
     dogfood: DogfoodStore
-    projects_store: ProjectStore
+    projects: ProjectStore
 
     @classmethod
     def from_config(cls, config: Config) -> "Pipeline":
@@ -115,7 +115,7 @@ class Pipeline:
         # multi-project productization path populates it via project_init
         # skills. Existing FR / milestone / spec / bug / dogfood records
         # remain project-implicit — Phase 3 migrates them.
-        projects_store = ProjectStore(knowledge_store=knowledge)
+        projects = ProjectStore(knowledge_store=knowledge)
 
         return cls(
             config=config,
@@ -130,7 +130,7 @@ class Pipeline:
             milestones=milestones,
             bugs=bugs,
             dogfood=dogfood,
-            projects_store=projects_store,
+            projects=projects,
         )
 
 
