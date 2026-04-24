@@ -96,8 +96,13 @@ class RepoRef:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RepoRef":
+        # Normalize path early: `None` and whitespace-only must NOT survive as
+        # a truthy str (str(None) == 'None', " " is truthy). Later validation
+        # relies on `if not ref.path` which breaks without this normalization.
+        raw_path = data.get("path")
+        path = (raw_path or "").strip() if isinstance(raw_path, str) or raw_path is None else str(raw_path).strip()
         return cls(
-            path=str(data.get("path", "")),
+            path=path,
             role=str(data.get("role") or PROJECT_ROLE_APP),
             install_name=str(data.get("install_name") or ""),
         )
@@ -171,12 +176,27 @@ def _validate_status(status: str) -> None:
 
 
 def _normalize_repos(repos: Iterable[Any]) -> list[RepoRef]:
-    """Accept either ``str`` (path-only) or ``dict`` with path/role/install_name."""
+    """Normalize a ``repos`` arg into a list of :class:`RepoRef`.
+
+    Accepted shapes per entry: ``str`` (path-only), ``dict`` with
+    path/role/install_name, or :class:`RepoRef` instance.
+
+    Note: a bare ``str`` for ``repos`` is treated as a single-repo list —
+    iterating a string would otherwise produce one RepoRef per character,
+    a well-known footgun. Passing ``repos="/a"`` is equivalent to
+    ``repos=["/a"]``.
+    """
+
+    # Guard the bare-string case before iteration. Mirrors milestone_store's
+    # _normalize_fr_ids convention of refusing to treat a string as an
+    # iterable-of-chars.
+    if isinstance(repos, str):
+        repos = [repos]
 
     out: list[RepoRef] = []
     for raw in repos:
         if isinstance(raw, str):
-            ref = RepoRef(path=raw)
+            ref = RepoRef(path=raw.strip())
         elif isinstance(raw, RepoRef):
             ref = raw
         elif isinstance(raw, dict):
@@ -186,7 +206,7 @@ def _normalize_repos(repos: Iterable[Any]) -> list[RepoRef]:
                 f"repo entry must be str, dict, or RepoRef; got {type(raw).__name__}"
             )
         _validate_role(ref.role)
-        if not ref.path:
+        if not ref.path or not ref.path.strip():
             raise ValueError("repo entry must have a non-empty 'path'")
         out.append(ref)
     return out
@@ -220,7 +240,17 @@ class ProjectStore:
 
         raw = entry.content or "{}"
         data = json.loads(raw)
-        return Project.from_dict(data)
+        project = Project.from_dict(data)
+        # KnowledgeStore.add() stamps its own ``updated_at`` on every write,
+        # so the entry's timestamps are the authoritative source of truth
+        # (see FRStore._store docs for the same pattern). Prefer them over
+        # whatever was serialized into the content blob to avoid divergence
+        # on round-trips.
+        if entry.created_at:
+            project.created_at = float(entry.created_at)
+        if entry.updated_at:
+            project.updated_at = float(entry.updated_at)
+        return project
 
     def _serialize(self, project: Project) -> str:
         import json
@@ -228,6 +258,10 @@ class ProjectStore:
         return json.dumps(project.to_dict(), sort_keys=True)
 
     def _put(self, project: Project) -> None:
+        # Pass the in-memory created_at (preserved on re-writes of an
+        # existing project). KnowledgeStore.add will ALWAYS overwrite
+        # updated_at with its own clock — that's the authoritative source
+        # of truth for the persisted timestamp, so we sync it back after.
         entry = KnowledgeEntry(
             id=project.id,
             title=project.name or project.slug,
@@ -235,8 +269,16 @@ class ProjectStore:
             tier=Tier.DERIVED,
             status=EntryStatus.DISTILLED,
             tags=[ENTRY_TAG, f"status:{project.status}", f"domain:{project.domain}"],
+            created_at=project.created_at,
+            updated_at=project.updated_at,
         )
         self.knowledge.add(entry)
+        persisted = self.knowledge.get(project.id)
+        if persisted is not None:
+            if persisted.created_at:
+                project.created_at = float(persisted.created_at)
+            if persisted.updated_at:
+                project.updated_at = float(persisted.updated_at)
 
     # ---- public API -------------------------------------------------------
 
@@ -259,7 +301,10 @@ class ProjectStore:
         if self.knowledge.get(entry_id) is not None:
             raise ProjectDuplicateError(f"project {slug!r} already exists")
 
-        now = time.time()
+        # Leave timestamps at 0.0 so KnowledgeStore.add stamps both with
+        # the same atomic ``now`` — preserves the
+        # ``created_at == updated_at`` invariant on create, which can't
+        # hold if we use time.time() here (store's clock runs later).
         project = Project(
             slug=slug,
             name=name or slug,
@@ -267,8 +312,8 @@ class ProjectStore:
             repos=_normalize_repos(repos),
             config=dict(config or {}),
             status=PROJECT_STATUS_ACTIVE,
-            created_at=now,
-            updated_at=now,
+            created_at=0.0,
+            updated_at=0.0,
         )
         self._put(project)
         return project
@@ -280,6 +325,11 @@ class ProjectStore:
         record is a return-None, not a raise. Caller decides whether
         absence is exceptional.
 
+        Tag-gated: even if some other store (or a manual write) uses the
+        ``project_<slug>`` id shape, a record without :data:`ENTRY_TAG`
+        in its tags is treated as absent. Prevents accidental cross-
+        store bleed-through.
+
         Invalid slug (never a match by construction) still raises
         :class:`ValueError` — signals a programming error, not a
         runtime absence.
@@ -289,6 +339,10 @@ class ProjectStore:
         entry = self.knowledge.get(f"project_{slug}")
         if entry is None:
             return None
+        if ENTRY_TAG not in (entry.tags or []):
+            # Id collision with some other store; do not surface a
+            # non-project record as a Project.
+            return None
         return self._deserialize(entry)
 
     def exists(self, slug: str) -> bool:
@@ -296,7 +350,8 @@ class ProjectStore:
             _validate_slug(slug)
         except ValueError:
             return False
-        return self.knowledge.get(f"project_{slug}") is not None
+        entry = self.knowledge.get(f"project_{slug}")
+        return entry is not None and ENTRY_TAG in (entry.tags or [])
 
     def list(self, *, include_retired: bool = False) -> list[Project]:
         """Return projects in the store.

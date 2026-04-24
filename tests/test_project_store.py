@@ -150,9 +150,21 @@ class TestCreate:
         with pytest.raises(ValueError):
             store.create("x", repos=[{"path": "/a", "role": "misc"}])
 
-    def test_rejects_empty_repo_path(self, store):
+    @pytest.mark.parametrize("path", ["", None, "   ", "\t\n"])
+    def test_rejects_empty_or_blank_repo_path(self, store, path):
+        # None and whitespace-only should not survive normalization —
+        # both must raise, not silently pass as a truthy str.
         with pytest.raises(ValueError):
-            store.create("x", repos=[{"path": "", "role": "app"}])
+            store.create("x", repos=[{"path": path, "role": "app"}])
+
+    def test_accepts_bare_string_as_single_repo(self, store):
+        # A bare str for `repos` is treated as one path — NOT iterated
+        # character-by-character. Locks in the defense against the
+        # classic "iterable-of-chars" footgun.
+        p = store.create("single", repos="/a")
+        assert [r.path for r in p.repos] == ["/a"]
+        assert len(p.repos) == 1
+        assert p.repos[0].role == PROJECT_ROLE_APP
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +206,31 @@ class TestExists:
     def test_false_for_bad_slug(self, store):
         # Invalid slugs never match — returns False without raising.
         assert not store.exists("BAD SLUG")
+
+
+class TestTagIsolation:
+    """Other stores can share the same KnowledgeStore DB; tag-gating must
+    prevent id collisions from surfacing non-project records as Projects.
+    """
+
+    def test_get_rejects_non_project_tag(self, tmp_path):
+        ks = KnowledgeStore(db_path=str(tmp_path / "mixed.db"))
+        store = ProjectStore(ks)
+        # Seed a record whose id matches the project_<slug> shape but
+        # carries a different tag (e.g. some other store's fr record
+        # that happens to reuse the id prefix).
+        ks.add(
+            KnowledgeEntry(
+                id="project_impostor",
+                title="impostor",
+                content="{}",
+                tier=Tier.DERIVED,
+                status=EntryStatus.DISTILLED,
+                tags=["fr"],
+            )
+        )
+        assert store.get("impostor") is None
+        assert not store.exists("impostor")
 
 
 # ---------------------------------------------------------------------------
