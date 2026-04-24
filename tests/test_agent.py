@@ -27,7 +27,8 @@ def test_skill_count(harness):
     #   supersede / update_frs / delete = 4.
     # + integration-point scanner (fr_developer_82fe7309): suggest +
     #   distill = 2.
-    assert len(harness.skills) == 71
+    # + project ecosystem introspection (fr_developer_5564b81f): 1.
+    assert len(harness.skills) == 72
 
 
 def test_skills_registered(harness):
@@ -75,6 +76,8 @@ def test_skills_registered(harness):
         "update_milestone_frs", "delete_milestone",
         # integration-point scanner (fr_developer_82fe7309)
         "suggest_integration_points", "distill_integration_points",
+        # project ecosystem introspection (fr_developer_5564b81f)
+        "project_ecosystem",
     }
     assert harness.skill_names == expected
 
@@ -114,6 +117,77 @@ def test_integration_scanner_skills(harness):
     harness.assert_skill_exists(
         "distill_integration_points", description="Re-project",
     )
+
+
+def test_project_ecosystem_skill_registered(harness):
+    harness.assert_skill_exists("project_ecosystem", description="ecosystem")
+
+
+@pytest.mark.asyncio
+async def test_project_ecosystem_handler_brief_no_live(harness, tmp_path):
+    # Exercise the handler end-to-end with `include_live=False` so we
+    # don't hit the bus — covers: detail normalization, start_dir resolution,
+    # sibling-prefix derivation, response shape.
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo-root"\n'
+        '[tool.setuptools.packages.find]\ninclude = ["demo_root*"]\n'
+    )
+    result = await harness.call("project_ecosystem", {
+        "start_dir": str(tmp_path),
+        "include_live": False,
+        "detail": "  BRIEF  ",  # also tests detail normalization
+    })
+    assert result["project"] == "demo-root"
+    assert "repos" in result
+    assert result["agents"]["live"] == []  # live was skipped
+    assert "health_summary" in result
+
+
+@pytest.mark.asyncio
+async def test_project_ecosystem_handler_rejects_unknown_detail(harness, tmp_path):
+    # Unknown detail must fall back to 'brief' (not error, not produce
+    # undocumented response shape).
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "d"\n')
+    result = await harness.call("project_ecosystem", {
+        "start_dir": str(tmp_path),
+        "include_live": False,
+        "detail": "nonsense",
+    })
+    # brief shape has the top-level keys:
+    assert "project" in result
+    assert "domain" in result
+    assert "agents" in result
+
+
+@pytest.mark.asyncio
+async def test_project_ecosystem_handler_include_live_string_false(harness, tmp_path):
+    # _bool_arg regression: include_live='false' should NOT trigger the
+    # bus fetch path. If this broke, the fetch would either succeed
+    # (against dev bus) or fail noisily.
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    for falsey in ("false", "0", ""):
+        result = await harness.call("project_ecosystem", {
+            "start_dir": str(tmp_path),
+            "include_live": falsey,
+        })
+        assert result["agents"]["live"] == []
+
+
+@pytest.mark.asyncio
+async def test_project_ecosystem_handler_strips_whitespace_args(harness, tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "whitespace-strip"\n')
+    # Whitespace-only start_dir / sibling_prefix must be treated as unset,
+    # not as literal paths.
+    result = await harness.call("project_ecosystem", {
+        "start_dir": "   ",
+        "sibling_prefix": "   ",
+        "include_live": False,
+    })
+    # With start_dir stripped to empty, the handler falls back to
+    # config.projects['developer'].repo (or cwd). Either way it finds A
+    # pyproject — the test just asserts we don't crash and produce a
+    # structured response.
+    assert "project" in result
 
 
 def test_pr_ready_skill(harness):
@@ -490,7 +564,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 71
+    assert len(reg.skills) == 72
     assert len(reg.collaborations) == 1
 
 
