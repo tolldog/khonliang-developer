@@ -26,6 +26,7 @@ from typing import Any, Optional
 from khonliang_bus import BaseAgent, Skill, Collaboration, handler
 
 from developer import integration_scan
+from developer import project_ecosystem as _project_ecosystem
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,22 @@ class DeveloperAgent(BaseAgent):
                   since="0.1.0"),
             Skill("developer_guide", "Development workflow guide",
                   since="0.1.0"),
+            # Read-only project introspection (fr_developer_5564b81f).
+            # Heuristic path today (walks pyproject.toml + sibling repos);
+            # real project records come later (gated on fr_developer_5d0a8711).
+            Skill("project_ecosystem",
+                  "Introspect a project's ecosystem — discover repos, roles, "
+                  "ecosystem deps, and live agents (read-only).",
+                  {"start_dir": {"type": "string", "default": "",
+                                 "description": "dir to anchor discovery; defaults to config.workspace_root"},
+                   "sibling_prefix": {"type": "string", "default": "",
+                                      "description": "override heuristic prefix; derived from install-name if empty"},
+                   "domain": {"type": "string", "default": "generic"},
+                   "detail": {"type": "string", "default": "brief",
+                              "description": "compact / brief / full"},
+                   "include_live": {"type": "boolean", "default": True,
+                                    "description": "overlay live-agent state from /v1/services"}},
+                  since="0.18.0"),
             # Cross-agent skills (use self.request() via bus-lib)
             Skill("get_fr", "Look up an FR from developer's FR store",
                   {"fr_id": {"type": "string", "required": True}},
@@ -784,6 +801,56 @@ class DeveloperAgent(BaseAgent):
     @handler("developer_guide")
     async def handle_developer_guide(self, args):
         return {"guide": self.pipeline.developer_guide_text}
+
+    @handler("project_ecosystem")
+    async def handle_project_ecosystem(self, args):
+        """Heuristic ecosystem introspection, with optional live-agent overlay.
+
+        No dependency on project records — walks pyproject.toml and sibling
+        repos to infer shape. When project records land
+        (fr_developer_5d0a8711), this handler will prefer them and fall back
+        to heuristics.
+        """
+
+        from pathlib import Path
+
+        detail = str(args.get("detail") or "brief")
+        start_dir_arg = str(args.get("start_dir") or "")
+        sibling_prefix = (args.get("sibling_prefix") or "") or None
+        domain = str(args.get("domain") or "generic")
+        include_live = bool(args.get("include_live", True))
+
+        # Resolve the starting dir: explicit arg wins; otherwise use the
+        # agent's configured workspace_root; last resort is process cwd.
+        if start_dir_arg:
+            start_dir = Path(start_dir_arg)
+        else:
+            try:
+                start_dir = Path(self.pipeline.config.workspace_root)
+            except Exception:
+                start_dir = Path.cwd()
+
+        services_payload = None
+        if include_live and getattr(self, "bus_url", None):
+            # Cheap HTTP GET against the same bus this agent is registered
+            # with. Failure is not fatal — degrades to empty live overlay.
+            try:
+                import httpx
+
+                async with httpx.AsyncClient(timeout=3.0) as client:
+                    resp = await client.get(f"{self.bus_url.rstrip('/')}/v1/services")
+                    resp.raise_for_status()
+                    services_payload = resp.json()
+            except Exception as e:
+                logger.debug("project_ecosystem live-overlay fetch failed: %s", e)
+
+        view = _project_ecosystem.build_view(
+            start_dir,
+            sibling_prefix=sibling_prefix,
+            domain=domain,
+            services_payload=services_payload,
+        )
+        return view.to_dict(detail=detail)
 
     # -- researcher evidence/concept skills (via bus-lib self.request) --
 

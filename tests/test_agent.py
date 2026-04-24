@@ -27,7 +27,8 @@ def test_skill_count(harness):
     #   supersede / update_frs / delete = 4.
     # + integration-point scanner (fr_developer_82fe7309): suggest +
     #   distill = 2.
-    assert len(harness.skills) == 71
+    # + project ecosystem introspection (fr_developer_5564b81f): 1.
+    assert len(harness.skills) == 72
 
 
 def test_skills_registered(harness):
@@ -75,6 +76,8 @@ def test_skills_registered(harness):
         "update_milestone_frs", "delete_milestone",
         # integration-point scanner (fr_developer_82fe7309)
         "suggest_integration_points", "distill_integration_points",
+        # project ecosystem introspection (fr_developer_5564b81f)
+        "project_ecosystem",
     }
     assert harness.skill_names == expected
 
@@ -490,7 +493,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 71
+    assert len(reg.skills) == 72
     assert len(reg.collaborations) == 1
 
 
