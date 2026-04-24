@@ -27,6 +27,64 @@ from khonliang_bus import BaseAgent, Skill, Collaboration, handler
 
 from developer import integration_scan
 from developer import project_ecosystem as _project_ecosystem
+from developer.project_store import ProjectDuplicateError
+
+
+# Forward reference — `_parse_json_dict` is defined further down in this
+# module (lifecycle skills land ahead of it in source order). Imported via
+# late name-lookup at call time, so the forward reference is fine.
+
+
+def _parse_repos_arg(raw):
+    """Accept comma-list, JSON list, or already-materialized list.
+
+    Strict on JSON-shaped input: any string whose first non-space char is
+    ``[`` or ``{`` is parsed as JSON. If decoding fails OR the decoded
+    value isn't a list, raises :class:`ValueError`. Silently CSV-splitting
+    a JSON object like ``{"path":"/x"}`` would persist a garbage path.
+    """
+
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return []
+        # Any JSON-shaped string is parsed strictly; both '[...]' and
+        # '{...}' must decode to a list or we raise. Prevents a JSON
+        # object from silently falling through to CSV and producing a
+        # single-element list with the raw object string as a path.
+        if s.startswith("[") or s.startswith("{"):
+            try:
+                parsed = json.loads(s)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"repos is not valid JSON: {e}") from e
+            if not isinstance(parsed, list):
+                raise ValueError(
+                    f"repos JSON must be a list (got {type(parsed).__name__})"
+                )
+            return parsed
+        # Comma-separated path list fallback (non-JSON-shaped string).
+        return [piece.strip() for piece in s.split(",") if piece.strip()]
+    # Explicitly reject a dict — ProjectStore.create iterates its arg, and
+    # iterating a dict yields the keys as "paths", persisting garbage.
+    if isinstance(raw, dict):
+        raise ValueError(
+            "repos must be a list of paths / dicts, not a bare dict "
+            "(pass a JSON list or wrap in [...])"
+        )
+    # Unknown shape — delegate rejection to ProjectStore.create() which
+    # raises TypeError for non-str/dict/RepoRef entries.
+    return raw
+
+
+# (Removed duplicate `_parse_json_object_arg` — use `_parse_json_dict`
+# defined later in this file. That helper returns either a parsed dict
+# or a one-key {"error": "..."} dict; handlers translate the error-shape
+# into the structured {error: ...} response path. One JSON-object-parse
+# convention for the whole module.)
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +284,31 @@ class DeveloperAgent(BaseAgent):
                    "include_live": {"type": "boolean", "default": True,
                                     "description": "overlay live-agent state from /v1/services"}},
                   since="0.18.0"),
+            # Project lifecycle (fr_developer_5d0a8711 Phase 2). Thin
+            # wrappers over ProjectStore; cross-store migration (adding
+            # `project` dimension to FR / milestone / spec / bug / dogfood)
+            # lands in Phase 3.
+            Skill("project_init",
+                  "Register a new project: name, repos, optional domain + config.",
+                  {"slug": {"type": "string", "required": True,
+                            "description": "unique project slug (1-64 chars; lowercase a-z0-9_-; must start with a letter or digit)"},
+                   "repos": {"type": "string", "required": True,
+                             "description": "comma-separated repo paths, or JSON array of repo objects ({path, role, install_name}); bare JSON objects are rejected — wrap in an array"},
+                   "name": {"type": "string", "default": ""},
+                   "domain": {"type": "string", "default": "generic"},
+                   "config": {"type": "string", "default": "",
+                              "description": "optional JSON object with project-scoped config overrides"}},
+                  since="0.19.0"),
+            Skill("list_projects",
+                  "List registered projects. Filters retired by default.",
+                  {"include_retired": {"type": "boolean", "default": False},
+                   "detail": {"type": "string", "default": "brief",
+                              "description": "compact / brief / full"}},
+                  since="0.19.0"),
+            Skill("get_project",
+                  "Look up a project by slug. Returns null when missing.",
+                  {"slug": {"type": "string", "required": True}},
+                  since="0.19.0"),
             # Cross-agent skills (use self.request() via bus-lib)
             Skill("get_fr", "Look up an FR from developer's FR store",
                   {"fr_id": {"type": "string", "required": True}},
@@ -801,6 +884,126 @@ class DeveloperAgent(BaseAgent):
     @handler("developer_guide")
     async def handle_developer_guide(self, args):
         return {"guide": self.pipeline.developer_guide_text}
+
+    # ------------------------------------------------------------------
+    # Project lifecycle (fr_developer_5d0a8711 Phase 2)
+    # ------------------------------------------------------------------
+
+    @handler("project_init")
+    async def handle_project_init(self, args):
+        """Create a new project record via ProjectStore.
+
+        Accepts ``repos`` as either a comma-separated string of paths or a
+        JSON-encoded list of dicts. ``config`` is an optional JSON object
+        (string) for per-project overrides. Other fields flow straight
+        through to :meth:`ProjectStore.create`.
+        """
+
+        slug = str(args.get("slug") or "").strip()
+        if not slug:
+            return {"error": "slug is required"}
+
+        name = str(args.get("name") or "").strip() or None
+        domain = str(args.get("domain") or "generic").strip() or "generic"
+
+        # Argument-shape parsing may raise ValueError — route it through
+        # the structured-error response path alongside downstream store
+        # validation errors, so callers see one consistent error shape.
+        #
+        # Config parsing is inlined here (rather than using the shared
+        # `_parse_json_dict`) so a legitimate config value like
+        # `{"error": "warn"}` cannot collide with the helper's
+        # one-key `{"error": ...}` parse-failure sentinel. All other
+        # `_parse_json_dict` callers work with opaque dicts where that
+        # collision is vanishingly unlikely; config is user-facing and
+        # `"error"` is a plausible key name.
+        try:
+            repos = _parse_repos_arg(args.get("repos"))
+            # Skill schema marks `repos` required; enforce at least one
+            # repo after normalization. Empty list → {error}, consistent
+            # with the docs and the project-as-1..N-repos contract.
+            if not repos:
+                return {"error": "repos is required (provide at least one path)"}
+            raw_config = args.get("config")
+            if raw_config in (None, "", {}):
+                config = {}
+            elif isinstance(raw_config, dict):
+                config = raw_config
+            elif isinstance(raw_config, str):
+                try:
+                    config = json.loads(raw_config)
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"config must be a JSON object: {e.msg}") from e
+                if not isinstance(config, dict):
+                    raise ValueError("config must be a JSON object")
+            else:
+                raise TypeError("config must be a JSON object or JSON-encoded object string")
+            project = self.pipeline.projects.create(
+                slug=slug,
+                repos=repos,
+                name=name,
+                domain=domain,
+                config=config,
+            )
+        except ProjectDuplicateError as e:
+            return {"error": f"duplicate: {e}"}
+        except (ValueError, TypeError) as e:
+            return {"error": f"invalid argument: {e}"}
+
+        return project.to_dict()
+
+    @handler("list_projects")
+    async def handle_list_projects(self, args):
+        # Use `_bool_arg` for string-boolean safety: `"false"`, `"no"`,
+        # `"0"`, and empty string all correctly stay falsey. Naive
+        # `bool(args.get(...))` would treat any non-empty string as True.
+        include_retired = _bool_arg(args, "include_retired", default=False)
+        # Normalize + clamp detail — match project_ecosystem's behavior so
+        # `' FULL '` → `'full'` and unknown values fall back to `'brief'`
+        # instead of silently producing the brief shape for unrecognized
+        # inputs. Keeps the brief/compact/full contract consistent
+        # across project-scoped skills.
+        detail = str(args.get("detail") or "brief").strip().lower()
+        if detail not in {"compact", "brief", "full"}:
+            detail = "brief"
+
+        projects = self.pipeline.projects.list(include_retired=include_retired)
+
+        if detail == "compact":
+            return {
+                "count": len(projects),
+                "slugs": [p.slug for p in projects],
+            }
+        # brief + full share a base shape; full adds the repos[] array.
+        rows = []
+        for p in projects:
+            row = {
+                "slug": p.slug,
+                "name": p.name or p.slug,
+                "domain": p.domain,
+                "status": p.status,
+                "repo_count": len(p.repos),
+            }
+            if detail == "full":
+                row["repos"] = [r.to_dict() for r in p.repos]
+                row["config"] = dict(p.config)
+                row["created_at"] = p.created_at
+                row["updated_at"] = p.updated_at
+            rows.append(row)
+        return {"count": len(rows), "projects": rows}
+
+    @handler("get_project")
+    async def handle_get_project(self, args):
+        slug = str(args.get("slug") or "").strip()
+        if not slug:
+            return {"error": "slug is required"}
+        try:
+            project = self.pipeline.projects.get(slug)
+        except ValueError as e:
+            return {"error": f"invalid argument: {e}"}
+        if project is None:
+            return {"project": None}
+        return {"project": project.to_dict()}
 
     @handler("project_ecosystem")
     async def handle_project_ecosystem(self, args):

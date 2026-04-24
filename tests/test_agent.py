@@ -28,7 +28,9 @@ def test_skill_count(harness):
     # + integration-point scanner (fr_developer_82fe7309): suggest +
     #   distill = 2.
     # + project ecosystem introspection (fr_developer_5564b81f): 1.
-    assert len(harness.skills) == 72
+    # + project lifecycle (fr_developer_5d0a8711 Phase 2):
+    #   project_init / list_projects / get_project = 3.
+    assert len(harness.skills) == 75
 
 
 def test_skills_registered(harness):
@@ -78,6 +80,8 @@ def test_skills_registered(harness):
         "suggest_integration_points", "distill_integration_points",
         # project ecosystem introspection (fr_developer_5564b81f)
         "project_ecosystem",
+        # project lifecycle (fr_developer_5d0a8711 Phase 2)
+        "project_init", "list_projects", "get_project",
     }
     assert harness.skill_names == expected
 
@@ -564,7 +568,7 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 72
+    assert len(reg.skills) == 75
     assert len(reg.collaborations) == 1
 
 
@@ -1249,3 +1253,287 @@ def test_main_version_flag_prints_and_exits(capsys):
     version_part = out.strip().split(" ", 1)[1]
     assert version_part, "version suffix empty"
     assert version_part != "<unknown>", "resolve_version failed unexpectedly"
+
+
+# -- project lifecycle (fr_developer_5d0a8711 Phase 2) ------------------
+
+
+def test_project_lifecycle_skills_registered(harness):
+    harness.assert_skill_exists("project_init", description="Register")
+    harness.assert_skill_exists("list_projects", description="List")
+    harness.assert_skill_exists("get_project", description="Look up")
+
+
+@pytest.mark.asyncio
+async def test_project_init_creates_record(harness):
+    result = await harness.call("project_init", {
+        "slug": "demo",
+        "repos": "/tmp/a,/tmp/b",
+        "name": "Demo Project",
+        "domain": "software-engineering",
+    })
+    assert result["slug"] == "demo"
+    assert result["name"] == "Demo Project"
+    assert result["domain"] == "software-engineering"
+    assert len(result["repos"]) == 2
+    assert result["status"] == "active"
+    assert result["created_at"] > 0
+
+
+@pytest.mark.asyncio
+async def test_project_init_accepts_json_repos(harness):
+    result = await harness.call("project_init", {
+        "slug": "json-repos",
+        "repos": '[{"path": "/x", "role": "library"}, {"path": "/y", "role": "agent"}]',
+    })
+    roles = [r["role"] for r in result["repos"]]
+    assert roles == ["library", "agent"]
+
+
+@pytest.mark.asyncio
+async def test_project_init_rejects_missing_slug(harness):
+    result = await harness.call("project_init", {"slug": "", "repos": ""})
+    assert "error" in result
+    assert "slug" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_project_init_rejects_duplicate(harness):
+    await harness.call("project_init", {"slug": "dup", "repos": "/a"})
+    result = await harness.call("project_init", {"slug": "dup", "repos": "/b"})
+    assert "error" in result
+    assert "duplicate" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_project_init_rejects_bad_slug(harness):
+    # Provide valid repos so the slug-validation path is what fails.
+    # (After the 'repos required' check landed, passing empty repos would
+    # trip THAT guard first and mask the slug test.)
+    result = await harness.call("project_init", {"slug": "BAD SLUG", "repos": "/a"})
+    assert "error" in result
+    assert "invalid" in result["error"].lower() or "slug" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_project_init_rejects_bad_config_json(harness):
+    result = await harness.call("project_init", {
+        "slug": "cfg",
+        "repos": "/a",
+        "config": "{ malformed",
+    })
+    assert "error" in result
+    assert "config" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_project_init_rejects_malformed_json_repos(harness):
+    # Malformed JSON starting with '[' must NOT silently fall back to
+    # CSV parsing and produce garbage path fragments.
+    result = await harness.call("project_init", {
+        "slug": "malformed-repos",
+        "repos": '[{"path": "/x"',
+    })
+    assert "error" in result
+    assert "json" in result["error"].lower() or "invalid" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_project_init_rejects_non_repoable_json_entries(harness):
+    # Real validation edge: JSON list whose elements aren't str/dict/RepoRef.
+    # _normalize_repos raises TypeError, which the handler routes through
+    # {error: 'invalid argument: ...'}. Covers the "valid JSON, bad content"
+    # path that wasn't exercised before.
+    result = await harness.call("project_init", {
+        "slug": "bad-entries",
+        "repos": '[42, true, null]',
+    })
+    assert "error" in result
+    assert "invalid" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_project_init_rejects_json_object_repos(harness):
+    # A JSON object (not a list) passed as repos MUST error cleanly —
+    # not silently CSV-split into `['{"path":"/x"}']` as a path.
+    result = await harness.call("project_init", {
+        "slug": "obj-repos",
+        "repos": '{"path":"/x"}',
+    })
+    assert "error" in result
+    err = result["error"].lower()
+    assert "invalid" in err or "json" in err or "list" in err
+
+
+@pytest.mark.asyncio
+async def test_project_init_rejects_bare_dict_repos(harness):
+    # Bare dict (not a JSON string — actual dict) gets iterated as keys
+    # by ProjectStore unless we intercept. Explicit rejection keeps
+    # the error surface consistent with the JSON-object-as-string case.
+    result = await harness.call("project_init", {
+        "slug": "dict-repos",
+        "repos": {"path": "/x", "role": "library"},  # real dict, not JSON string
+    })
+    assert "error" in result
+    err = result["error"].lower()
+    assert "invalid" in err or "list" in err or "dict" in err
+
+
+@pytest.mark.asyncio
+async def test_project_init_rejects_empty_repos(harness):
+    # Skill schema says repos is required. Empty after normalization
+    # (empty string, comma-only string, empty JSON list) must error.
+    for index, empty in enumerate(("", "   ", ",,,", "[]")):
+        result = await harness.call("project_init", {
+            "slug": f"empty-{index}",
+            "repos": empty,
+        })
+        assert "error" in result, f"empty repos {empty!r} was accepted"
+        assert "repos" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_project_init_accepts_valid_list_repos(harness):
+    # Sanity pair for the rejection tests — the happy path still works.
+    result = await harness.call("project_init", {
+        "slug": "dict-entries-ok",
+        "repos": '[{"path":"/a","role":"library"},{"path":"/b","role":"agent"}]',
+    })
+    assert "error" not in result
+    roles = [r["role"] for r in result["repos"]]
+    assert roles == ["library", "agent"]
+
+
+@pytest.mark.asyncio
+async def test_list_projects_empty(harness):
+    result = await harness.call("list_projects", {})
+    assert result == {"count": 0, "projects": []}
+
+
+@pytest.mark.asyncio
+async def test_list_projects_include_retired_string_false_not_truthy(harness):
+    # Naive `bool("false") == True` would silently include retired records.
+    # `_bool_arg` correctly treats "false"/"no"/"0"/"" as falsey. Regression
+    # guard mirrors the milestone-status force-string test.
+    #
+    # Seed BOTH an active and a retired project so the test actually
+    # distinguishes the two paths — a test that doesn't seed retired data
+    # can't detect the `bool("false") → True` bug.
+    from developer.project_store import Project, PROJECT_STATUS_RETIRED
+
+    await harness.call("project_init", {"slug": "visible", "repos": "/a"})
+    # Inject a retired project directly via the store (no skill yet exposes
+    # the retire operation — that's Phase 3 work).
+    pipeline = harness.agent.pipeline
+    retired = Project(
+        slug="retired-one",
+        name="retired-one",
+        status=PROJECT_STATUS_RETIRED,
+        created_at=1.0,
+        updated_at=1.0,
+    )
+    pipeline.projects._put(retired)
+
+    # Sanity: default hides the retired one.
+    default = await harness.call("list_projects", {})
+    assert default["count"] == 1
+
+    # `include_retired=True` (real bool) shows both.
+    with_retired = await harness.call("list_projects", {"include_retired": True})
+    assert with_retired["count"] == 2
+
+    # String-falsey variants must NOT silently include the retired record.
+    for falsey in ("false", "no", "0", "", "FALSE", "  false  "):
+        result = await harness.call("list_projects", {"include_retired": falsey})
+        assert result["count"] == 1, (
+            f"include_retired={falsey!r} leaked the retired project "
+            f"(got count={result['count']}, expected 1)"
+        )
+
+
+@pytest.mark.asyncio
+async def test_list_projects_compact(harness):
+    await harness.call("project_init", {"slug": "alpha", "repos": "/a"})
+    await harness.call("project_init", {"slug": "bravo", "repos": "/b"})
+    result = await harness.call("list_projects", {"detail": "compact"})
+    assert result["count"] == 2
+    assert result["slugs"] == ["alpha", "bravo"]
+
+
+@pytest.mark.asyncio
+async def test_list_projects_full(harness):
+    await harness.call("project_init", {
+        "slug": "full-one",
+        "repos": '[{"path": "/r", "role": "library"}]',
+        "domain": "se",
+    })
+    result = await harness.call("list_projects", {"detail": "full"})
+    assert result["count"] == 1
+    row = result["projects"][0]
+    assert row["slug"] == "full-one"
+    assert row["repos"][0]["role"] == "library"
+    assert row["domain"] == "se"
+
+
+@pytest.mark.asyncio
+async def test_list_projects_detail_normalizes_case_and_whitespace(harness):
+    # `  FULL  ` and `BRIEF` must normalize to their lowercase variants so
+    # the response shape matches the declared contract instead of silently
+    # falling back to the brief default for unexpected casing.
+    await harness.call("project_init", {
+        "slug": "normalize-case",
+        "repos": '[{"path": "/r", "role": "library"}]',
+    })
+    result_full = await harness.call("list_projects", {"detail": "  FULL  "})
+    assert result_full["count"] == 1
+    assert "repos" in result_full["projects"][0]  # full shape
+
+    result_compact = await harness.call("list_projects", {"detail": "Compact"})
+    assert "slugs" in result_compact  # compact shape
+
+
+@pytest.mark.asyncio
+async def test_list_projects_unknown_detail_falls_back_to_brief(harness):
+    await harness.call("project_init", {"slug": "unknown-detail", "repos": "/a"})
+    result = await harness.call("list_projects", {"detail": "nonsense"})
+    assert result["count"] == 1
+    row = result["projects"][0]
+    assert "repos" not in row  # not full
+    assert "slugs" not in result  # not compact
+    assert row["slug"] == "unknown-detail"
+
+
+@pytest.mark.asyncio
+async def test_project_init_accepts_config_with_error_key(harness):
+    # Regression: the `_parse_json_dict` helper uses a one-key
+    # `{"error": ...}` dict as its parse-failure sentinel, which conflates
+    # with a user config that legitimately has an "error" key (e.g.
+    # `{"error": "warn"}`). project_init inlines its own JSON parse to
+    # avoid this collision.
+    result = await harness.call("project_init", {
+        "slug": "error-key-config",
+        "repos": "/a",
+        "config": '{"error": "warn"}',
+    })
+    assert "error" not in result
+    assert result["config"] == {"error": "warn"}
+
+
+@pytest.mark.asyncio
+async def test_get_project_found(harness):
+    await harness.call("project_init", {"slug": "hit", "repos": "/a"})
+    result = await harness.call("get_project", {"slug": "hit"})
+    assert result["project"]["slug"] == "hit"
+
+
+@pytest.mark.asyncio
+async def test_get_project_missing_returns_none(harness):
+    result = await harness.call("get_project", {"slug": "ghost"})
+    assert result == {"project": None}
+
+
+@pytest.mark.asyncio
+async def test_get_project_rejects_bad_slug(harness):
+    result = await harness.call("get_project", {"slug": "BAD"})
+    assert "error" in result
+    assert "slug" in result["error"].lower()
