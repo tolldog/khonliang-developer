@@ -1225,3 +1225,43 @@ def test_list_empty_string_project_filters_for_default_not_all(store):
     assert other.id not in ids_ws
     # None still means "all projects".
     assert {f.id for f in store.list(project=None)} >= {default_fr.id, other.id}
+
+
+def test_migrate_stamps_whitespace_only_project(store):
+    # Legacy record whose metadata has a whitespace-only `project`
+    # value (possible if a previous code path wrote an unnormalized
+    # string). The old `if meta.get("project"): continue` guard would
+    # have left it unfilterable; the current guard treats whitespace
+    # as effectively empty and stamps the canonical default.
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="fr_developer_wsonly",
+        tier=Tier.DERIVED,
+        title="ws only",
+        content="body",
+        source="developer.fr_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["fr", "target:developer", "app"],
+        metadata={
+            "fr_status": "open",
+            "priority": "medium",
+            "target": "developer",
+            "project": "   ",
+        },
+        created_at=now, updated_at=now,
+    ))
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 1
+    raw = store.knowledge.get("fr_developer_wsonly")
+    assert raw.metadata["project"] == DEFAULT_PROJECT
+    # Read-path also surfaces the canonical default (reader uses
+    # `meta.get("project") or DEFAULT_PROJECT`; whitespace is falsy
+    # via `.strip()` but `"   "` is truthy as a string — the read-side
+    # default still kicks in only when the string is falsy. The
+    # migration normalizes it so downstream filters work.)
+    fr = store.get("fr_developer_wsonly")
+    assert fr.project == DEFAULT_PROJECT

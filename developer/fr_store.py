@@ -1130,7 +1130,14 @@ class FRStore:
             if "fr" not in (entry.tags or []):
                 continue
             meta = dict(entry.metadata or {})
-            if meta.get("project"):
+            # Match write-side normalization: a whitespace-only value
+            # is effectively empty and should still be stamped,
+            # otherwise the migration leaves records that read-side
+            # filters (normalized via strip+default) can't match.
+            existing = meta.get("project")
+            if isinstance(existing, str) and existing.strip():
+                continue
+            if existing is not None and not isinstance(existing, str) and existing:
                 continue
             meta["project"] = project
             patched = dataclasses.replace(entry, metadata=meta)
@@ -1148,10 +1155,12 @@ def _fr_from_entry(entry: KnowledgeEntry) -> FR:
     """Convert a KnowledgeEntry back into an :class:`FR`.
 
     Records written before fr_developer_1c5178d2 don't have ``project``
-    in their metadata; ``meta.get("project", DEFAULT_PROJECT)`` falls
-    back to the canonical bootstrapped project so those records keep
-    working seamlessly. ``migrate_records_to_project`` can stamp the
-    field onto the persisted data once the caller is ready to tidy up.
+    in their metadata, and records with an empty/falsy ``project`` value
+    (e.g. ``""``) are normalized the same way:
+    ``meta.get("project") or DEFAULT_PROJECT`` falls back to the
+    canonical bootstrapped project so those records keep working
+    seamlessly. ``migrate_records_to_project`` can stamp the field
+    onto the persisted data once the caller is ready to tidy up.
     """
     meta = entry.metadata or {}
     return FR(

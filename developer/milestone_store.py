@@ -873,7 +873,14 @@ class MilestoneStore:
             if "milestone" not in (entry.tags or []):
                 continue
             meta = dict(entry.metadata or {})
-            if meta.get("project"):
+            # Match write-side normalization: treat whitespace-only
+            # project values as effectively empty so the migration
+            # doesn't leave records that read-side filters (also
+            # strip-normalized) won't match.
+            existing = meta.get("project")
+            if isinstance(existing, str) and existing.strip():
+                continue
+            if existing is not None and not isinstance(existing, str) and existing:
                 continue
             meta["project"] = project
             patched = dataclasses.replace(entry, metadata=meta)

@@ -604,7 +604,14 @@ class BugStore:
             if "bug" not in (entry.tags or []):
                 continue
             meta = dict(entry.metadata or {})
-            if meta.get("project"):
+            # Match write-side normalization: treat whitespace-only
+            # project values as effectively empty so migration
+            # canonicalizes them instead of leaving rows with a project
+            # that read-side filters won't match.
+            existing = meta.get("project")
+            if isinstance(existing, str) and existing.strip():
+                continue
+            if existing is not None and not isinstance(existing, str) and existing:
                 continue
             meta["project"] = project
             patched = dataclasses.replace(entry, metadata=meta)
