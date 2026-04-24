@@ -785,7 +785,12 @@ class FRStore:
         self._store(fr)
         return fr
 
-    def next_fr(self, *, target: Optional[str] = None) -> Optional[FR]:
+    def next_fr(
+        self,
+        *,
+        target: Optional[str] = None,
+        project: Optional[str] = None,
+    ) -> Optional[FR]:
         """Pick the highest-priority FR that's ready to work on.
 
         "Ready" means:
@@ -798,10 +803,13 @@ class FRStore:
         `created_at` (first-in, first-out). Returns None when nothing
         qualifies.
 
-        ``target`` optionally restricts to a single project.
+        ``target`` optionally restricts to a single agent/app target.
+        ``project`` optionally restricts to a single project slug;
+        None returns every project (cross-project view). Filtering is
+        delegated to :meth:`list`, which normalizes the value.
         """
         candidates = []
-        for fr in self.list(include_all=True):
+        for fr in self.list(include_all=True, project=project):
             if fr.status not in (FR_STATUS_OPEN, FR_STATUS_PLANNED):
                 continue
             if target and fr.target != target:

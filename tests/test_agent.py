@@ -1697,3 +1697,214 @@ async def test_review_staged_diff_reports_reviewer_failure(harness, git_repo):
     assert "error" in result
     assert "reviewer request failed" in result["error"]
     assert "reviewer offline" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# fr_developer_69973285 — skill-handler project pass-through
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_promote_fr_defaults_project_to_default_project(harness):
+    from developer.project_store import DEFAULT_PROJECT
+    result = await harness.call("promote_fr", {
+        "target": "developer", "title": "default-proj-fr", "description": "d",
+    })
+    assert result["project"] == DEFAULT_PROJECT
+    # Round-trips through the store.
+    got = await harness.call("get_fr_local", {"fr_id": result["fr_id"]})
+    assert got["project"] == DEFAULT_PROJECT
+
+
+@pytest.mark.asyncio
+async def test_promote_fr_passes_project_through_to_store(harness):
+    result = await harness.call("promote_fr", {
+        "target": "developer", "title": "alpha-proj-fr", "description": "d",
+        "project": "alpha",
+    })
+    assert result["project"] == "alpha"
+    got = await harness.call("get_fr_local", {"fr_id": result["fr_id"]})
+    assert got["project"] == "alpha"
+
+
+@pytest.mark.asyncio
+async def test_list_frs_local_filters_by_project(harness):
+    # One default-project FR and one alpha FR; ensure the filter
+    # reaches the store.
+    default_fr = await harness.call("promote_fr", {
+        "target": "developer", "title": "d-fr", "description": "d",
+    })
+    alpha_fr = await harness.call("promote_fr", {
+        "target": "developer", "title": "a-fr", "description": "a",
+        "project": "alpha",
+    })
+    alpha_only = await harness.call("list_frs_local", {"project": "alpha"})
+    ids = {f["id"] for f in alpha_only["frs"]}
+    assert alpha_fr["fr_id"] in ids
+    assert default_fr["fr_id"] not in ids
+    # Empty project → all projects (None at the store).
+    all_of_them = await harness.call("list_frs_local", {})
+    all_ids = {f["id"] for f in all_of_them["frs"]}
+    assert {default_fr["fr_id"], alpha_fr["fr_id"]} <= all_ids
+
+
+@pytest.mark.asyncio
+async def test_next_fr_local_filters_by_project(harness):
+    default_fr = await harness.call("promote_fr", {
+        "target": "developer", "title": "d-next", "description": "d",
+    })
+    alpha_fr = await harness.call("promote_fr", {
+        "target": "developer", "title": "a-next", "description": "a",
+        "project": "alpha",
+    })
+    # Scoped to alpha should pick alpha_fr (only ready candidate there).
+    result = await harness.call("next_fr_local", {"project": "alpha"})
+    assert result["fr"] is not None
+    assert result["fr"]["id"] == alpha_fr["fr_id"]
+
+
+@pytest.mark.asyncio
+async def test_file_bug_passes_project_through(harness):
+    result = await harness.call("file_bug", {
+        "target": "developer", "title": "b", "description": "d",
+        "observed_entity": "x", "project": "genealogy",
+    })
+    assert result["project"] == "genealogy"
+
+
+@pytest.mark.asyncio
+async def test_list_bugs_filters_by_project(harness):
+    a = await harness.call("file_bug", {
+        "target": "developer", "title": "alpha-b", "description": "d1",
+        "observed_entity": "e1", "project": "alpha",
+    })
+    b = await harness.call("file_bug", {
+        "target": "developer", "title": "beta-b", "description": "d2",
+        "observed_entity": "e2", "project": "beta",
+    })
+    alpha_only = await harness.call("list_bugs", {"project": "alpha"})
+    ids = {bug["id"] for bug in alpha_only["bugs"]}
+    assert a["bug_id"] in ids
+    assert b["bug_id"] not in ids
+
+
+@pytest.mark.asyncio
+async def test_log_dogfood_passes_project_through(harness):
+    result = await harness.call("log_dogfood", {
+        "observation": "project-pass-obs", "project": "alpha-app",
+    })
+    assert result["project"] == "alpha-app"
+
+
+@pytest.mark.asyncio
+async def test_list_dogfood_filters_by_project(harness):
+    a = await harness.call("log_dogfood", {
+        "observation": "alpha obs", "project": "alpha",
+    })
+    b = await harness.call("log_dogfood", {
+        "observation": "beta obs", "project": "beta",
+    })
+    alpha_only = await harness.call("list_dogfood", {"project": "alpha"})
+    ids = {d["id"] for d in alpha_only["dogfood"]}
+    assert a["dog_id"] in ids
+    assert b["dog_id"] not in ids
+
+
+@pytest.mark.asyncio
+async def test_list_milestones_filters_by_project(harness):
+    # Seed two milestones with distinct fr_ids so they get separate ids,
+    # one default and one explicit.
+    def _wu(name, fr_id):
+        return {
+            "name": name,
+            "targets": ["developer"],
+            "rank": 1,
+            "frs": [{"fr_id": fr_id, "target": "developer", "title": fr_id}],
+        }
+    import json
+    default_ms = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": json.dumps(_wu("A", "fr_developer_a0000001")),
+    })
+    alpha_ms = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": json.dumps(_wu("B", "fr_developer_b0000001")),
+        "project": "alpha",
+    })
+    alpha_only = await harness.call("list_milestones", {"project": "alpha"})
+    ids = {m["id"] for m in alpha_only["milestones"]}
+    assert alpha_ms["milestone"]["id"] in ids
+    assert default_ms["milestone"]["id"] not in ids
+
+
+@pytest.mark.asyncio
+async def test_list_frs_local_string_false_include_all_not_truthy(harness):
+    # Regression: naive bool("false") == True would silently include
+    # terminal-state FRs when a caller sends a JSON/CLI string.
+    # _bool_arg correctly treats "false" / "0" / "no" / "" as falsey.
+    # Seeding a terminal FR and asserting visibility is how this test
+    # actually detects the bug — without a terminal row, include_all
+    # flipping True would go unnoticed.
+    active = await harness.call("promote_fr", {
+        "target": "developer", "title": "active", "description": "d",
+    })
+    archived = await harness.call("promote_fr", {
+        "target": "developer", "title": "stale", "description": "d",
+    })
+    archived_result = await harness.call("update_fr_status", {
+        "fr_id": archived["fr_id"], "status": "archived",
+    })
+    assert archived_result["status"] == "archived"
+
+    # include_all=True → terminal FR is visible.
+    with_archived = await harness.call("list_frs_local", {"include_all": True})
+    with_ids = {f["id"] for f in with_archived["frs"]}
+    assert archived["fr_id"] in with_ids
+    assert active["fr_id"] in with_ids
+
+    # Falsy string variants must HIDE the terminal FR. If _bool_arg
+    # regressed to naive bool(), "false" would show the archived row.
+    for falsey in ("false", "0", "no", "", "FALSE", "  false  "):
+        result = await harness.call("list_frs_local", {"include_all": falsey})
+        ids = {f["id"] for f in result["frs"]}
+        assert archived["fr_id"] not in ids, (
+            f"include_all={falsey!r} leaked a terminal FR"
+        )
+        assert active["fr_id"] in ids
+
+
+@pytest.mark.asyncio
+async def test_list_milestones_string_false_include_archived_not_truthy(harness):
+    def _wu(name, fr_id):
+        return {
+            "name": name, "targets": ["developer"], "rank": 1,
+            "frs": [{"fr_id": fr_id, "target": "developer", "title": fr_id}],
+        }
+    import json
+    # Seed one active and one abandoned milestone so the test
+    # actually measures filter behavior, not just call shape.
+    active = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": json.dumps(_wu("active-ms", "fr_developer_msa00001")),
+    })
+    to_abandon = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": json.dumps(_wu("abandon-ms", "fr_developer_msb00002")),
+    })
+    abandoned = await harness.call("update_milestone_status", {
+        "milestone_id": to_abandon["milestone"]["id"],
+        "status": "abandoned",
+    })
+    assert abandoned.get("milestone", {}).get("status") == "abandoned" or \
+        abandoned.get("status") == "abandoned"
+
+    # include_archived=True → abandoned milestone visible.
+    with_arc = await harness.call("list_milestones", {"include_archived": True})
+    with_ids = {m["id"] for m in with_arc["milestones"]}
+    assert to_abandon["milestone"]["id"] in with_ids
+    assert active["milestone"]["id"] in with_ids
+
+    # Falsy string variants must HIDE the abandoned milestone.
+    for falsey in ("false", "0", "no", ""):
+        result = await harness.call("list_milestones", {"include_archived": falsey})
+        ids = {m["id"] for m in result["milestones"]}
+        assert to_abandon["milestone"]["id"] not in ids, (
+            f"include_archived={falsey!r} leaked an abandoned milestone"
+        )
+        assert active["milestone"]["id"] in ids
