@@ -217,7 +217,7 @@ class DeveloperAgent(BaseAgent):
                   "Introspect a project's ecosystem — discover repos, roles, "
                   "ecosystem deps, and live agents (read-only).",
                   {"start_dir": {"type": "string", "default": "",
-                                 "description": "dir to anchor discovery; defaults to config.workspace_root"},
+                                 "description": "repo path to anchor discovery; defaults to the configured developer repo (falls back to cwd)"},
                    "sibling_prefix": {"type": "string", "default": "",
                                       "description": "override heuristic prefix; derived from install-name if empty"},
                    "domain": {"type": "string", "default": "generic"},
@@ -812,9 +812,6 @@ class DeveloperAgent(BaseAgent):
         to heuristics.
         """
 
-        import asyncio
-        import json
-        import urllib.request
         from pathlib import Path
 
         # Normalize + validate detail. Unknown values silently fall through
@@ -829,33 +826,40 @@ class DeveloperAgent(BaseAgent):
         domain = str(args.get("domain") or "generic")
         include_live = bool(args.get("include_live", True))
 
-        # Resolve the starting dir: explicit arg wins; otherwise use the
-        # agent's configured workspace_root; last resort is process cwd.
+        # Resolve the starting dir: explicit arg wins. Otherwise prefer a
+        # configured REPO path — workspace_root is the parent directory
+        # containing repos, not a repo itself, so walking up from there
+        # won't find a pyproject (→ project='unknown'). Falls back to cwd
+        # when no developer-project repo is configured.
         if start_dir_arg:
             start_dir = Path(start_dir_arg)
         else:
+            start_dir = None
             try:
-                start_dir = Path(self.pipeline.config.workspace_root)
+                projects = getattr(self.pipeline.config, "projects", None) or {}
+                developer_project = projects.get("developer") if isinstance(projects, dict) else None
+                repo = getattr(developer_project, "repo", None)
+                if repo:
+                    start_dir = Path(repo)
             except Exception:
+                start_dir = None
+            if start_dir is None:
                 start_dir = Path.cwd()
 
         services_payload = None
         if include_live and getattr(self, "bus_url", None):
-            # Cheap GET against the same bus this agent is registered with.
-            # Uses stdlib urllib to avoid a new httpx dependency on this
-            # repo's pyproject — `urllib` is shipping-lib territory. Failure
-            # is non-fatal and degrades to an empty live overlay.
-            url = f"{self.bus_url.rstrip('/')}/v1/services"
-
-            def _fetch():
-                with urllib.request.urlopen(url, timeout=3.0) as resp:
-                    charset = resp.headers.get_content_charset() or "utf-8"
-                    return json.loads(resp.read().decode(charset))
-
-            try:
-                services_payload = await asyncio.to_thread(_fetch)
-            except Exception as e:
-                logger.debug("project_ecosystem live-overlay fetch failed: %s", e)
+            # Reuse the agent's existing async HTTP client (same one
+            # `_fetch_remote_skills` uses). Avoids spawning threads per
+            # call and keeps httpx/timeout/error-shape handling consistent.
+            # Failure is non-fatal — degrades to empty overlay.
+            client = getattr(self, "_http", None)
+            if client is not None:
+                try:
+                    response = await client.get(f"{self.bus_url.rstrip('/')}/v1/services")
+                    response.raise_for_status()
+                    services_payload = response.json()
+                except Exception as e:
+                    logger.debug("project_ecosystem live-overlay fetch failed: %s", e)
 
         view = _project_ecosystem.build_view(
             start_dir,

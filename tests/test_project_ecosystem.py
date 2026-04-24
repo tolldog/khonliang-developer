@@ -307,13 +307,10 @@ class TestDiscoverProject:
         assert {r.install_name for r in view.repos} == {"foo-bar", "foo-baz"}
 
     def test_handles_no_pyproject(self, tmp_path, monkeypatch):
-        # Walk `find_pyproject` only within a controlled subtree so
-        # ancestor pyprojects on the real filesystem don't leak into
-        # the test. Monkeypatch Path.resolve to pin the anchor so
-        # walk-up terminates inside tmp_path.
+        # Monkeypatch `find_pyproject` to walk only within a controlled
+        # subtree so ancestor pyprojects on the real filesystem don't
+        # leak into the test.
         from developer import project_ecosystem as pe
-
-        original_find = pe.find_pyproject
 
         def bounded_find(start: Path):
             # Only walk within tmp_path; anything outside returns None,
