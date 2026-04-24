@@ -54,6 +54,8 @@ from khonliang.knowledge.store import (
     Tier,
 )
 
+from developer.project_store import DEFAULT_PROJECT
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -117,6 +119,8 @@ class Bug:
     updated_at: float = 0.0
     notes_history: list[dict] = field(default_factory=list)
     source: Optional[dict[str, Any]] = None
+    # Phase 3 of fr_developer_5d0a8711: project as a first-class dimension.
+    project: str = DEFAULT_PROJECT
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -129,6 +133,7 @@ class Bug:
             "severity": self.severity,
             "status": self.status,
             "reporter": self.reporter,
+            "project": self.project,
             "linked_frs": list(self.linked_frs),
             "linked_pr": self.linked_pr,
             "duplicate_of": self.duplicate_of,
@@ -197,6 +202,7 @@ class BugStore:
         severity_min: str = "",
         status: Optional[Iterable[str] | str] = None,
         include_terminal: bool = False,
+        project: Optional[str] = None,
     ) -> list[Bug]:
         """List bugs in the store.
 
@@ -227,6 +233,8 @@ class BugStore:
             bug = _bug_from_entry(entry)
             if target and bug.target != target:
                 continue
+            if project and bug.project != project:
+                continue
             if allowed_statuses is not None and bug.status not in allowed_statuses:
                 continue
             if cutoff_rank is not None:
@@ -253,6 +261,7 @@ class BugStore:
         reporter: str = "",
         source: Optional[dict[str, Any]] = None,
         observed_at: Optional[float] = None,
+        project: str = DEFAULT_PROJECT,
     ) -> Bug:
         """File a new bug. Returns the stored :class:`Bug`.
 
@@ -288,6 +297,7 @@ class BugStore:
                 f"(existing tags: {sorted(existing.tags or [])}); refusing to overwrite"
             )
 
+        project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
         now = time.time()
         observed = observed_at if observed_at is not None else now
         bug = Bug(
@@ -300,6 +310,7 @@ class BugStore:
             severity=severity,
             status=BUG_STATUS_OPEN,
             reporter=reporter,
+            project=project,
             linked_frs=[],
             linked_pr="",
             duplicate_of="",
@@ -538,6 +549,7 @@ class BugStore:
                 "bug_status": bug.status,
                 "severity": bug.severity,
                 "target": bug.target,
+                "project": bug.project or DEFAULT_PROJECT,
                 "reproduction": bug.reproduction,
                 "observed_entity": bug.observed_entity,
                 "observed_at": bug.observed_at,
@@ -556,6 +568,32 @@ class BugStore:
         if stored is not None:
             bug.created_at = stored.created_at
             bug.updated_at = stored.updated_at
+
+    # ------------------------------------------------------------------
+    # fr_developer_1c5178d2 — project-dimension migration helper
+    # ------------------------------------------------------------------
+
+    def migrate_records_to_project(
+        self, project: str = DEFAULT_PROJECT
+    ) -> int:
+        """Stamp ``project`` onto bug records whose metadata lacks it.
+
+        Idempotent; returns the number of records actually rewritten.
+        See :meth:`FRStore.migrate_records_to_project` for rationale.
+        """
+        project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
+        rewritten = 0
+        for entry in self.knowledge.get_by_tier(Tier.DERIVED):
+            if "bug" not in (entry.tags or []):
+                continue
+            meta = entry.metadata or {}
+            if meta.get("project"):
+                continue
+            bug = _bug_from_entry(entry)
+            bug.project = project
+            self._store(bug)
+            rewritten += 1
+        return rewritten
 
     def _count_bugs(self) -> int:
         count = 0
@@ -621,6 +659,7 @@ def _bug_from_entry(entry: KnowledgeEntry) -> Bug:
         severity=meta.get("severity", BUG_SEVERITY_MEDIUM),
         status=meta.get("bug_status", BUG_STATUS_OPEN),
         reporter=meta.get("reporter", ""),
+        project=meta.get("project") or DEFAULT_PROJECT,
         linked_frs=list(meta.get("linked_frs") or []),
         linked_pr=meta.get("linked_pr", ""),
         duplicate_of=meta.get("duplicate_of", ""),

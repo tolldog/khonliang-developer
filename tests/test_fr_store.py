@@ -1036,3 +1036,108 @@ def test_to_public_dict_includes_all_fields(store):
     assert d["merged_into"] is None
     assert d["merged_from"] == []
     assert "redirected_from" in d
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 of fr_developer_5d0a8711 — project dimension
+# ---------------------------------------------------------------------------
+
+
+def test_project_defaults_to_khonliang_on_promote(store):
+    from developer.project_store import DEFAULT_PROJECT
+    fr = store.promote(target="developer", title="default proj", description="d")
+    assert fr.project == DEFAULT_PROJECT
+    # Round-trips through the store: the second get sees the same value.
+    assert store.get(fr.id).project == DEFAULT_PROJECT
+
+
+def test_project_is_persisted_in_metadata(store):
+    fr = store.promote(
+        target="developer", title="tag-check", description="d",
+        project="sibling-app",
+    )
+    assert fr.project == "sibling-app"
+    raw = store.knowledge.get(fr.id)
+    assert raw.metadata["project"] == "sibling-app"
+
+
+def test_pre_phase3_record_reads_as_default_project(store):
+    # Simulate a record written before Phase 3 by crafting the
+    # KnowledgeEntry directly without a `project` metadata key.
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="fr_developer_legacy01",
+        tier=Tier.DERIVED,
+        title="Legacy FR",
+        content="legacy body",
+        source="developer.fr_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["fr", "target:developer", "app"],
+        metadata={
+            "fr_status": "open",
+            "priority": "medium",
+            "concept": "",
+            "classification": "app",
+            "target": "developer",
+            # Deliberately no "project" key — simulates pre-Phase-3 data.
+        },
+        created_at=now, updated_at=now,
+    ))
+    fr = store.get("fr_developer_legacy01")
+    assert fr.project == DEFAULT_PROJECT, (
+        "reader should default missing project metadata to DEFAULT_PROJECT"
+    )
+
+
+def test_list_filters_by_project(store):
+    a = store.promote(target="developer", title="a", description="d", project="alpha")
+    b = store.promote(target="developer", title="b", description="d", project="beta")
+    both = store.list()
+    assert {fr.id for fr in both} >= {a.id, b.id}
+    alpha_only = store.list(project="alpha")
+    ids = {fr.id for fr in alpha_only}
+    assert a.id in ids
+    assert b.id not in ids
+
+
+def test_migrate_records_to_project_is_idempotent(store):
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    # Two legacy-shaped entries missing `project`, plus a current entry
+    # written through the normal path (already has the field).
+    for idx in range(2):
+        store.knowledge.add(KnowledgeEntry(
+            id=f"fr_developer_legacy{idx:02d}",
+            tier=Tier.DERIVED,
+            title=f"legacy {idx}",
+            content="body",
+            source="developer.fr_store",
+            scope="development",
+            confidence=1.0,
+            status=EntryStatus.DISTILLED,
+            tags=["fr", "target:developer", "app"],
+            metadata={
+                "fr_status": "open",
+                "priority": "medium",
+                "target": "developer",
+            },
+            created_at=now, updated_at=now,
+        ))
+    current = store.promote(target="developer", title="current", description="d")
+    assert current.project == DEFAULT_PROJECT
+
+    # First run stamps only the 2 legacy ones.
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 2
+    # Idempotent — second run touches nothing.
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 0
+    # All records now carry the project in persisted metadata.
+    for idx in range(2):
+        raw = store.knowledge.get(f"fr_developer_legacy{idx:02d}")
+        assert raw.metadata["project"] == DEFAULT_PROJECT

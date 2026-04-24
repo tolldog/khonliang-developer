@@ -44,6 +44,8 @@ from khonliang.knowledge.store import (
     EntryStatus,
 )
 
+from developer.project_store import DEFAULT_PROJECT
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -123,6 +125,12 @@ class FR:
     created_at: float = 0.0
     updated_at: float = 0.0
     redirected_from: Optional[str] = None
+    # Phase 3 of fr_developer_5d0a8711: project as a first-class dimension.
+    # Records pre-dating this field read back as "khonliang" via the default
+    # in `_fr_from_entry`, so old data keeps working without an explicit
+    # migration pass (though `migrate_records_to_project` is provided to
+    # tidy the metadata once and for all).
+    project: str = DEFAULT_PROJECT
 
     def to_public_dict(self) -> dict[str, Any]:
         """Serializable representation for MCP / JSON consumers."""
@@ -135,6 +143,7 @@ class FR:
             "priority": self.priority,
             "concept": self.concept,
             "classification": self.classification,
+            "project": self.project,
             "backing_papers": list(self.backing_papers),
             "depends_on": list(self.depends_on),
             "branch": self.branch,
@@ -258,6 +267,7 @@ class FRStore:
         target: Optional[str] = None,
         status: Optional[str] = None,
         include_all: bool = False,
+        project: Optional[str] = None,
     ) -> list[FR]:
         """List FRs in the store.
 
@@ -266,6 +276,8 @@ class FRStore:
         (completed, archived, merged).
         Pass ``status=<name>`` to filter to a single status
         (ignores ``include_all`` since it's more specific).
+        Pass ``project=<slug>`` to restrict to one project; ``None``
+        returns every project (cross-project view).
         """
         entries = self.knowledge.get_by_tier(Tier.DERIVED)
         frs: list[FR] = []
@@ -274,6 +286,8 @@ class FRStore:
                 continue
             fr = _fr_from_entry(entry)
             if target and fr.target != target:
+                continue
+            if project and fr.project != project:
                 continue
             if status:
                 if fr.status != status:
@@ -300,12 +314,18 @@ class FRStore:
         concept: str = "",
         classification: str = "app",
         backing_papers: Optional[Iterable[str]] = None,
+        project: str = DEFAULT_PROJECT,
     ) -> FR:
         """Create a new FR. Returns the stored :class:`FR`.
 
         ``id`` is derived deterministically from (target, title, concept)
         so re-promoting the same content yields the same id (collision
         detection via pre-existing entry).
+
+        ``project`` partitions the record into a project slug; defaults
+        to :data:`DEFAULT_PROJECT` so pre-Phase-3 callers keep working
+        without changes. See fr_developer_1c5178d2 (Phase 3) for the
+        full rollout plan.
         """
         if not target or not title:
             raise FRError("promote_fr requires non-empty target and title")
@@ -313,6 +333,7 @@ class FRStore:
             raise FRError(
                 f"priority must be one of {sorted(ALLOWED_PRIORITIES)}, got {priority!r}"
             )
+        project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
         backing = list(backing_papers or [])
 
         fr_id = _derive_fr_id(target, title, concept)
@@ -331,6 +352,7 @@ class FRStore:
             priority=priority,
             concept=concept,
             classification=classification,
+            project=project,
             backing_papers=backing,
             depends_on=[],
             branch="",
@@ -893,6 +915,7 @@ class FRStore:
                 "concept": fr.concept,
                 "classification": fr.classification,
                 "target": fr.target,
+                "project": fr.project or DEFAULT_PROJECT,
                 "backing_papers": list(fr.backing_papers),
                 "depends_on": list(fr.depends_on),
                 "branch": fr.branch,
@@ -1042,6 +1065,38 @@ class FRStore:
             fr.updated_at = time.time()
             self._store(fr)
 
+    # ------------------------------------------------------------------
+    # fr_developer_1c5178d2 — project-dimension migration helper
+    # ------------------------------------------------------------------
+
+    def migrate_records_to_project(
+        self, project: str = DEFAULT_PROJECT
+    ) -> int:
+        """Stamp ``project`` onto FR records whose metadata lacks it.
+
+        Read-time fallback in :func:`_fr_from_entry` already surfaces
+        pre-Phase-3 records as ``project=DEFAULT_PROJECT``; this helper
+        writes the value into persisted metadata for callers that want
+        the data canonicalized rather than fallback-interpreted.
+
+        Idempotent: only touches records whose ``metadata.project`` is
+        missing or empty. Returns the number of records actually
+        rewritten so callers can log / assert the migration ran.
+        """
+        project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
+        rewritten = 0
+        for entry in self.knowledge.get_by_tier(Tier.DERIVED):
+            if "fr" not in (entry.tags or []):
+                continue
+            meta = entry.metadata or {}
+            if meta.get("project"):
+                continue
+            fr = _fr_from_entry(entry)
+            fr.project = project
+            self._store(fr)
+            rewritten += 1
+        return rewritten
+
 
 # ---------------------------------------------------------------------------
 # Module helpers
@@ -1049,7 +1104,14 @@ class FRStore:
 
 
 def _fr_from_entry(entry: KnowledgeEntry) -> FR:
-    """Convert a KnowledgeEntry back into an :class:`FR`."""
+    """Convert a KnowledgeEntry back into an :class:`FR`.
+
+    Records written before fr_developer_1c5178d2 don't have ``project``
+    in their metadata; ``meta.get("project", DEFAULT_PROJECT)`` falls
+    back to the canonical bootstrapped project so those records keep
+    working seamlessly. ``migrate_records_to_project`` can stamp the
+    field onto the persisted data once the caller is ready to tidy up.
+    """
     meta = entry.metadata or {}
     return FR(
         id=entry.id,
@@ -1060,6 +1122,7 @@ def _fr_from_entry(entry: KnowledgeEntry) -> FR:
         priority=meta.get("priority", "medium"),
         concept=meta.get("concept", ""),
         classification=meta.get("classification", "app"),
+        project=meta.get("project") or DEFAULT_PROJECT,
         backing_papers=list(meta.get("backing_papers") or []),
         depends_on=list(meta.get("depends_on") or []),
         branch=meta.get("branch", ""),

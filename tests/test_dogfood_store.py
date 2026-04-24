@@ -1069,3 +1069,58 @@ def test_dogfood_triage_queue_default_detail_is_compact(pipeline):
     first = result["dogfood"][0]
     assert "kind" in first
     assert "target" in first
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 of fr_developer_5d0a8711 — project dimension
+# ---------------------------------------------------------------------------
+
+
+def test_dogfood_project_defaults_to_khonliang(store):
+    from developer.project_store import DEFAULT_PROJECT
+    dog = store.log_dogfood("first friction")
+    assert dog.project == DEFAULT_PROJECT
+    assert store.knowledge.get(dog.id).metadata["project"] == DEFAULT_PROJECT
+
+
+def test_dogfood_project_passes_through_log(store):
+    dog = store.log_dogfood("alpha friction", project="alpha-app")
+    assert dog.project == "alpha-app"
+    assert store.knowledge.get(dog.id).metadata["project"] == "alpha-app"
+
+
+def test_dogfood_list_filters_by_project(store):
+    import time
+    a = store.log_dogfood("alpha thing", project="alpha", observed_at=time.time() - 1)
+    b = store.log_dogfood("beta thing", project="beta", observed_at=time.time())
+    alpha_only = store.list_dogfood(project="alpha")
+    ids = {d.id for d in alpha_only}
+    assert a.id in ids
+    assert b.id not in ids
+
+
+def test_dogfood_migrate_records_to_project_is_idempotent(store):
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="dog_legacy01",
+        tier=Tier.DERIVED,
+        title="legacy obs",
+        content="legacy obs",
+        source="developer.dogfood_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["dogfood", "kind:friction"],
+        metadata={
+            "dogfood_status": "observed",
+            "kind": "friction",
+        },
+        created_at=now, updated_at=now,
+    ))
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 1
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 0
+    raw = store.knowledge.get("dog_legacy01")
+    assert raw.metadata["project"] == DEFAULT_PROJECT

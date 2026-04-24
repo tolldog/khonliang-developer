@@ -968,3 +968,69 @@ def test_report_gap_bug_propagates_cancellation(pipeline):
         ))
 
 
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 of fr_developer_5d0a8711 — project dimension
+# ---------------------------------------------------------------------------
+
+
+def test_bug_project_defaults_to_khonliang(store):
+    from developer.project_store import DEFAULT_PROJECT
+    bug = store.file_bug(
+        target="developer", title="t", description="d", observed_entity="x",
+    )
+    assert bug.project == DEFAULT_PROJECT
+    assert store.knowledge.get(bug.id).metadata["project"] == DEFAULT_PROJECT
+
+
+def test_bug_project_passes_through_file_bug(store):
+    bug = store.file_bug(
+        target="developer", title="t", description="d",
+        observed_entity="x", project="genealogy",
+    )
+    assert bug.project == "genealogy"
+    assert store.knowledge.get(bug.id).metadata["project"] == "genealogy"
+
+
+def test_bug_list_filters_by_project(store):
+    a = store.file_bug(
+        target="developer", title="A", description="a",
+        observed_entity="x", project="alpha",
+    )
+    b = store.file_bug(
+        target="developer", title="B", description="b",
+        observed_entity="y", project="beta",
+    )
+    alpha_only = store.list_bugs(project="alpha")
+    ids = {bug.id for bug in alpha_only}
+    assert a.id in ids
+    assert b.id not in ids
+
+
+def test_bug_migrate_records_to_project_is_idempotent(store):
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    store.knowledge.add(KnowledgeEntry(
+        id="bug_developer_legacy01",
+        tier=Tier.DERIVED,
+        title="Legacy Bug",
+        content="body",
+        source="developer.bug_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["bug", "target:developer", "severity:medium"],
+        metadata={
+            "bug_status": "open",
+            "severity": "medium",
+            "target": "developer",
+        },
+        created_at=now, updated_at=now,
+    ))
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 1
+    assert store.migrate_records_to_project(DEFAULT_PROJECT) == 0
+    raw = store.knowledge.get("bug_developer_legacy01")
+    assert raw.metadata["project"] == DEFAULT_PROJECT

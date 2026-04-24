@@ -21,6 +21,8 @@ from khonliang.knowledge.store import (
     Tier,
 )
 
+from developer.project_store import DEFAULT_PROJECT
+
 # The FR store is passed into :meth:`MilestoneStore.delete` as an
 # argument rather than imported here so milestone_store stays free of
 # any hard dependency on fr_store. The only place we need FR state is
@@ -139,6 +141,10 @@ class Milestone:
     superseded_by: str = ""
     created_at: float = 0.0
     updated_at: float = 0.0
+    # Phase 3 of fr_developer_5d0a8711: project as a first-class dimension.
+    # Read-time fallback to DEFAULT_PROJECT keeps pre-existing records
+    # valid; migrate_records_to_project() canonicalizes the metadata.
+    project: str = DEFAULT_PROJECT
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -147,6 +153,7 @@ class Milestone:
             "target": self.target,
             "status": self.status,
             "summary": self.summary,
+            "project": self.project,
             "fr_ids": list(self.fr_ids),
             "work_unit": dict(self.work_unit),
             "source": self.source,
@@ -177,6 +184,7 @@ class MilestoneStore:
         target: str = "",
         status: str = "",
         include_archived: bool = False,
+        project: Optional[str] = None,
     ) -> list[Milestone]:
         if status and status not in ALL_MILESTONE_STATUSES:
             raise MilestoneError(f"status must be one of: {sorted(ALL_MILESTONE_STATUSES)}")
@@ -206,6 +214,8 @@ class MilestoneStore:
                 continue
             milestone = _milestone_from_entry(entry)
             if target and milestone.target != target:
+                continue
+            if project and milestone.project != project:
                 continue
             if status_match and milestone.status not in status_match:
                 continue
@@ -245,8 +255,15 @@ class MilestoneStore:
         title: str = "",
         summary: str = "",
         source: str = "work_unit",
+        project: str = DEFAULT_PROJECT,
     ) -> Milestone:
-        """Create or update a proposed milestone from a ranked work unit."""
+        """Create or update a proposed milestone from a ranked work unit.
+
+        ``project`` partitions the milestone into a project slug; defaults
+        to :data:`DEFAULT_PROJECT` (Phase 3 of fr_developer_5d0a8711).
+        On re-propose the existing milestone's project is preserved
+        unless the caller explicitly overrides it via this argument.
+        """
         if not isinstance(work_unit, dict) or not work_unit:
             raise MilestoneError("work_unit is required")
 
@@ -264,6 +281,8 @@ class MilestoneStore:
                 "target is required when work_unit has missing or ambiguous targets"
             )
 
+        project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
+
         milestone_title = title.strip() or str(work_unit.get("name") or "FR work unit").strip()
         milestone_summary = summary.strip() or _summarize_work_unit(work_unit)
         rank = int(work_unit.get("rank") or 0)
@@ -279,6 +298,10 @@ class MilestoneStore:
         if existing is not None:
             notes_history = list(existing.notes_history)
             superseded_by = existing.superseded_by
+            # Preserve existing project unless the caller explicitly
+            # asked for a different one (non-default project arg).
+            if project == DEFAULT_PROJECT and existing.project:
+                project = existing.project
         else:
             notes_history = [{
                 "at": now,
@@ -305,6 +328,7 @@ class MilestoneStore:
             ),
             notes_history=notes_history,
             superseded_by=superseded_by,
+            project=project,
             created_at=created_at,
             updated_at=now,
         )
@@ -788,6 +812,7 @@ class MilestoneStore:
             metadata={
                 "milestone_status": milestone.status,
                 "target": milestone.target,
+                "project": milestone.project or DEFAULT_PROJECT,
                 "fr_ids": list(milestone.fr_ids),
                 "work_unit": dict(milestone.work_unit),
                 "source": milestone.source,
@@ -804,6 +829,32 @@ class MilestoneStore:
         if stored is not None:
             milestone.created_at = stored.created_at
             milestone.updated_at = stored.updated_at
+
+    # ------------------------------------------------------------------
+    # fr_developer_1c5178d2 — project-dimension migration helper
+    # ------------------------------------------------------------------
+
+    def migrate_records_to_project(
+        self, project: str = DEFAULT_PROJECT
+    ) -> int:
+        """Stamp ``project`` onto milestone records whose metadata lacks it.
+
+        Idempotent; returns the number of records actually rewritten.
+        See :meth:`FRStore.migrate_records_to_project` for rationale.
+        """
+        project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
+        rewritten = 0
+        for entry in self.knowledge.get_by_tier(Tier.DERIVED):
+            if "milestone" not in (entry.tags or []):
+                continue
+            meta = entry.metadata or {}
+            if meta.get("project"):
+                continue
+            milestone = _milestone_from_entry(entry)
+            milestone.project = project
+            self._store(milestone)
+            rewritten += 1
+        return rewritten
 
 
 def _milestone_from_entry(entry: KnowledgeEntry) -> Milestone:
@@ -824,6 +875,7 @@ def _milestone_from_entry(entry: KnowledgeEntry) -> Milestone:
         draft_spec=meta.get("draft_spec", ""),
         notes_history=list(meta.get("notes_history") or []),
         superseded_by=meta.get("superseded_by", "") or "",
+        project=meta.get("project") or DEFAULT_PROJECT,
         created_at=entry.created_at,
         updated_at=entry.updated_at,
     )

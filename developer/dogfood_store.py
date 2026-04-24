@@ -45,6 +45,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
+from developer.project_store import DEFAULT_PROJECT
 from khonliang.knowledge.store import (
     EntryStatus,
     KnowledgeEntry,
@@ -110,6 +111,8 @@ class Dogfood:
     duplicate_of: str = ""
     notes_history: list[dict] = field(default_factory=list)
     source: Optional[dict[str, Any]] = None
+    # Phase 3 of fr_developer_5d0a8711: project as a first-class dimension.
+    project: str = DEFAULT_PROJECT
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -120,6 +123,7 @@ class Dogfood:
             "context": self.context,
             "reporter": self.reporter,
             "status": self.status,
+            "project": self.project,
             "observed_at": self.observed_at,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -189,6 +193,7 @@ class DogfoodStore:
         status: Optional[Iterable[str] | str] = None,
         include_terminal: bool = False,
         limit: Optional[int] = 20,
+        project: Optional[str] = None,
     ) -> list[Dogfood]:
         """List dogfood entries, newest ``observed_at`` first.
 
@@ -215,6 +220,8 @@ class DogfoodStore:
             if kind and d.kind != kind:
                 continue
             if target and d.target != target:
+                continue
+            if project and d.project != project:
                 continue
             if since is not None and d.observed_at < since:
                 continue
@@ -296,6 +303,7 @@ class DogfoodStore:
         reporter: str = "",
         source: Optional[dict[str, Any]] = None,
         observed_at: Optional[float] = None,
+        project: str = DEFAULT_PROJECT,
     ) -> Dogfood:
         """Record a single dogfood observation.
 
@@ -330,6 +338,7 @@ class DogfoodStore:
                 f"(existing tags: {sorted(existing.tags or [])}); refusing to overwrite"
             )
 
+        project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
         dog = Dogfood(
             id=dog_id,
             observation=observation,
@@ -338,6 +347,7 @@ class DogfoodStore:
             context=context,
             reporter=reporter,
             status=DOGFOOD_STATUS_OBSERVED,
+            project=project,
             observed_at=observed,
             created_at=now,
             updated_at=now,
@@ -482,6 +492,7 @@ class DogfoodStore:
                 "dogfood_status": dog.status,
                 "kind": dog.kind,
                 "target": dog.target,
+                "project": dog.project or DEFAULT_PROJECT,
                 "context": dog.context,
                 "reporter": dog.reporter,
                 "observed_at": dog.observed_at,
@@ -498,6 +509,32 @@ class DogfoodStore:
         if stored is not None:
             dog.created_at = stored.created_at
             dog.updated_at = stored.updated_at
+
+    # ------------------------------------------------------------------
+    # fr_developer_1c5178d2 — project-dimension migration helper
+    # ------------------------------------------------------------------
+
+    def migrate_records_to_project(
+        self, project: str = DEFAULT_PROJECT
+    ) -> int:
+        """Stamp ``project`` onto dogfood records whose metadata lacks it.
+
+        Idempotent; returns the number of records actually rewritten.
+        See :meth:`FRStore.migrate_records_to_project` for rationale.
+        """
+        project = (project or DEFAULT_PROJECT).strip() or DEFAULT_PROJECT
+        rewritten = 0
+        for entry in self.knowledge.get_by_tier(Tier.DERIVED):
+            if "dogfood" not in (entry.tags or []):
+                continue
+            meta = entry.metadata or {}
+            if meta.get("project"):
+                continue
+            dog = _dogfood_from_entry(entry)
+            dog.project = project
+            self._store(dog)
+            rewritten += 1
+        return rewritten
 
     def _count_dogfood(self) -> int:
         count = 0
@@ -596,6 +633,7 @@ def _dogfood_from_entry(entry: KnowledgeEntry) -> Dogfood:
         context=meta.get("context", ""),
         reporter=meta.get("reporter", ""),
         status=meta.get("dogfood_status", DOGFOOD_STATUS_OBSERVED),
+        project=meta.get("project") or DEFAULT_PROJECT,
         observed_at=float(
             meta["observed_at"]
             if meta.get("observed_at") is not None

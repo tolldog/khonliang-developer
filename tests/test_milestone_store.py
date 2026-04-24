@@ -850,3 +850,81 @@ def test_audit_flag_named_force_override_not_force_rollback(pipeline):
     last = jumped.notes_history[-1]
     assert last.get("force_override") is True
     assert "force_rollback" not in last
+
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 of fr_developer_5d0a8711 — project dimension
+# ---------------------------------------------------------------------------
+
+
+def test_milestone_project_defaults_to_khonliang(pipeline):
+    from developer.project_store import DEFAULT_PROJECT
+    m = pipeline.milestones.propose_from_work_unit(_work_unit())
+    assert m.project == DEFAULT_PROJECT
+    raw = pipeline.knowledge.get(m.id)
+    assert raw.metadata["project"] == DEFAULT_PROJECT
+
+
+def test_milestone_project_passes_through_propose(pipeline):
+    m = pipeline.milestones.propose_from_work_unit(
+        _work_unit(), project="sibling-app",
+    )
+    assert m.project == "sibling-app"
+    raw = pipeline.knowledge.get(m.id)
+    assert raw.metadata["project"] == "sibling-app"
+
+
+def test_milestone_list_filters_by_project(pipeline):
+    def _wu(name, fr_ids):
+        return {
+            "name": name,
+            "targets": ["developer"],
+            "rank": 1,
+            "frs": [{"fr_id": fid, "target": "developer", "title": fid} for fid in fr_ids],
+        }
+    alpha = pipeline.milestones.propose_from_work_unit(
+        _wu("A", ["fr_developer_alpha01"]), project="alpha",
+    )
+    beta = pipeline.milestones.propose_from_work_unit(
+        _wu("B", ["fr_developer_beta01"]), project="beta",
+    )
+    alpha_only = pipeline.milestones.list(project="alpha")
+    ids = {m.id for m in alpha_only}
+    assert alpha.id in ids
+    assert beta.id not in ids
+
+
+def test_milestone_migrate_records_to_project_is_idempotent(pipeline):
+    from developer.project_store import DEFAULT_PROJECT
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+    import time
+    now = time.time()
+    # Legacy milestone missing `project`.
+    pipeline.knowledge.add(KnowledgeEntry(
+        id="ms_developer_legacy01",
+        tier=Tier.DERIVED,
+        title="Legacy MS",
+        content="body",
+        source="developer.milestone_store",
+        scope="development",
+        confidence=1.0,
+        status=EntryStatus.DISTILLED,
+        tags=["milestone", "target:developer", "status:proposed"],
+        metadata={
+            "milestone_status": "proposed",
+            "target": "developer",
+            "fr_ids": [],
+            "work_unit": {},
+            "source": "work_unit",
+            "rank": 0,
+        },
+        created_at=now, updated_at=now,
+    ))
+    # Current entry already has project.
+    pipeline.milestones.propose_from_work_unit(_work_unit())
+
+    assert pipeline.milestones.migrate_records_to_project(DEFAULT_PROJECT) == 1
+    assert pipeline.milestones.migrate_records_to_project(DEFAULT_PROJECT) == 0
+    raw = pipeline.knowledge.get("ms_developer_legacy01")
+    assert raw.metadata["project"] == DEFAULT_PROJECT

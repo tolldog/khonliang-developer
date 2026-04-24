@@ -77,6 +77,14 @@ _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 # every store without cross-talk.
 ENTRY_TAG = "project"
 
+# Project-dimension default for records that pre-date fr_developer_1c5178d2
+# (Phase 3 of fr_developer_5d0a8711). Every FR / milestone / bug / dogfood
+# record gets a ``project`` field with this default so records written
+# before the field existed continue to surface correctly at read time.
+# ``migrate_records_to_project`` bulk-stamps the metadata explicitly when
+# the caller wants the data tidy (not just fallback-tidy).
+DEFAULT_PROJECT = "khonliang"
+
 
 # ---------------------------------------------------------------------------
 # Domain objects
