@@ -4364,7 +4364,7 @@ def main():
     from khonliang_bus import add_version_flag
 
     parser = argparse.ArgumentParser(
-        prog="khonliang-developer",
+        prog="khonliang-developer-agent",
         description="khonliang-developer bus agent",
     )
     add_version_flag(parser)

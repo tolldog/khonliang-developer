@@ -1384,11 +1384,14 @@ def test_main_version_flag_prints_and_exits(capsys):
         sys.argv = saved_argv
 
     out = capsys.readouterr().out
-    # The argparse `prog=` matches the [project.scripts] entry point name
-    # so `khonliang-developer --help` / `--version` advertise the same
-    # invocation a user actually types. See sibling fix in
-    # khonliang-reviewer PR #18.
-    assert out.startswith("khonliang-developer "), f"unexpected prog name in {out!r}"
+    # The argparse `prog=` matches the bus-agent console-script name
+    # added in this same change (`khonliang-developer-agent`), distinct
+    # from `khonliang-developer` which launches the standalone MCP
+    # server in developer.server:main. Sibling spirit to khonliang-
+    # reviewer PR #18, adjusted for developer's two-binary layout.
+    assert out.startswith("khonliang-developer-agent "), (
+        f"unexpected prog name in {out!r}"
+    )
     # Version itself is resolved from pyproject at call time; only assert
     # it's a non-empty dotted version string so bumps don't break the test.
     version_part = out.strip().split(" ", 1)[1]
