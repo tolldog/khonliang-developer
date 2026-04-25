@@ -5,6 +5,8 @@ Acceptance #2, #4 (catalog assertion for developer_guide), #5, #6, #7, #8.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from developer.server import create_developer_server
@@ -119,7 +121,14 @@ async def test_list_specs_compact(mcp):
     )
     text = _extract_text(result)
     assert "project=developer" in text
-    assert "count=1" in text
+    # Don't pin the count — specs accumulate. The compact output only
+    # carries basenames (e.g. paths=spec.md,spec.md) so we can't pick
+    # out a specific spec here; just assert count is a positive int and
+    # that at least one spec.md is reported.
+    count_match = re.search(r"count=(\d+)", text)
+    assert count_match is not None, f"no count= field in compact output: {text!r}"
+    assert int(count_match.group(1)) >= 1
+    assert "spec.md" in text
 
 
 @pytest.mark.asyncio
