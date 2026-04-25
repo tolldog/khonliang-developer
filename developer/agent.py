@@ -1944,14 +1944,15 @@ class DeveloperAgent(BaseAgent):
     async def handle_propose_milestone_from_work_unit(self, args):
         from developer.milestone_store import MilestoneError
 
-        # Reject the common-but-wrong shape upfront. Top-level `frs=[...]`
-        # is what callers reach for when they want to bundle a specific
-        # set; without this guard the field is silently ignored, the
-        # handler falls through to next_work_unit, and a milestone is
-        # auto-created from the top-ranked unit instead. Force the
-        # caller to nest the FR list inside a `work_unit` object so the
-        # intent is unambiguous.
-        if "frs" in args and "work_unit" not in args:
+        # Reject top-level `frs=[...]` outright — it's never the right
+        # shape. A caller wanting to bundle a specific set must nest
+        # the IDs inside a `work_unit` object; a caller wanting auto-
+        # pick passes nothing. Anything in between (top-level `frs`
+        # alongside an empty/missing work_unit, etc.) used to silently
+        # fall through to next_work_unit and produce an auto-selected
+        # milestone, which looked like success but bundled the wrong
+        # FR set.
+        if "frs" in args:
             return {
                 "error": (
                     "top-level 'frs' is not honored; pass "

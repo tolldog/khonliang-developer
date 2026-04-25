@@ -900,17 +900,28 @@ async def test_propose_milestone_rejects_top_level_frs(harness):
     from the top-ranked unit, which looked like success but bundled
     the wrong FR set. The handler now refuses upfront and points at
     the correct nested shape.
+
+    Three variants — top-level `frs` is rejected regardless of whether
+    `work_unit` is absent, empty-string, or empty-dict. Earlier the
+    guard only triggered when `work_unit` was absent, so a caller who
+    passed both `frs=[...]` and a falsy `work_unit` could still slip
+    through to the auto-pick path (Copilot review on PR #56).
     """
-    result = await harness.call("propose_milestone_from_work_unit", {
+    common = {
         "frs": ["fr_developer_aaaa", "fr_developer_bbbb"],
         "title": "Bundle these",
         "summary": "from top-level frs",
-    })
-    assert "error" in result
-    assert "top-level 'frs' is not honored" in result["error"]
-    assert "work_unit" in result["error"]
-    # No milestone artifact created.
-    assert "milestone" not in result
+    }
+    for variant in (
+        common,
+        {**common, "work_unit": ""},
+        {**common, "work_unit": {}},
+    ):
+        result = await harness.call("propose_milestone_from_work_unit", variant)
+        assert "error" in result, f"variant {variant!r} should be rejected"
+        assert "top-level 'frs' is not honored" in result["error"]
+        assert "work_unit" in result["error"]
+        assert "milestone" not in result
 
 
 @pytest.mark.asyncio
