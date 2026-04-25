@@ -50,9 +50,19 @@ def test_read_spec_finds_strict_fr_reference(pipeline):
 
 def test_list_specs_discovers_via_project_config(pipeline):
     summaries = pipeline.specs.list_specs("developer")
-    assert len(summaries) == 1
-    assert Path(summaries[0].path).name == "spec.md"
-    assert summaries[0].fr == "fr_developer_28a11ce2"
+    # Don't pin the count — the developer repo accumulates specs over
+    # time. Just verify the MS-01 entry is discoverable, and that every
+    # returned path is a spec.md.
+    ms01 = next(
+        (s for s in summaries if Path(s.path).parent.name == "MS-01"),
+        None,
+    )
+    assert ms01 is not None, (
+        f"MS-01 spec not found among {[Path(s.path).parent.name for s in summaries]}"
+    )
+    assert Path(ms01.path).name == "spec.md"
+    assert ms01.fr == "fr_developer_28a11ce2"
+    assert all(Path(s.path).name == "spec.md" for s in summaries)
 
 
 def test_list_specs_unknown_project_returns_empty(pipeline):
