@@ -559,6 +559,79 @@ async def test_get_pr_closed_without_merge_has_none_merged_at():
 
 
 @pytest.mark.asyncio
+async def test_pr_readiness_classifies_merged_pr_as_terminal():
+    """A merged PR is terminal — must NOT be classified as needs_fixes
+    just because a CHANGES_REQUESTED review predates the merge.
+
+    Regression guard for bug_developer_b317e4ea: the readiness ladder
+    used to fall straight through to the review-state check, so any
+    merged PR that had ever received a CHANGES_REQUESTED review came
+    back as `needs_fixes` despite being closed and merged.
+    """
+    c = GithubClient(token="t")
+    _install_fake_gh(
+        c,
+        pr=_FakePR(
+            state="closed",
+            merged=True,
+            merged_at="2026-04-25T06:00:00Z",
+            mergeable_state="unknown",
+        ),
+        reviews=[
+            _FakeReview(
+                1, "CHANGES_REQUESTED", "old block", "2026-04-13T00:00:00Z",
+                user=_FakeUser(login="someone"),
+            ),
+        ],
+    )
+    out = await c.pr_readiness("o/n", 42)
+    assert out.state == "merged"
+    assert out.recommended_action == "no_action"
+
+
+@pytest.mark.asyncio
+async def test_pr_readiness_classifies_closed_unmerged_pr_as_terminal():
+    """A closed-but-not-merged PR is terminal — must surface an explicit
+    closed_unmerged state rather than running through the review/merge
+    ladder.
+    """
+    c = GithubClient(token="t")
+    _install_fake_gh(
+        c,
+        pr=_FakePR(
+            state="closed",
+            merged=False,
+            merged_at=None,
+            mergeable_state="unknown",
+        ),
+    )
+    out = await c.pr_readiness("o/n", 42)
+    assert out.state == "closed_unmerged"
+    assert out.recommended_action == "reopen_or_drop"
+
+
+@pytest.mark.asyncio
+async def test_pr_readiness_terminal_skips_review_fetches():
+    """Terminal PRs don't trigger the review/comment list fetches —
+    saves three REST calls per polling iteration on done PRs.
+    """
+    c = GithubClient(token="t")
+    _install_fake_gh(
+        c,
+        pr=_FakePR(state="closed", merged=True, merged_at="2026-04-25T06:00:00Z"),
+    )
+    # Replace the list helpers with sentinels that fail the test if called.
+    async def _boom(*args, **kwargs):  # pragma: no cover - sentinel
+        raise AssertionError("review/comment fetch must not run for terminal PRs")
+    c.list_pr_reviews = _boom  # type: ignore[method-assign]
+    c.list_pr_review_comments = _boom  # type: ignore[method-assign]
+    c.list_pr_issue_comments = _boom  # type: ignore[method-assign]
+
+    out = await c.pr_readiness("o/n", 42)
+    assert out.state == "merged"
+
+
+@pytest.mark.asyncio
 async def test_pr_readiness_classifies_policy_blocked_after_copilot_clear():
     c = GithubClient(token="t")
     _install_fake_gh(c, pr=_FakePR(mergeable_state="blocked"), issue_comments=[

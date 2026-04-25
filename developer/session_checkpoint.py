@@ -14,6 +14,7 @@ from typing import Any
 
 from developer.fr_store import FR
 from developer.git_client import RepoStatus
+from developer.github_client import TERMINAL_PR_STATES
 from developer.tests_runner import RunResult, format_response as format_test_response
 
 
@@ -334,8 +335,12 @@ def _next_actions(
     else:
         actions.append("run tests and store a distilled digest")
     if pr_summary:
+        # Skip terminal PRs (merged / closed_unmerged) — their
+        # recommended_action is informational only. Skip ready_normal_merge
+        # too: "merge" is the user's verb, not a queued task.
+        state = pr_summary.get("state", "")
         action = pr_summary.get("recommended_action")
-        if action and action != "merge":
+        if state not in TERMINAL_PR_STATES and action and action != "merge":
             actions.append(str(action))
     else:
         actions.append("open or update PR when branch is ready")

@@ -56,6 +56,45 @@ def test_checkpoint_shape_includes_repo_actions_and_resume_basis():
     assert "checkpoint durable state before idle or exit" in checkpoint["next_actions"]
 
 
+def test_checkpoint_skips_terminal_pr_action_in_next_actions():
+    """A merged or closed-unmerged PR's `recommended_action`
+    ("no_action" / "reopen_or_drop") is informational only. Filtering
+    on the state field rather than the action string prevents the
+    terminal verdict from leaking into the queued next-actions list.
+    """
+    pr_ready_merged = {
+        "state": "merged",
+        "recommended_action": "no_action",
+        "head_sha": "abc",
+    }
+    checkpoint = build_session_checkpoint(
+        fr=None,
+        work_unit=None,
+        repo_path="/repo",
+        git_status=RepoStatus(branch="fr/x", is_dirty=False),
+        pr_ready=pr_ready_merged,
+        head_sha="abc",
+        now=1000,
+    )
+    assert "no_action" not in checkpoint["next_actions"]
+
+    pr_ready_closed = {
+        "state": "closed_unmerged",
+        "recommended_action": "reopen_or_drop",
+        "head_sha": "abc",
+    }
+    checkpoint2 = build_session_checkpoint(
+        fr=None,
+        work_unit=None,
+        repo_path="/repo",
+        git_status=RepoStatus(branch="fr/x", is_dirty=False),
+        pr_ready=pr_ready_closed,
+        head_sha="abc",
+        now=1000,
+    )
+    assert "reopen_or_drop" not in checkpoint2["next_actions"]
+
+
 def test_resume_briefing_marks_stale_checkpoint():
     checkpoint = build_session_checkpoint(
         fr=None,
