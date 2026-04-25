@@ -14,80 +14,37 @@ def harness(temp_config_file):
 
 # -- skills --
 
-def test_skill_count(harness):
-    # 34 existing skills + 7 milestone/handoff/migration skills
-    # + concept FR candidates + PR readiness + session checkpoint/resume
-    # + repo hygiene audit/apply
-    # + PR fleet watcher trio (watch/list/stop)
-    # + pr_fleet_status snapshot (fr_developer_fafb36f1).
-    # + tracking-infrastructure Phase 1 (BugStore 6 + DogfoodStore 3 = 9).
-    # + tracking-infrastructure Phase 2A (triage_bug / link_bug_fr /
-    #   triage_dogfood / dogfood_triage_queue / report_gap = 5).
-    # + milestone lifecycle (fr_developer_91a5a072): update_status /
-    #   supersede / update_frs / delete = 4.
-    # + integration-point scanner (fr_developer_82fe7309): suggest +
-    #   distill = 2.
-    # + project ecosystem introspection (fr_developer_5564b81f): 1.
-    # + project lifecycle (fr_developer_5d0a8711 Phase 2):
-    #   project_init / list_projects / get_project = 3.
-    # + pre-push review orchestration (fr_developer_6ecd0c01):
-    #   review_staged_diff = 1.
-    assert len(harness.skills) == 76
+def test_handler_skill_consistency(harness):
+    """Set-symmetry check between advertised Skills and @handler methods.
 
+    Pulls Skills from BaseAgent._all_skills() (subclass register_skills
+    plus built-ins like the default health_check) and handler names from
+    BaseAgent._handlers. Asserts each side is a subset of the other.
+    Replaces a hardcoded count + name set that had to be bumped on every
+    PR; catches real registration bugs (advertised skill that 404s,
+    handler invisible to discovery) the count check could not.
 
-def test_skills_registered(harness):
-    expected = {
-        "read_spec", "list_specs", "traverse_milestone",
-        "health_check", "developer_guide",
-        "get_fr", "list_frs", "get_paper_context",
-        "fr_candidates_from_concepts",
-        "pr_ready",
-        "next_work_unit", "work_units",
-        "propose_milestone_from_work_unit", "get_milestone",
-        "list_milestones", "draft_spec_from_milestone", "review_milestone_scope",
-        "prepare_development_handoff",
-        "migrate_frs_from_researcher",
-        "create_session_checkpoint", "resume_session_checkpoint",
-        "audit_repo_hygiene", "apply_repo_hygiene_plan",
-        "run_tests",
-        # developer-owned FR lifecycle (PR #10)
-        "promote_fr", "update_fr_status", "set_fr_dependency",
-        "get_fr_local", "list_frs_local",
-        # merge write op (PR #11)
-        "merge_frs",
-        # in-place edit + next-to-work picker (this PR)
-        "update_fr", "next_fr_local",
-        # native git operations (fr_developer_e778b9bf)
-        "git_status", "git_log", "git_diff", "git_branches", "git_commit",
-        "git_stage", "git_unstage", "git_checkout", "git_create_branch",
-        "git_delete_branch", "git_fetch", "git_pull", "git_push",
-        "git_show", "git_rev_parse",
-        # long-running PR fleet watcher (fr_developer_6c8ec260)
-        "watch_pr_fleet", "list_pr_watchers", "stop_pr_watcher",
-        # fleet-digest snapshot (fr_developer_fafb36f1)
-        "pr_fleet_status",
-        # tracking-infrastructure Phase 1 (fr_developer_f669bd33 +
-        # fr_developer_1324440c): BugStore + DogfoodStore CRUD.
-        "file_bug", "list_bugs", "get_bug", "update_bug_status",
-        "link_bug_pr", "close_bug",
-        "log_dogfood", "list_dogfood", "get_dogfood",
-        # tracking-infrastructure Phase 2A: triage loop + report_gap hook.
-        # Phase 2B (GH issue ingest, fr_developer_47271f34) follows.
-        "triage_bug", "link_bug_fr", "triage_dogfood",
-        "dogfood_triage_queue", "report_gap",
-        # milestone lifecycle (fr_developer_91a5a072)
-        "update_milestone_status", "supersede_milestone",
-        "update_milestone_frs", "delete_milestone",
-        # integration-point scanner (fr_developer_82fe7309)
-        "suggest_integration_points", "distill_integration_points",
-        # project ecosystem introspection (fr_developer_5564b81f)
-        "project_ecosystem",
-        # project lifecycle (fr_developer_5d0a8711 Phase 2)
-        "project_init", "list_projects", "get_project",
-        # pre-push review orchestration (fr_developer_6ecd0c01)
-        "review_staged_diff",
-    }
-    assert harness.skill_names == expected
+    Reaches into _all_skills() and _handlers — both BaseAgent privates —
+    because there's no public harness accessor for either today. Public
+    harness.skills omits built-ins; there's no equivalent for handlers.
+    Extracting handler_names (and a built-ins-aware skill enumeration)
+    onto AgentTestHarness in khonliang-bus-lib is the proper home and is
+    tracked as a follow-up FR.
+    """
+    skill_names = {s.name for s in harness.agent._all_skills()}
+    handler_names = set(harness.agent._handlers)
+
+    skills_without_handler = sorted(skill_names - handler_names)
+    handlers_without_skill = sorted(handler_names - skill_names)
+
+    assert not skills_without_handler, (
+        "Skill(s) declared in register_skills with no matching @handler: "
+        f"{skills_without_handler}"
+    )
+    assert not handlers_without_skill, (
+        "@handler method(s) with no corresponding Skill registration: "
+        f"{handlers_without_skill}"
+    )
 
 
 def test_read_spec_skill(harness):
@@ -572,7 +529,6 @@ async def test_read_spec_brief_detail_omits_text(harness):
 def test_registration_metadata(harness):
     reg = harness.registration
     assert reg.agent_type == "developer"
-    assert len(reg.skills) == 76
     assert len(reg.collaborations) == 1
 
 
