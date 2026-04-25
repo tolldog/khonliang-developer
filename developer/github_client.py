@@ -394,7 +394,20 @@ class GithubClient:
         actionable_comments = len(review_comments)
         merge_state = str(pr.get("mergeable_state") or "unknown").lower()
 
-        if pr.get("draft"):
+        # Terminal states first — a merged or closed-unmerged PR has no
+        # actionable readiness ladder, and falling through to the
+        # review-state checks below misclassified merged PRs as
+        # `needs_fixes` whenever a CHANGES_REQUESTED review predated the
+        # merge (bug_developer_b317e4ea). GitHub's `state` field is
+        # `closed` for both merged and closed-unmerged; the `merged`
+        # boolean disambiguates.
+        if pr.get("merged"):
+            state = "merged"
+            action = "no_action"
+        elif str(pr.get("state") or "").lower() == "closed":
+            state = "closed_unmerged"
+            action = "reopen_or_drop"
+        elif pr.get("draft"):
             state = "blocked_draft"
             action = "mark_ready_for_review"
         elif effective_blocking_reviews:
