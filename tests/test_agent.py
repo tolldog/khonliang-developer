@@ -1857,6 +1857,53 @@ async def test_promote_fr_defaults_project_to_default_project(harness):
 
 
 @pytest.mark.asyncio
+async def test_promote_fr_default_returns_brief_lifecycle_shape(harness):
+    """Legacy callers see no behavior change — minimal lifecycle dict."""
+    result = await harness.call("promote_fr", {
+        "target": "developer", "title": "brief", "description": "d",
+    })
+    assert set(result.keys()) == {"fr_id", "target", "priority", "status", "project"}
+    # The verbose fields don't leak in the default shape.
+    assert "description" not in result
+    assert "title" not in result
+
+
+@pytest.mark.asyncio
+async def test_promote_fr_detail_full_returns_public_fr_dict(harness):
+    """detail='full' returns the public FR dict so caller can verify
+    the description / backing_papers landed without a follow-up
+    get_fr_local round-trip (fr_developer_9d6abe20).
+    """
+    result = await harness.call("promote_fr", {
+        "target": "developer",
+        "title": "verifyme",
+        "description": "the body i want to confirm landed",
+        "concept": "round-trip elimination",
+        "backing_papers": "paper-A,paper-B",
+        "detail": "full",
+    })
+    assert result["title"] == "verifyme"
+    assert result["description"] == "the body i want to confirm landed"
+    assert result["concept"] == "round-trip elimination"
+    assert result["backing_papers"] == ["paper-A", "paper-B"]
+    # `id` is the canonical FR-store key; `fr_id` alias preserved so
+    # callers that switch from brief to full don't break.
+    assert "id" in result
+    assert result["fr_id"] == result["id"]
+    assert result["status"] == "open"
+
+
+@pytest.mark.asyncio
+async def test_promote_fr_rejects_unknown_detail_value(harness):
+    result = await harness.call("promote_fr", {
+        "target": "developer", "title": "x", "description": "d",
+        "detail": "verbose",
+    })
+    assert "error" in result
+    assert "detail" in result["error"]
+
+
+@pytest.mark.asyncio
 async def test_promote_fr_passes_project_through_to_store(harness):
     result = await harness.call("promote_fr", {
         "target": "developer", "title": "alpha-proj-fr", "description": "d",
