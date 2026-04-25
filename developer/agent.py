@@ -518,7 +518,9 @@ class DeveloperAgent(BaseAgent):
             # Developer-owned FR lifecycle. Researcher is no longer an FR
             # authority; migrate old researcher FR ids into developer before
             # executing against them so external references keep working.
-            Skill("promote_fr", "Create a new FR in developer's store",
+            Skill("promote_fr", "Create a new FR in developer's store. "
+                  "Returns lifecycle fields by default; pass detail='full' "
+                  "to get the public FR dict back (skips a verify round-trip).",
                   {"target": {"type": "string", "required": True},
                    "title": {"type": "string", "required": True},
                    "description": {"type": "string", "required": True},
@@ -527,7 +529,9 @@ class DeveloperAgent(BaseAgent):
                    "classification": {"type": "string", "default": "app"},
                    "backing_papers": {"type": "string", "default": ""},
                    "project": {"type": "string", "default": "",
-                               "description": f"project slug (Phase 3); empty defaults to {DEFAULT_PROJECT!r}"}},
+                               "description": f"project slug (Phase 3); empty defaults to {DEFAULT_PROJECT!r}"},
+                   "detail": {"type": "string", "default": "brief",
+                              "description": "'brief' (legacy minimal shape) or 'full' (public FR dict)"}},
                   since="0.4.0"),
             # fr_developer_232574cd — request → draft FR with corpus + code
             # enrichment. Never auto-promotes; caller calls promote_fr
@@ -2535,6 +2539,19 @@ class DeveloperAgent(BaseAgent):
     async def handle_promote_fr(self, args):
         from developer.fr_store import FRError
 
+        # ``detail`` controls return verbosity. Default ``brief`` keeps
+        # the legacy minimal shape (id + lifecycle fields) so existing
+        # callers see no change. Opt-in ``full`` returns the public FR
+        # dict so a caller can verify the description / backing_papers
+        # landed correctly without a follow-up get_fr_local round-trip
+        # (fr_developer_9d6abe20).
+        detail = str(args.get("detail") or "brief").strip().lower()
+        if detail not in {"brief", "full"}:
+            return {
+                "error": (
+                    f"detail must be 'brief' or 'full', got {detail!r}"
+                )
+            }
         try:
             backing = [p.strip() for p in (args.get("backing_papers") or "").split(",") if p.strip()]
             # Phase 3 pass-through: an empty/whitespace `project` at
@@ -2558,6 +2575,12 @@ class DeveloperAgent(BaseAgent):
         except Exception as e:
             await self.report_gap("promote_fr", f"unexpected failure: {e}")
             raise
+        if detail == "full":
+            payload = fr.to_public_dict()
+            # Mirror the legacy ``fr_id`` alias so callers that read it
+            # by key keep working when they bump to detail='full'.
+            payload["fr_id"] = fr.id
+            return payload
         return {
             "fr_id": fr.id,
             "target": fr.target,
