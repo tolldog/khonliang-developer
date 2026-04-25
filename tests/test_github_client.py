@@ -567,6 +567,11 @@ async def test_pr_readiness_classifies_merged_pr_as_terminal():
     used to fall straight through to the review-state check, so any
     merged PR that had ever received a CHANGES_REQUESTED review came
     back as `needs_fixes` despite being closed and merged.
+
+    `recommended_action` is the empty string for terminal states so
+    downstream consumers (e.g. session_checkpoint._next_actions, which
+    appends any non-empty action != 'merge') don't surface a confusing
+    "no_action" task for a merged PR.
     """
     c = GithubClient(token="t")
     _install_fake_gh(
@@ -586,14 +591,14 @@ async def test_pr_readiness_classifies_merged_pr_as_terminal():
     )
     out = await c.pr_readiness("o/n", 42)
     assert out.state == "merged"
-    assert out.recommended_action == "no_action"
+    assert out.recommended_action == ""
 
 
 @pytest.mark.asyncio
 async def test_pr_readiness_classifies_closed_unmerged_pr_as_terminal():
     """A closed-but-not-merged PR is terminal — must surface an explicit
     closed_unmerged state rather than running through the review/merge
-    ladder.
+    ladder. Empty `recommended_action` for the same reason.
     """
     c = GithubClient(token="t")
     _install_fake_gh(
@@ -607,7 +612,28 @@ async def test_pr_readiness_classifies_closed_unmerged_pr_as_terminal():
     )
     out = await c.pr_readiness("o/n", 42)
     assert out.state == "closed_unmerged"
-    assert out.recommended_action == "reopen_or_drop"
+    assert out.recommended_action == ""
+
+
+@pytest.mark.asyncio
+async def test_pr_readiness_terminal_skips_review_fetches():
+    """Terminal PRs don't trigger the review/comment list fetches —
+    saves three REST calls per polling iteration on done PRs.
+    """
+    c = GithubClient(token="t")
+    _install_fake_gh(
+        c,
+        pr=_FakePR(state="closed", merged=True, merged_at="2026-04-25T06:00:00Z"),
+    )
+    # Replace the list helpers with sentinels that fail the test if called.
+    async def _boom(*args, **kwargs):  # pragma: no cover - sentinel
+        raise AssertionError("review/comment fetch must not run for terminal PRs")
+    c.list_pr_reviews = _boom  # type: ignore[method-assign]
+    c.list_pr_review_comments = _boom  # type: ignore[method-assign]
+    c.list_pr_issue_comments = _boom  # type: ignore[method-assign]
+
+    out = await c.pr_readiness("o/n", 42)
+    assert out.state == "merged"
 
 
 @pytest.mark.asyncio

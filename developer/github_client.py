@@ -372,9 +372,52 @@ class GithubClient:
         does capture the failure mode we hit repeatedly: Copilot clears the
         latest commit in conversation comments while branch policy still
         reports a review block.
+
+        Terminal states (merged, closed-unmerged) short-circuit before
+        the review/comment fetches so polling workflows don't spend
+        three extra REST calls per loop on PRs that are already done.
         """
-        pr, reviews, review_comments, issue_comments = await asyncio.gather(
-            self.get_pr(repo, pr_number),
+        pr = await self.get_pr(repo, pr_number)
+        merge_state = str(pr.get("mergeable_state") or "unknown").lower()
+
+        # Terminal states are answered from `pr` alone — a merged or
+        # closed-unmerged PR has no actionable readiness ladder, so
+        # `recommended_action` is the empty string (downstream consumers
+        # like session_checkpoint._next_actions filter empty actions
+        # out). GitHub's `state` field is `closed` for both merged and
+        # closed-unmerged; the `merged` boolean disambiguates. Falling
+        # through to the review ladder used to misclassify merged PRs
+        # as `needs_fixes` whenever a CHANGES_REQUESTED review predated
+        # the merge (bug_developer_b317e4ea).
+        if pr.get("merged"):
+            return GithubPRReadiness(
+                state="merged",
+                recommended_action="",
+                copilot_verdict="",
+                latest_copilot_comment="",
+                actionable_comments=0,
+                review_decision="unknown",
+                merge_state=merge_state,
+                head_ref=pr.get("head", ""),
+                head_sha=pr.get("head_sha", ""),
+                url=pr.get("html_url", ""),
+            )
+        if str(pr.get("state") or "").lower() == "closed":
+            return GithubPRReadiness(
+                state="closed_unmerged",
+                recommended_action="",
+                copilot_verdict="",
+                latest_copilot_comment="",
+                actionable_comments=0,
+                review_decision="unknown",
+                merge_state=merge_state,
+                head_ref=pr.get("head", ""),
+                head_sha=pr.get("head_sha", ""),
+                url=pr.get("html_url", ""),
+            )
+
+        # Active PR — fetch review state concurrently and run the ladder.
+        reviews, review_comments, issue_comments = await asyncio.gather(
             self.list_pr_reviews(repo, pr_number),
             self.list_pr_review_comments(repo, pr_number),
             self.list_pr_issue_comments(repo, pr_number),
@@ -392,22 +435,8 @@ class GithubClient:
             if not (copilot_comment and is_copilot_login(r.reviewer))
         ]
         actionable_comments = len(review_comments)
-        merge_state = str(pr.get("mergeable_state") or "unknown").lower()
 
-        # Terminal states first — a merged or closed-unmerged PR has no
-        # actionable readiness ladder, and falling through to the
-        # review-state checks below misclassified merged PRs as
-        # `needs_fixes` whenever a CHANGES_REQUESTED review predated the
-        # merge (bug_developer_b317e4ea). GitHub's `state` field is
-        # `closed` for both merged and closed-unmerged; the `merged`
-        # boolean disambiguates.
-        if pr.get("merged"):
-            state = "merged"
-            action = "no_action"
-        elif str(pr.get("state") or "").lower() == "closed":
-            state = "closed_unmerged"
-            action = "reopen_or_drop"
-        elif pr.get("draft"):
+        if pr.get("draft"):
             state = "blocked_draft"
             action = "mark_ready_for_review"
         elif effective_blocking_reviews:
