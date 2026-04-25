@@ -824,6 +824,59 @@ Thought Communication (strength: 60%)
 
 
 @pytest.mark.asyncio
+async def test_draft_fr_from_request_returns_promote_ready_draft(harness):
+    """Handler wires brief_on + a code scan into compose_draft and
+    returns a draft whose `draft` field is shaped for promote_fr.
+    """
+    async def mock_request(**kwargs):
+        assert kwargs["operation"] == "brief_on"
+        assert kwargs["args"]["topic"].startswith("Add a foo_threshold")
+        assert kwargs["args"]["in_context_of"] == "reviewer"
+        return {"result": {"brief": "Corpus says foo thresholds matter.",
+                            "sources": ["paper-A"]}}
+
+    harness.agent.request = mock_request
+    result = await harness.call("draft_fr_from_request", {
+        "request": "Add a foo_threshold knob to the reviewer.",
+        "target": "reviewer",
+    })
+    assert "error" not in result
+    assert "draft_id" in result
+    assert result["draft"]["target"] == "reviewer"
+    assert result["draft"]["title"].startswith("Add a foo_threshold")
+    assert "Corpus says foo thresholds matter." in result["draft"]["description"]
+    # Brief sources end up in promote_fr's backing_papers shape.
+    assert result["draft"]["backing_papers"] == "paper-A"
+    # No FR was written to the store — caller must call promote_fr explicitly.
+    listed = await harness.call("list_frs_local", {})
+    assert all(
+        fr["title"] != result["draft"]["title"] for fr in listed["frs"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_draft_fr_from_request_rejects_empty_request(harness):
+    result = await harness.call("draft_fr_from_request", {"request": "   "})
+    assert result == {"error": "request is required"}
+
+
+@pytest.mark.asyncio
+async def test_draft_fr_from_request_records_brief_failure_diagnostic(harness):
+    async def mock_request(**kwargs):
+        raise RuntimeError("bus down")
+
+    harness.agent.request = mock_request
+    result = await harness.call("draft_fr_from_request", {
+        "request": "Some request that needs context.",
+        "target": "developer",
+    })
+    assert "error" not in result
+    assert any("brief_on failed" in d for d in result["diagnostics"])
+    # Draft is still composed from the request itself.
+    assert result["draft"]["title"]
+
+
+@pytest.mark.asyncio
 async def test_fr_candidates_from_concepts_allows_timeout_override(harness):
     concept_response = {"result": {"result": ""}}
     seen = {}
