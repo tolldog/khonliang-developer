@@ -2420,9 +2420,11 @@ class DeveloperAgent(BaseAgent):
         if not request:
             return {"error": "request is required"}
         target = str(args.get("target") or "").strip()
-        repo_hints = [
-            h.strip() for h in str(args.get("repo_hints") or "").split(",") if h.strip()
-        ]
+        # repo_hints accepts list-of-strings (preferred) or
+        # comma-separated string (back-compat with the skill schema).
+        # Stringifying a list produces "['a','b']" which is wrong;
+        # _parse_paths normalizes both shapes.
+        repo_hints = _parse_paths(args.get("repo_hints"))
         priority = str(args.get("priority") or "").strip()
         classification = str(args.get("classification") or "").strip()
 

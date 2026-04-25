@@ -324,6 +324,16 @@ async def compose_draft(
     repo_hints = list(repo_hints or [])
     diagnostics: list[str] = []
 
+    # promote_fr requires a non-empty target. We don't reject here —
+    # the draft is still useful as a scaffold the caller can edit —
+    # but we surface a diagnostic so the caller knows they must fill
+    # `target` before passing the draft to promote_fr.
+    if not target:
+        diagnostics.append(
+            "target is empty; fill it before passing the draft to "
+            "promote_fr (which requires a non-empty target)"
+        )
+
     if not request.strip():
         return DraftFR(
             draft={
@@ -346,7 +356,9 @@ async def compose_draft(
         except Exception as exc:  # noqa: BLE001 — best-effort
             diagnostics.append(f"brief_on failed: {exc}")
     else:
-        diagnostics.append("no brief_fn supplied; motivation will be caller's request")
+        diagnostics.append(
+            "no brief_fn supplied; Motivation section omitted from the draft"
+        )
 
     # 2. Code evidence — best-effort.
     code_evidence: list[CodeEvidence] = []

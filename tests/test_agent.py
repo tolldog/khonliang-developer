@@ -861,6 +861,41 @@ async def test_draft_fr_from_request_rejects_empty_request(harness):
 
 
 @pytest.mark.asyncio
+async def test_draft_fr_from_request_accepts_list_repo_hints(harness):
+    """`repo_hints` should accept either a comma-separated string or
+    a JSON/list. Stringifying a list to ``"['a.py', 'b.py']"`` would
+    have produced bogus hint paths in the prior implementation.
+    """
+    seen_hints = []
+
+    async def mock_request(**kwargs):
+        return {"result": {"brief": "", "sources": []}}
+
+    # Replace the scan helper so we can capture what hints reach the
+    # composer without depending on a real repo layout.
+    import developer.fr_drafting as drafting
+
+    real_scan = drafting.scan_for_evidence
+
+    def spy_scan(repo_root, tokens, *, repo_hints=(), **kw):
+        seen_hints.extend(list(repo_hints))
+        return real_scan(repo_root, tokens, repo_hints=repo_hints, **kw)
+
+    harness.agent.request = mock_request
+    drafting.scan_for_evidence = spy_scan
+    try:
+        await harness.call("draft_fr_from_request", {
+            "request": "Touch a couple of paths.",
+            "target": "developer",
+            "repo_hints": ["developer/agent.py", "tests/test_agent.py"],
+        })
+    finally:
+        drafting.scan_for_evidence = real_scan
+
+    assert seen_hints == ["developer/agent.py", "tests/test_agent.py"]
+
+
+@pytest.mark.asyncio
 async def test_draft_fr_from_request_rejects_bad_timeout(harness):
     """brief_timeout_s must be a positive finite number."""
     for bad in ("slow", -1, 0, float("inf")):

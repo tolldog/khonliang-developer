@@ -286,3 +286,20 @@ async def test_compose_draft_no_callables_records_diagnostics():
     # Still produces a usable draft from the request alone.
     assert result.draft["title"] != ""
     assert "**Request.**" in result.draft["description"]
+    # Without a brief, Motivation must be omitted (not duplicated from
+    # Request).
+    assert "**Motivation.**" not in result.draft["description"]
+
+
+@pytest.mark.asyncio
+async def test_compose_draft_records_diagnostic_when_target_empty():
+    """promote_fr requires a non-empty target; surface that mismatch
+    so a caller doesn't pass the draft straight through and hit a
+    server-side rejection. The draft is still composed — caller can
+    fill the field before promoting.
+    """
+    result = await compose_draft(request="ordinary request")
+    diags = " ".join(result.diagnostics)
+    assert "target is empty" in diags
+    assert result.draft["title"]  # still useful as a scaffold
+    assert result.draft["target"] == ""
