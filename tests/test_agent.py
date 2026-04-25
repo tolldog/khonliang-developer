@@ -861,6 +861,18 @@ async def test_draft_fr_from_request_rejects_empty_request(harness):
 
 
 @pytest.mark.asyncio
+async def test_draft_fr_from_request_rejects_bad_timeout(harness):
+    """brief_timeout_s must be a positive finite number."""
+    for bad in ("slow", -1, 0, float("inf")):
+        result = await harness.call("draft_fr_from_request", {
+            "request": "ok",
+            "brief_timeout_s": bad,
+        })
+        assert "error" in result, f"value {bad!r} should be rejected"
+        assert "brief_timeout_s" in result["error"]
+
+
+@pytest.mark.asyncio
 async def test_draft_fr_from_request_records_brief_failure_diagnostic(harness):
     async def mock_request(**kwargs):
         raise RuntimeError("bus down")

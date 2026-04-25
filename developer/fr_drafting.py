@@ -162,6 +162,12 @@ def scan_for_evidence(
     biases the search to specific subpaths (e.g. ``["developer/agent.py"]``)
     by checking those first. Best-effort: any I/O error skips the
     file silently.
+
+    Symlink-safe: every candidate path is resolved and then required to
+    stay under ``repo_root`` (post-resolution). A symlink that points
+    outside the repo is silently dropped — we don't want to leak an
+    absolute path from the host filesystem into ``CodeEvidence.path``,
+    or read content the caller didn't intend.
     """
     if not repo_root.exists() or not repo_root.is_dir():
         return []
@@ -169,38 +175,42 @@ def scan_for_evidence(
     if not tokens_list:
         return []
 
-    candidate_paths: list[Path] = []
-    seen_paths: set[Path] = set()
-    # Hinted paths first.
-    for hint in repo_hints:
-        p = (repo_root / hint).resolve()
-        if p.exists() and p.is_file() and p not in seen_paths:
-            candidate_paths.append(p)
-            seen_paths.add(p)
-    # Then a glob walk.
-    for pattern in globs:
-        for p in sorted(repo_root.glob(pattern)):
-            try:
-                resolved = p.resolve()
-            except OSError:
-                continue
-            if resolved.is_file() and resolved not in seen_paths:
-                candidate_paths.append(resolved)
-                seen_paths.add(resolved)
+    try:
+        root_resolved = repo_root.resolve()
+    except OSError:
+        return []
+
+    def _within_root(p: Path) -> Optional[Path]:
+        try:
+            resolved = p.resolve()
+        except OSError:
+            return None
+        try:
+            resolved.relative_to(root_resolved)
+        except ValueError:
+            return None
+        return resolved
 
     evidence: list[CodeEvidence] = []
     matched_per_token: dict[str, int] = {t: 0 for t in tokens_list}
-    for path in candidate_paths:
+    seen_paths: set[Path] = set()
+
+    def _consider(path: Path) -> bool:
+        """Try to collect snippets from ``path``. Returns True if max
+        was reached (signal to stop the outer walk)."""
         if len(evidence) >= max_total:
-            break
+            return True
+        if path in seen_paths:
+            return False
+        seen_paths.add(path)
         try:
             text = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
-            continue
+            return False
         lines = text.splitlines()
         for i, line in enumerate(lines):
             if len(evidence) >= max_total:
-                break
+                return True
             lower = line.lower()
             for token in tokens_list:
                 if matched_per_token[token] >= _MAX_SNIPPETS_PER_TOKEN:
@@ -211,10 +221,29 @@ def scan_for_evidence(
                     snippet = "\n".join(
                         f"{n + 1:>4}: {lines[n]}" for n in range(start, end)
                     )
-                    rel = path.relative_to(repo_root) if path.is_relative_to(repo_root) else path
+                    rel = path.relative_to(root_resolved)
                     evidence.append(CodeEvidence(path=str(rel), snippet=snippet))
                     matched_per_token[token] += 1
                     break  # one match per line is enough
+        return len(evidence) >= max_total
+
+    # Hinted paths first.
+    for hint in repo_hints:
+        resolved = _within_root(repo_root / hint)
+        if resolved is None or not resolved.is_file():
+            continue
+        if _consider(resolved):
+            return evidence
+
+    # Then a lazy glob walk — stop as soon as we've hit ``max_total``
+    # rather than materializing every match into a sorted list up front.
+    for pattern in globs:
+        for p in repo_root.glob(pattern):
+            resolved = _within_root(p)
+            if resolved is None or not resolved.is_file():
+                continue
+            if _consider(resolved):
+                return evidence
     return evidence
 
 
@@ -333,8 +362,11 @@ async def compose_draft(
     classification_final = classification.strip() or infer_classification(target, request)
     priority_final = priority.strip() or infer_priority(request)
 
-    # 4. Compose description.
-    motivation_block = motivation.strip() or request.strip()
+    # 4. Compose description. Don't fall back to the request itself for
+    # Motivation — Request is rendered above as its own section, and
+    # duplicating it adds noise without information. An empty
+    # Motivation just omits the section.
+    motivation_block = motivation.strip()
     scope_bullets = [
         f"Touches {ev.path}" for ev in code_evidence
     ] or ["Scope to be defined — no code evidence surfaced for this request."]

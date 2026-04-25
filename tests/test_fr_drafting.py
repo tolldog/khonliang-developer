@@ -7,7 +7,6 @@ priority inference, evidence scan, description composition) plus
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 
 import pytest
@@ -124,6 +123,31 @@ def test_scan_for_evidence_hints_first(tmp_path: Path):
     assert evidence[0].path == "sub/b.py"
 
 
+def test_scan_for_evidence_drops_symlink_escaping_root(tmp_path: Path):
+    """A symlink in the repo that points outside ``repo_root`` must
+    be silently dropped — scan must not leak content (or absolute
+    host paths) from outside the configured root.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "inside.py").write_text("# token here\n", encoding="utf-8")
+    outside = tmp_path / "outside_secrets.py"
+    outside.write_text("# secret token in here\n", encoding="utf-8")
+    # Symlink lives inside repo, target lives outside.
+    try:
+        (repo / "leak.py").symlink_to(outside)
+    except OSError:
+        pytest.skip("symlinks not supported on this platform")
+    evidence = scan_for_evidence(repo, ["token"], max_total=10)
+    # Only the in-repo file should be reported; the symlink's resolved
+    # path is outside the root and must be dropped.
+    paths = [e.path for e in evidence]
+    assert "inside.py" in paths
+    assert "leak.py" not in paths
+    assert not any("outside_secrets" in e.snippet for e in evidence)
+    assert not any(e.path.startswith("/") for e in evidence)
+
+
 # ---------------------------------------------------------------------------
 # Description composition
 # ---------------------------------------------------------------------------
@@ -160,10 +184,6 @@ def test_compose_description_renders_bullets():
 # ---------------------------------------------------------------------------
 # compose_draft end-to-end
 # ---------------------------------------------------------------------------
-
-
-def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
 
 
 @pytest.mark.asyncio

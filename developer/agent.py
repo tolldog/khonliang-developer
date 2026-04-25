@@ -2425,10 +2425,28 @@ class DeveloperAgent(BaseAgent):
         ]
         priority = str(args.get("priority") or "").strip()
         classification = str(args.get("classification") or "").strip()
-        try:
-            brief_timeout_s = float(args.get("brief_timeout_s") or 60.0)
-        except (TypeError, ValueError):
+
+        # Timeout: parse only when supplied, then require a positive
+        # finite number. Mirrors the validation pattern other handlers
+        # in this module use (e.g. fr_candidates_from_concepts).
+        import math
+        raw_timeout = args.get("brief_timeout_s")
+        if raw_timeout in (None, ""):
             brief_timeout_s = 60.0
+        else:
+            try:
+                brief_timeout_s = float(raw_timeout)
+            except (TypeError, ValueError):
+                return {
+                    "error": f"brief_timeout_s must be a number, got {raw_timeout!r}"
+                }
+            if not math.isfinite(brief_timeout_s) or brief_timeout_s <= 0:
+                return {
+                    "error": (
+                        "brief_timeout_s must be a positive finite number, "
+                        f"got {raw_timeout!r}"
+                    )
+                }
 
         async def _brief_fn(req: str, tgt: str) -> tuple[str, list[str]]:
             response = await self.request(
@@ -2454,15 +2472,16 @@ class DeveloperAgent(BaseAgent):
 
         scan_root = self._draft_fr_scan_root(target)
 
-        def _scan_fn(req: str, _tgt: str, hints: list[str]) -> list[fr_drafting.CodeEvidence]:
-            if scan_root is None:
-                return []
-            tokens = fr_drafting._tokenize_request(req)
-            return fr_drafting.scan_for_evidence(
-                scan_root,
-                tokens,
-                repo_hints=hints,
-            )
+        if scan_root is None:
+            scan_fn: "fr_drafting.ScanFn | None" = None
+        else:
+            def scan_fn(req: str, _tgt: str, hints: list[str]) -> list[fr_drafting.CodeEvidence]:
+                tokens = fr_drafting._tokenize_request(req)
+                return fr_drafting.scan_for_evidence(
+                    scan_root,
+                    tokens,
+                    repo_hints=hints,
+                )
 
         try:
             draft = await fr_drafting.compose_draft(
@@ -2472,7 +2491,7 @@ class DeveloperAgent(BaseAgent):
                 priority=priority,
                 classification=classification,
                 brief_fn=_brief_fn,
-                scan_fn=_scan_fn,
+                scan_fn=scan_fn,
             )
         except Exception as e:  # noqa: BLE001 — composer has its own degrade paths
             await self._safe_report_gap("draft_fr_from_request", f"compose_draft raised: {e}")
