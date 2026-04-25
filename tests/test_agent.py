@@ -892,6 +892,39 @@ async def test_propose_milestone_from_top_work_unit(harness):
 
 
 @pytest.mark.asyncio
+async def test_propose_milestone_rejects_top_level_frs(harness):
+    """Top-level `frs=[...]` is the wrong shape — must error, not auto-pick.
+
+    Regression guard for bug_developer_ad60dca4: the handler used to
+    silently fall through to next_work_unit and create a milestone
+    from the top-ranked unit, which looked like success but bundled
+    the wrong FR set. The handler now refuses upfront and points at
+    the correct nested shape.
+
+    Three variants — top-level `frs` is rejected regardless of whether
+    `work_unit` is absent, empty-string, or empty-dict. Earlier the
+    guard only triggered when `work_unit` was absent, so a caller who
+    passed both `frs=[...]` and a falsy `work_unit` could still slip
+    through to the auto-pick path (Copilot review on PR #56).
+    """
+    common = {
+        "frs": ["fr_developer_aaaa", "fr_developer_bbbb"],
+        "title": "Bundle these",
+        "summary": "from top-level frs",
+    }
+    for variant in (
+        common,
+        {**common, "work_unit": ""},
+        {**common, "work_unit": {}},
+    ):
+        result = await harness.call("propose_milestone_from_work_unit", variant)
+        assert "error" in result, f"variant {variant!r} should be rejected"
+        assert "top-level 'frs' is not honored" in result["error"]
+        assert "work_unit" in result["error"]
+        assert "milestone" not in result
+
+
+@pytest.mark.asyncio
 async def test_propose_milestone_accepts_json_work_unit(harness):
     work_unit = """{
       "name": "Cluster 9 (1 FR, targets: developer)",
@@ -906,6 +939,55 @@ async def test_propose_milestone_accepts_json_work_unit(harness):
 
     assert result["milestone"]["title"] == "Small milestone"
     assert result["milestone"]["fr_ids"] == ["fr_developer_33333333"]
+
+
+@pytest.mark.asyncio
+async def test_update_milestone_frs_rejects_wrong_arg_names(harness):
+    """`add` / `remove` / `add_frs` / `remove_frs` are the obvious-but-wrong
+    shapes a caller reaches for; without rejection they get dropped silently
+    and the handler returns ok=true with no mutation. Regression guard for
+    bug_developer_b5fd44ce.
+    """
+    work_unit = """{
+      "name": "Mutator cluster",
+      "targets": ["developer"],
+      "frs": [{"fr_id": "fr_developer_mutator", "description": "x", "priority": "high"}]
+    }"""
+    proposed = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": work_unit, "title": "Mutator",
+    })
+    mid = proposed["milestone"]["id"]
+
+    for wrong_name in ("add", "remove", "add_frs", "remove_frs"):
+        result = await harness.call("update_milestone_frs", {
+            "milestone_id": mid,
+            wrong_name: ["fr_developer_other"],
+        })
+        assert "error" in result, f"{wrong_name!r} should be rejected"
+        assert wrong_name in result["error"]
+        assert "add_fr_ids" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_update_milestone_frs_rejects_empty_change_set(harness):
+    """Both add_fr_ids and remove_fr_ids empty/missing → error, not no-op.
+
+    A no-op silently returning ok=true was indistinguishable from a
+    successful mutation. Regression guard for bug_developer_b5fd44ce.
+    """
+    work_unit = """{
+      "name": "Empty-change cluster",
+      "targets": ["developer"],
+      "frs": [{"fr_id": "fr_developer_empty", "description": "x", "priority": "high"}]
+    }"""
+    proposed = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": work_unit, "title": "Empty-change",
+    })
+    mid = proposed["milestone"]["id"]
+
+    result = await harness.call("update_milestone_frs", {"milestone_id": mid})
+    assert "error" in result
+    assert "no changes specified" in result["error"]
 
 
 @pytest.mark.asyncio

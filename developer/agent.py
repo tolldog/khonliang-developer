@@ -731,6 +731,7 @@ class DeveloperAgent(BaseAgent):
                                   "description": "'fixed' or 'wontfix'"}},
                   since="0.15.0"),
             Skill("log_dogfood", "Cheap local capture of a friction/UX observation. "
+                  "Pass the body as `observation` (required, non-empty). "
                   "No LLM / embedding / network calls — <100ms local write.",
                   {"observation": {"type": "string", "required": True},
                    "kind": {"type": "string", "default": "friction",
@@ -1943,6 +1944,24 @@ class DeveloperAgent(BaseAgent):
     async def handle_propose_milestone_from_work_unit(self, args):
         from developer.milestone_store import MilestoneError
 
+        # Reject top-level `frs=[...]` outright — it's never the right
+        # shape. A caller wanting to bundle a specific set must nest
+        # the IDs inside a `work_unit` object; a caller wanting auto-
+        # pick passes nothing. Anything in between (top-level `frs`
+        # alongside an empty/missing work_unit, etc.) used to silently
+        # fall through to next_work_unit and produce an auto-selected
+        # milestone, which looked like success but bundled the wrong
+        # FR set.
+        if "frs" in args:
+            return {
+                "error": (
+                    "top-level 'frs' is not honored; pass "
+                    "{'work_unit': {'frs': [...], 'name': '...', "
+                    "'concept': '...', 'targets': [...]}, 'title': ..., "
+                    "'summary': ...}"
+                )
+            }
+
         try:
             work_unit = _parse_work_unit_arg(args.get("work_unit"))
             source = "provided_work_unit"
@@ -2082,14 +2101,39 @@ class DeveloperAgent(BaseAgent):
     async def handle_update_milestone_frs(self, args):
         from developer.milestone_store import MilestoneError
 
+        # Reject the common-but-wrong arg names upfront so a caller
+        # who reached for the obvious shape gets a useful pointer
+        # instead of an ok=true silent no-op.
+        for wrong_name in ("add", "remove", "add_frs", "remove_frs"):
+            if wrong_name in args:
+                return {
+                    "error": (
+                        f"unknown arg {wrong_name!r}; use "
+                        "'add_fr_ids' / 'remove_fr_ids' "
+                        "(comma-separated fr_ids)"
+                    )
+                }
+
         milestone_id = args.get("milestone_id", "")
         if not milestone_id:
             return {"error": "milestone_id is required"}
+
+        add_fr_ids = _parse_paths(args.get("add_fr_ids", ""))
+        remove_fr_ids = _parse_paths(args.get("remove_fr_ids", ""))
+        if not add_fr_ids and not remove_fr_ids:
+            return {
+                "error": (
+                    "no changes specified; pass non-empty "
+                    "'add_fr_ids' and/or 'remove_fr_ids' "
+                    "(comma-separated fr_ids)"
+                )
+            }
+
         try:
             milestone = self.pipeline.milestones.update_frs(
                 milestone_id,
-                add_fr_ids=_parse_paths(args.get("add_fr_ids", "")),
-                remove_fr_ids=_parse_paths(args.get("remove_fr_ids", "")),
+                add_fr_ids=add_fr_ids,
+                remove_fr_ids=remove_fr_ids,
                 notes=args.get("notes", ""),
             )
         except MilestoneError as e:
