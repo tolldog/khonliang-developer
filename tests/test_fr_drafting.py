@@ -43,6 +43,14 @@ def test_infer_classification_picks_library_from_request():
     )
 
 
+def test_infer_classification_avoids_substring_false_positives():
+    """Whole-word matching: short hints like 'lib' / 'ci' must not
+    fire on unrelated identifiers like 'public' / 'decision'.
+    """
+    assert infer_classification("developer", "make this public api nicer") == "app"
+    assert infer_classification("developer", "tighten our decision logic") == "app"
+
+
 def test_infer_priority_default_is_medium():
     assert infer_priority("plain request with no markers") == "medium"
 
@@ -227,9 +235,38 @@ async def test_compose_draft_records_diagnostic_on_brief_failure():
         brief_fn=brief_fn,
         scan_fn=scan_fn,
     )
-    assert any("brief_on failed" in d for d in result.diagnostics)
+    # Diagnostic carries the type name + a sanitized one-line message.
+    diags = " ".join(result.diagnostics)
+    assert "brief_on failed" in diags
+    assert "RuntimeError" in diags
+    assert "bus down" in diags
     # Draft is still composed from the request itself.
     assert result.draft["description"].strip() != ""
+
+
+@pytest.mark.asyncio
+async def test_compose_draft_sanitizes_exception_in_diagnostics():
+    """Exception messages can carry absolute paths or multi-line
+    tracebacks. Diagnostics must surface a single capped line so
+    those don't leak into the returned draft.
+    """
+    huge_secret = "/etc/" + "a" * 300
+
+    async def brief_fn(req, tgt):
+        raise RuntimeError(f"failed reading {huge_secret}\nsecondary line")
+
+    result = await compose_draft(
+        request="r",
+        target="developer",
+        brief_fn=brief_fn,
+    )
+    diag = next(d for d in result.diagnostics if d.startswith("brief_on failed"))
+    # Single line.
+    assert "\n" not in diag
+    # Capped — the full secret path can't survive verbatim.
+    assert huge_secret not in diag
+    # But the type name is preserved so callers can dispatch.
+    assert "RuntimeError" in diag
 
 
 @pytest.mark.asyncio

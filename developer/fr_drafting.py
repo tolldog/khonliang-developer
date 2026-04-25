@@ -24,6 +24,7 @@ This is best-effort scaffolding — see the FR description for what
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 import time
@@ -74,20 +75,35 @@ class DraftFR:
 # ---------------------------------------------------------------------------
 
 
-_INFRA_HINTS = ("infra", "scheduler", "bus", "transport", "deploy", "ci")
-_LIBRARY_HINTS = ("lib", "library", "primitive", "sdk")
+_INFRA_HINTS = frozenset({
+    "infra", "scheduler", "bus", "transport", "deploy", "ci",
+})
+_LIBRARY_HINTS = frozenset({
+    "lib", "library", "primitive", "sdk",
+})
+
+
+def _classification_tokens(text: str) -> set[str]:
+    """Lower-cased word-token set for whole-word classification matching.
+
+    Substring matching (``"lib" in "public"``) produced false
+    positives — short hints like ``ci`` and ``lib`` are common
+    fragments of unrelated identifiers. Splitting into word tokens
+    forces an exact match on the hint.
+    """
+    return {tok.lower() for tok in re.findall(r"[A-Za-z][A-Za-z0-9_-]*", text)}
 
 
 def infer_classification(target: str, request: str) -> str:
     """Return one of ``app`` / ``library`` / ``infra``.
 
-    Heuristic: target slug + request keywords. Defaults to ``app`` —
-    it's the most common case for agent-targeted FRs.
+    Heuristic: target slug + request keywords as whole-word tokens.
+    Defaults to ``app`` — most agent-targeted FRs are app work.
     """
-    haystack = f"{target} {request}".lower()
-    if any(h in haystack for h in _INFRA_HINTS):
+    tokens = _classification_tokens(f"{target} {request}")
+    if tokens & _INFRA_HINTS:
         return "infra"
-    if any(h in haystack for h in _LIBRARY_HINTS):
+    if tokens & _LIBRARY_HINTS:
         return "library"
     return "app"
 
@@ -354,19 +370,22 @@ async def compose_draft(
         try:
             motivation, corpus_sources = await brief_fn(request, target)
         except Exception as exc:  # noqa: BLE001 — best-effort
-            diagnostics.append(f"brief_on failed: {exc}")
+            diagnostics.append(f"brief_on failed: {_sanitize_exc(exc)}")
     else:
         diagnostics.append(
             "no brief_fn supplied; Motivation section omitted from the draft"
         )
 
-    # 2. Code evidence — best-effort.
+    # 2. Code evidence — best-effort. Run on a worker thread so the
+    # filesystem walk doesn't block the event loop on large repos.
     code_evidence: list[CodeEvidence] = []
     if scan_fn is not None:
         try:
-            code_evidence = list(scan_fn(request, target, repo_hints))
+            code_evidence = list(
+                await asyncio.to_thread(scan_fn, request, target, repo_hints)
+            )
         except Exception as exc:  # noqa: BLE001 — best-effort
-            diagnostics.append(f"code scan failed: {exc}")
+            diagnostics.append(f"code scan failed: {_sanitize_exc(exc)}")
     else:
         diagnostics.append("no scan_fn supplied; acceptance will lack code evidence")
 
@@ -420,6 +439,25 @@ async def compose_draft(
 
 
 _TITLE_MAX_CHARS = 100
+_DIAG_EXC_MAX_CHARS = 160
+
+
+def _sanitize_exc(exc: BaseException) -> str:
+    """Compact, single-line, length-capped form of ``exc`` for diagnostics.
+
+    Keeps the type name (load-bearing for the caller — ``OSError`` vs
+    ``RuntimeError`` matters) and a short message head, but drops
+    multi-line tracebacks and caps the body so absolute paths or
+    other host-specific blobs don't end up in the returned draft.
+    """
+    body = str(exc).strip().splitlines()
+    head = body[0] if body else ""
+    if len(head) > _DIAG_EXC_MAX_CHARS:
+        head = head[: _DIAG_EXC_MAX_CHARS - 1].rstrip() + "…"
+    type_name = type(exc).__name__
+    if head:
+        return f"{type_name}: {head}"
+    return type_name
 
 
 def _title_from_request(request: str) -> str:
