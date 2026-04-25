@@ -3,11 +3,8 @@
 Acceptance #2, #4 (catalog assertion for developer_guide), #5, #6, #7, #8.
 """
 
-from __future__ import annotations
-
-import re
-
 import pytest
+import re
 
 from developer.server import create_developer_server
 from tests.conftest import MILESTONE_PATH, SPEC_PATH
