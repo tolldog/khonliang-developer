@@ -15,11 +15,21 @@ def harness(temp_config_file):
 # -- skills --
 
 def test_handler_skill_consistency(harness):
-    """Every Skill in register_skills has a matching @handler, and every
-    @handler has a matching Skill. Replaces a hardcoded count + name set
-    that had to be bumped on every PR. The set-symmetry check catches
-    real registration bugs (advertised skill that 404s, handler that's
-    invisible to discovery) that the count check could not.
+    """Set-symmetry check between advertised Skills and @handler methods.
+
+    Pulls Skills from BaseAgent._all_skills() (subclass register_skills
+    plus built-ins like the default health_check) and handler names from
+    BaseAgent._handlers. Asserts each side is a subset of the other.
+    Replaces a hardcoded count + name set that had to be bumped on every
+    PR; catches real registration bugs (advertised skill that 404s,
+    handler invisible to discovery) the count check could not.
+
+    Reaches into _all_skills() and _handlers — both BaseAgent privates —
+    because there's no public harness accessor for either today. Public
+    harness.skills omits built-ins; there's no equivalent for handlers.
+    Extracting handler_names (and a built-ins-aware skill enumeration)
+    onto AgentTestHarness in khonliang-bus-lib is the proper home and is
+    tracked as a follow-up FR.
     """
     skill_names = {s.name for s in harness.agent._all_skills()}
     handler_names = set(harness.agent._handlers)
