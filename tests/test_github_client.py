@@ -567,11 +567,6 @@ async def test_pr_readiness_classifies_merged_pr_as_terminal():
     used to fall straight through to the review-state check, so any
     merged PR that had ever received a CHANGES_REQUESTED review came
     back as `needs_fixes` despite being closed and merged.
-
-    `recommended_action` is the empty string for terminal states so
-    downstream consumers (e.g. session_checkpoint._next_actions, which
-    appends any non-empty action != 'merge') don't surface a confusing
-    "no_action" task for a merged PR.
     """
     c = GithubClient(token="t")
     _install_fake_gh(
@@ -591,14 +586,14 @@ async def test_pr_readiness_classifies_merged_pr_as_terminal():
     )
     out = await c.pr_readiness("o/n", 42)
     assert out.state == "merged"
-    assert out.recommended_action == ""
+    assert out.recommended_action == "no_action"
 
 
 @pytest.mark.asyncio
 async def test_pr_readiness_classifies_closed_unmerged_pr_as_terminal():
     """A closed-but-not-merged PR is terminal — must surface an explicit
     closed_unmerged state rather than running through the review/merge
-    ladder. Empty `recommended_action` for the same reason.
+    ladder.
     """
     c = GithubClient(token="t")
     _install_fake_gh(
@@ -612,7 +607,7 @@ async def test_pr_readiness_classifies_closed_unmerged_pr_as_terminal():
     )
     out = await c.pr_readiness("o/n", 42)
     assert out.state == "closed_unmerged"
-    assert out.recommended_action == ""
+    assert out.recommended_action == "reopen_or_drop"
 
 
 @pytest.mark.asyncio

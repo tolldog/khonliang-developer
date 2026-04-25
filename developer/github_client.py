@@ -107,6 +107,14 @@ class GithubPRReadiness:
     url: str
 
 
+# Lifecycle-terminal ``GithubPRReadiness.state`` values. Their
+# ``recommended_action`` is informational only ("no_action",
+# "reopen_or_drop") — there is no further work that the caller can do
+# from a checkpoint/digest. Downstream consumers gate on the state
+# rather than scraping the action string for keywords.
+TERMINAL_PR_STATES = frozenset({"merged", "closed_unmerged"})
+
+
 class GithubClientError(RuntimeError):
     """Base class for client errors so callers can distinguish from
     domain errors (404 from GitHub is a transport concern, not a bug)."""
@@ -381,18 +389,20 @@ class GithubClient:
         merge_state = str(pr.get("mergeable_state") or "unknown").lower()
 
         # Terminal states are answered from `pr` alone — a merged or
-        # closed-unmerged PR has no actionable readiness ladder, so
-        # `recommended_action` is the empty string (downstream consumers
-        # like session_checkpoint._next_actions filter empty actions
-        # out). GitHub's `state` field is `closed` for both merged and
-        # closed-unmerged; the `merged` boolean disambiguates. Falling
-        # through to the review ladder used to misclassify merged PRs
-        # as `needs_fixes` whenever a CHANGES_REQUESTED review predated
-        # the merge (bug_developer_b317e4ea).
+        # closed-unmerged PR has no actionable readiness ladder.
+        # `recommended_action` stays meaningful so summary displays
+        # like ``session_checkpoint`` don't render it as ``?``;
+        # downstream filtering uses the ``state`` field (in
+        # TERMINAL_PR_STATES) rather than the action string.
+        # GitHub's ``state`` is ``closed`` for both merged and
+        # closed-unmerged; the ``merged`` boolean disambiguates.
+        # Falling through to the review ladder used to misclassify
+        # merged PRs as ``needs_fixes`` whenever a CHANGES_REQUESTED
+        # review predated the merge (bug_developer_b317e4ea).
         if pr.get("merged"):
             return GithubPRReadiness(
                 state="merged",
-                recommended_action="",
+                recommended_action="no_action",
                 copilot_verdict="",
                 latest_copilot_comment="",
                 actionable_comments=0,
@@ -405,7 +415,7 @@ class GithubClient:
         if str(pr.get("state") or "").lower() == "closed":
             return GithubPRReadiness(
                 state="closed_unmerged",
-                recommended_action="",
+                recommended_action="reopen_or_drop",
                 copilot_verdict="",
                 latest_copilot_comment="",
                 actionable_comments=0,
