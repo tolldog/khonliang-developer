@@ -45,6 +45,12 @@ test = ["pytest>=8.0", "pytest-asyncio>=0.24"]
 
 [project.scripts]
 khonliang-developer = "developer.server:main"
+# Bus-mode entry point. The original `khonliang-developer` script
+# launches the standalone MCP server (developer.server:main); the
+# bus-native agent lives in developer.agent and now ships its own
+# console-script so `--help` / `--version` advertise an invocation
+# the user can actually type.
+khonliang-developer-agent = "developer.agent:main"
 
 [tool.setuptools.packages.find]
 include = ["developer*"]
