@@ -542,7 +542,7 @@ class DeveloperAgent(BaseAgent):
                    "target": {"type": "string", "default": "",
                               "description": "agent / repo slug the FR is for"},
                    "repo_hints": {"type": "string", "default": "",
-                                  "description": "comma-separated relative paths to bias the code scan"},
+                                  "description": "list of relative paths (preferred) or comma-separated string to bias the code scan"},
                    "priority": {"type": "string", "default": "",
                                 "description": "high / medium / low; inferred from request when empty"},
                    "classification": {"type": "string", "default": "",

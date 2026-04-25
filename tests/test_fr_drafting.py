@@ -295,6 +295,18 @@ async def test_compose_draft_empty_request_returns_empty_draft():
 
 
 @pytest.mark.asyncio
+async def test_compose_draft_empty_request_preserves_target_diagnostic():
+    """Earlier diagnostics (target empty) must survive the
+    empty-request early return — callers need the full diagnostic
+    set to know what to fix.
+    """
+    result = await compose_draft(request="   ", target="")
+    diags = " ".join(result.diagnostics)
+    assert "target is empty" in diags
+    assert "request is empty" in diags
+
+
+@pytest.mark.asyncio
 async def test_compose_draft_caller_overrides_priority_and_classification():
     async def brief_fn(req, tgt):
         return ("", [])

@@ -351,6 +351,10 @@ async def compose_draft(
         )
 
     if not request.strip():
+        # Preserve diagnostics already accumulated above (e.g. the
+        # "target is empty" warning) so callers see the full picture
+        # — overwriting the list dropped earlier signals.
+        diagnostics.append("request is empty; nothing to draft")
         return DraftFR(
             draft={
                 "title": "",
@@ -359,7 +363,7 @@ async def compose_draft(
                 "priority": priority or "medium",
                 "classification": classification or "app",
             },
-            diagnostics=["request is empty; nothing to draft"],
+            diagnostics=diagnostics,
             draft_id=_draft_id_for(request, target),
         )
 
