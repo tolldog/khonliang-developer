@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 from khonliang_bus import BaseAgent, Skill, Collaboration, handler
 
+from developer import fr_drafting
 from developer import integration_scan
 from developer import project_ecosystem as _project_ecosystem
 from developer.project_store import DEFAULT_PROJECT, ProjectDuplicateError
@@ -528,6 +529,26 @@ class DeveloperAgent(BaseAgent):
                    "project": {"type": "string", "default": "",
                                "description": f"project slug (Phase 3); empty defaults to {DEFAULT_PROJECT!r}"}},
                   since="0.4.0"),
+            # fr_developer_232574cd — request → draft FR with corpus + code
+            # enrichment. Never auto-promotes; caller calls promote_fr
+            # with the returned `draft` after review/edit.
+            Skill("draft_fr_from_request",
+                  "Compose a promote-ready draft FR from a free-form request "
+                  "with corpus motivation (researcher.brief_on) and local "
+                  "code evidence. Never auto-promotes — returns a draft for "
+                  "the caller to inspect, edit, and pass through promote_fr.",
+                  {"request": {"type": "string", "required": True,
+                               "description": "1-paragraph natural-language request"},
+                   "target": {"type": "string", "default": "",
+                              "description": "agent / repo slug the FR is for"},
+                   "repo_hints": {"type": "string", "default": "",
+                                  "description": "list of relative paths (preferred) or comma-separated string to bias the code scan"},
+                   "priority": {"type": "string", "default": "",
+                                "description": "high / medium / low; inferred from request when empty"},
+                   "classification": {"type": "string", "default": "",
+                                      "description": "app / library / infra; inferred from target+request when empty"},
+                   "brief_timeout_s": {"type": "number", "default": 60.0}},
+                  since="0.20.0"),
             Skill("update_fr_status", "Advance an FR's lifecycle status",
                   {"fr_id": {"type": "string", "required": True},
                    "status": {"type": "string", "required": True},
@@ -2385,6 +2406,130 @@ class DeveloperAgent(BaseAgent):
         return {"audit": result}
 
     # -- developer-owned FR lifecycle --
+
+    @handler("draft_fr_from_request")
+    async def handle_draft_fr_from_request(self, args):
+        """Wire researcher.brief_on + local code scan into fr_drafting.compose_draft.
+
+        Both I/O legs are best-effort: their failures are recorded as
+        diagnostics on the returned draft, not raised, so the caller
+        always gets a usable scaffold even when the bus or filesystem
+        is uncooperative. Implements ``fr_developer_232574cd``.
+        """
+        request = str(args.get("request") or "").strip()
+        if not request:
+            return {"error": "request is required"}
+        target = str(args.get("target") or "").strip()
+        # repo_hints accepts list-of-strings (preferred) or
+        # comma-separated string (back-compat with the skill schema).
+        # Stringifying a list produces "['a','b']" which is wrong;
+        # _parse_paths normalizes both shapes.
+        repo_hints = _parse_paths(args.get("repo_hints"))
+        priority = str(args.get("priority") or "").strip()
+        classification = str(args.get("classification") or "").strip()
+
+        # Timeout: parse only when supplied, then require a positive
+        # finite number. Mirrors the validation pattern other handlers
+        # in this module use (e.g. fr_candidates_from_concepts).
+        import math
+        raw_timeout = args.get("brief_timeout_s")
+        if raw_timeout in (None, ""):
+            brief_timeout_s = 60.0
+        else:
+            try:
+                brief_timeout_s = float(raw_timeout)
+            except (TypeError, ValueError):
+                return {
+                    "error": f"brief_timeout_s must be a number, got {raw_timeout!r}"
+                }
+            if not math.isfinite(brief_timeout_s) or brief_timeout_s <= 0:
+                return {
+                    "error": (
+                        "brief_timeout_s must be a positive finite number, "
+                        f"got {raw_timeout!r}"
+                    )
+                }
+
+        async def _brief_fn(req: str, tgt: str) -> tuple[str, list[str]]:
+            response = await self.request(
+                agent_type="researcher",
+                operation="brief_on",
+                args={
+                    "topic": req,
+                    "in_context_of": tgt,
+                    "detail": "brief",
+                },
+                timeout=brief_timeout_s,
+            )
+            payload = (response and response.get("result")) or {}
+            if isinstance(payload, dict):
+                brief = str(payload.get("brief") or "").strip()
+                sources_raw = payload.get("sources") or []
+                if isinstance(sources_raw, list):
+                    sources = [str(s) for s in sources_raw if s]
+                else:
+                    sources = []
+                return brief, sources
+            return str(payload), []
+
+        scan_root = self._draft_fr_scan_root(target)
+
+        if scan_root is None:
+            scan_fn: "fr_drafting.ScanFn | None" = None
+        else:
+            def scan_fn(req: str, _tgt: str, hints: list[str]) -> list[fr_drafting.CodeEvidence]:
+                tokens = fr_drafting._tokenize_request(req)
+                return fr_drafting.scan_for_evidence(
+                    scan_root,
+                    tokens,
+                    repo_hints=hints,
+                )
+
+        try:
+            draft = await fr_drafting.compose_draft(
+                request=request,
+                target=target,
+                repo_hints=repo_hints,
+                priority=priority,
+                classification=classification,
+                brief_fn=_brief_fn,
+                scan_fn=scan_fn,
+            )
+        except Exception as e:  # noqa: BLE001 — composer has its own degrade paths
+            await self._safe_report_gap("draft_fr_from_request", f"compose_draft raised: {e}")
+            return {"error": f"draft composition failed: {e}"}
+
+        return draft.to_public_dict()
+
+    def _draft_fr_scan_root(self, target: str) -> "Path | None":
+        """Best-effort: turn an agent slug into a repo root for the scan.
+
+        Heuristic: look up the project record by slug. If unknown, fall
+        back to the configured developer repo so something useful comes
+        back when the caller gives a vague target. Returns None if
+        nothing usable can be found — composer will record a diagnostic.
+        """
+        from pathlib import Path
+        target = (target or "").strip()
+        candidates: list[Path] = []
+        try:
+            project = self.pipeline.projects.get(target) if target else None
+        except Exception:  # noqa: BLE001
+            project = None
+        if project is not None:
+            for repo in getattr(project, "repos", []) or []:
+                path = getattr(repo, "path", "") or ""
+                if path:
+                    candidates.append(Path(path))
+        # Fallback: this developer's own repo root, derived from the
+        # agent module path.
+        own_root = Path(__file__).resolve().parent.parent
+        if own_root not in candidates:
+            candidates.append(own_root)
+        for cand in candidates:
+            if cand.exists() and cand.is_dir():
+                return cand
+        return None
 
     @handler("promote_fr")
     async def handle_promote_fr(self, args):
