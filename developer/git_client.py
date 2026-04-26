@@ -780,7 +780,13 @@ class GitClient:
         Refuses if ``branch`` is in ``PROTECTED_BRANCHES`` (push would
         refuse anyway, but failing here is faster and avoids a stray
         commit on the local protected branch). ``paths`` must be
-        explicit (no wildcards — same rules as ``stage``).
+        explicit; bulk-add inputs (``.``, ``./``, etc) are
+        intentionally **not** supported by this composite — there is
+        no ``allow_all`` opt-in. The composite is the canonical
+        path for "ship a known set of changes to a feature branch";
+        bulk staging is rare enough to keep separate. If you really
+        need it, call ``stage(["."], allow_all=True)`` then
+        ``commit`` / ``push`` directly.
 
         Returns ``{"commit": GitCommit-as-dict, "push": push-result}``.
         """

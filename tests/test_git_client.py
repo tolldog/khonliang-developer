@@ -520,7 +520,7 @@ def test_stage_allow_all_accepts_dot_pathspec(client, repo_path):
     (repo_path / "b.txt").write_text("hi\n")
     staged = client.stage(["."], allow_all=True)
     assert staged == ["."]
-    # Bulk add captured the new file (status returns paths with ./ prefix).
+    # Bulk add captured the new file in the staged set.
     assert any("b.txt" in p for p in client.status().staged)
 
 

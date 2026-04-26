@@ -3069,8 +3069,8 @@ class DeveloperAgent(BaseAgent):
             return {"error": "cwd is required"}
         try:
             branches = GitClient(cwd).list_branches(
-                local=bool(args.get("local", True)),
-                remote=bool(args.get("remote", False)),
+                local=_bool_arg(args, "local", default=True),
+                remote=_bool_arg(args, "remote", default=False),
             )
         except GitClientError as e:
             await self._safe_report_gap("git_branches", str(e))
@@ -3155,7 +3155,7 @@ class DeveloperAgent(BaseAgent):
         try:
             branch = GitClient(cwd).checkout(
                 ref,
-                new_branch=bool(args.get("new_branch", False)),
+                new_branch=_bool_arg(args, "new_branch", default=False),
             )
         except GitClientError as e:
             await self._safe_report_gap("git_checkout", str(e))
@@ -3186,15 +3186,16 @@ class DeveloperAgent(BaseAgent):
         name = args.get("name", "")
         if not cwd or not name:
             return {"error": "cwd and name are required"}
+        # ``force`` is destructive — naive ``bool("false")`` would
+        # silently enable unmerged-branch deletion for string-boolean
+        # callers. ``_bool_arg`` is the safe parser at the bus boundary.
+        force = _bool_arg(args, "force", default=False)
         try:
-            branch = GitClient(cwd).delete_branch(
-                name,
-                force=bool(args.get("force", False)),
-            )
+            branch = GitClient(cwd).delete_branch(name, force=force)
         except GitClientError as e:
             await self._safe_report_gap("git_delete_branch", str(e))
             return {"error": str(e)}
-        return {"deleted": branch, "force": bool(args.get("force", False))}
+        return {"deleted": branch, "force": force}
 
     @handler("git_fetch")
     async def handle_git_fetch(self, args):
@@ -3219,7 +3220,7 @@ class DeveloperAgent(BaseAgent):
             branch = GitClient(cwd).pull(
                 remote=args.get("remote") or None,
                 branch=args.get("branch") or None,
-                ff_only=bool(args.get("ff_only", True)),
+                ff_only=_bool_arg(args, "ff_only", default=True),
             )
         except GitClientError as e:
             await self._safe_report_gap("git_pull", str(e))
