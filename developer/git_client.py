@@ -35,26 +35,33 @@ def _is_wildcard_pathspec(p: str) -> bool:
 
     The bare ``.`` check would be bypassed by trailing-separator
     forms like ``./`` — ``os.path.normpath`` collapses them all
-    back to ``.`` so the guard catches every variant.
+    back to ``_STAGE_WILDCARD_PATHSPEC`` so the guard catches
+    every variant.
     """
-    return os.path.normpath(p) == "."
+    return os.path.normpath(p) == _STAGE_WILDCARD_PATHSPEC
 
 
 def _resolve_push_dst_branch(branch: str) -> str:
     """Pull the destination branch out of a push refspec.
 
-    Refspecs come in two shapes:
+    Refspecs come in three shapes:
 
     * Bare branch name (``"feat/x"``) — src and dst are the same;
       return as-is.
     * Colon form (``"<src>:<dst>"``) — return only the dst. ``HEAD:main``
       and ``main:main`` both push to ``main``, so the protected-branch
       check has to look at the dst, not the literal arg.
+    * Force-update prefix ``+<refspec>`` — git treats ``+main`` and
+      ``+main:main`` as force-update equivalents; without stripping
+      the ``+`` the dst-comparison would silently miss them and the
+      protected-branch guard would be bypassed.
 
     ``refs/heads/main`` is normalized to ``main`` so a ref-style dst
     triggers the same guard. ``refs/tags/...`` is left alone (tag pushes
     aren't branch pushes).
     """
+    if branch.startswith("+"):
+        branch = branch[1:]
     dst = branch.split(":", 1)[1] if ":" in branch else branch
     if dst.startswith("refs/heads/"):
         dst = dst[len("refs/heads/"):]

@@ -587,6 +587,20 @@ def test_push_refuses_refspec_to_main(client):
         client.push(branch="refs/heads/main")
 
 
+def test_push_refuses_force_refspec_to_main(client):
+    """Force-update refspecs (``+main``, ``+main:main``, ``+refs/heads/main``)
+    are git's way of force-pushing without ``--force`` on the command line.
+    Without stripping the ``+`` the dst-comparison would miss them and
+    the protected-branch guard would be bypassed entirely.
+    """
+    with pytest.raises(GitGuardError, match="protected branch 'main'"):
+        client.push(branch="+main")
+    with pytest.raises(GitGuardError, match="protected branch 'main'"):
+        client.push(branch="+main:main")
+    with pytest.raises(GitGuardError, match="protected branch 'main'"):
+        client.push(branch="+refs/heads/main")
+
+
 def test_push_refspec_to_feature_does_not_trigger_guard(client, repo_path):
     """Pushing a colon-form refspec to a feature branch is fine — the
     guard only fires on protected destinations.
