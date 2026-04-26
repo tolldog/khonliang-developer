@@ -22,11 +22,43 @@ switch on the specific cause without parsing messages.
 from __future__ import annotations
 
 import logging
+import os.path
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _is_wildcard_pathspec(p: str) -> bool:
+    """True for ``.`` and any equivalent (``./``, ``.//``, etc).
+
+    The bare ``.`` check would be bypassed by trailing-separator
+    forms like ``./`` — ``os.path.normpath`` collapses them all
+    back to ``.`` so the guard catches every variant.
+    """
+    return os.path.normpath(p) == "."
+
+
+def _resolve_push_dst_branch(branch: str) -> str:
+    """Pull the destination branch out of a push refspec.
+
+    Refspecs come in two shapes:
+
+    * Bare branch name (``"feat/x"``) — src and dst are the same;
+      return as-is.
+    * Colon form (``"<src>:<dst>"``) — return only the dst. ``HEAD:main``
+      and ``main:main`` both push to ``main``, so the protected-branch
+      check has to look at the dst, not the literal arg.
+
+    ``refs/heads/main`` is normalized to ``main`` so a ref-style dst
+    triggers the same guard. ``refs/tags/...`` is left alone (tag pushes
+    aren't branch pushes).
+    """
+    dst = branch.split(":", 1)[1] if ":" in branch else branch
+    if dst.startswith("refs/heads/"):
+        dst = dst[len("refs/heads/"):]
+    return dst
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +527,10 @@ class GitClient:
                 f"git command-line switches, not pathspecs. Use "
                 f"stage(['.'], allow_all=True) for bulk-add."
             )
-        wildcards = [p for p in paths if p == _STAGE_WILDCARD_PATHSPEC]
+        # ``_is_wildcard_pathspec`` normalizes equivalents (``./``,
+        # ``.//``) — without that, callers could bypass the guard with
+        # a trailing-separator variant.
+        wildcards = [p for p in paths if _is_wildcard_pathspec(p)]
         if wildcards and not allow_all:
             raise GitGuardError(
                 f"stage refused wildcard pathspec {wildcards!r}: pass "
@@ -688,12 +723,17 @@ class GitClient:
         current = self.current_branch()
         branch_to_push = branch or current
 
-        if branch_to_push in PROTECTED_BRANCHES and not allow_main:
+        # Resolve the destination side of the refspec — ``HEAD:main``
+        # and ``main:main`` both push to main, and ``refs/heads/main``
+        # is the same destination by another name. Without this the
+        # guard would only catch a bare ``"main"`` arg.
+        dst_branch = _resolve_push_dst_branch(branch_to_push)
+        if dst_branch in PROTECTED_BRANCHES and not allow_main:
             raise GitGuardError(
-                f"push refused: {branch_to_push!r} is a protected branch. "
-                f"Use a feature branch + PR, or pass allow_main=True for "
-                f"the rare cases where direct-to-{branch_to_push} is "
-                f"intentional (release tags, etc.)."
+                f"push refused: {branch_to_push!r} resolves to protected "
+                f"branch {dst_branch!r}. Use a feature branch + PR, or "
+                f"pass allow_main=True for the rare cases where direct-"
+                f"to-{dst_branch} is intentional (release tags, etc.)."
             )
 
         try:

@@ -500,6 +500,18 @@ def test_stage_refuses_dash_a_unconditionally(client):
         client.stage(["-u"], allow_all=True)
 
 
+def test_stage_refuses_dot_slash_wildcard_equivalents(client):
+    """``./`` and ``.//`` normalize to ``.`` — the guard catches all
+    variants, not just the bare token. Without normalization a
+    caller could bypass the wildcard refusal with a trailing
+    separator.
+    """
+    with pytest.raises(GitGuardError, match="wildcard"):
+        client.stage(["./"])
+    with pytest.raises(GitGuardError, match="wildcard"):
+        client.stage([".//"])
+
+
 def test_stage_allow_all_accepts_dot_pathspec(client, repo_path):
     """``allow_all=True`` is the explicit opt-in for callers who really
     do want to capture every change in the working tree. Only ``.``
@@ -560,6 +572,30 @@ def test_push_refuses_current_branch_when_protected(client, repo_path):
     """
     with pytest.raises(GitGuardError, match="protected branch"):
         client.push()
+
+
+def test_push_refuses_refspec_to_main(client):
+    """Refspec forms like ``HEAD:main`` and ``main:main`` push to
+    main — the guard has to look at the destination side, not the
+    literal arg, or callers can bypass with a colon form.
+    """
+    with pytest.raises(GitGuardError, match="protected branch 'main'"):
+        client.push(branch="HEAD:main")
+    with pytest.raises(GitGuardError, match="protected branch 'main'"):
+        client.push(branch="main:main")
+    with pytest.raises(GitGuardError, match="protected branch 'main'"):
+        client.push(branch="refs/heads/main")
+
+
+def test_push_refspec_to_feature_does_not_trigger_guard(client, repo_path):
+    """Pushing a colon-form refspec to a feature branch is fine — the
+    guard only fires on protected destinations.
+    """
+    _run("checkout", "-b", "feat/y", cwd=repo_path)
+    # No remote in test repo → push fails downstream, not at the guard.
+    with pytest.raises(Exception) as exc_info:
+        client.push(branch="HEAD:feat/y")
+    assert not isinstance(exc_info.value, GitGuardError)
 
 
 def test_push_feature_branch_does_not_trigger_guard(client, repo_path):

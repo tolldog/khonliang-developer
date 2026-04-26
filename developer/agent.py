@@ -643,9 +643,12 @@ class DeveloperAgent(BaseAgent):
                    "paths": {"type": "string", "required": True,
                              "description": "comma-separated paths"},
                    "allow_all": {"type": "boolean", "default": False,
-                                 "description": "opt in to wildcard tokens "
-                                 "('.', '-A', '--all', '-u'); refused by default "
-                                 "so a wrong-cwd add doesn't capture unrelated files"}},
+                                 "description": "opt in to the wildcard "
+                                 "pathspec '.'; refused by default so a "
+                                 "wrong-cwd add doesn't capture unrelated "
+                                 "files. CLI flags (-A/--all/-u/--update) "
+                                 "are refused unconditionally — they are "
+                                 "git command-line switches, not pathspecs"}},
                   since="0.7.0"),
             Skill("git_unstage", "Unstage paths while keeping working-tree changes",
                   {"cwd": {"type": "string", "required": True},
