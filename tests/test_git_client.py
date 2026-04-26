@@ -484,6 +484,22 @@ def test_stage_refuses_dot_wildcard(client):
         client.stage(["."])
 
 
+def test_stage_refuses_empty_string_entries(client):
+    """``os.path.normpath("") == "."`` so ``[""]`` would misfire as
+    a wildcard refusal (confusing) or, with ``allow_all=True``, slip
+    into ``repo.index.add`` and silently stage either nothing or
+    garbage. Reject empty / whitespace-only entries explicitly with
+    a clear message so the caller's bug surfaces at the boundary.
+    """
+    with pytest.raises(GitGuardError, match="empty / whitespace-only"):
+        client.stage([""])
+    with pytest.raises(GitGuardError, match="empty / whitespace-only"):
+        client.stage(["   "])
+    # Even with allow_all, blanks are still rejected.
+    with pytest.raises(GitGuardError, match="empty / whitespace-only"):
+        client.stage([""], allow_all=True)
+
+
 def test_stage_refuses_dash_a_unconditionally(client):
     """``-A`` / ``--all`` / ``-u`` / ``--update`` are CLI flags, not
     pathspecs — passing them to ``repo.index.add`` would silently

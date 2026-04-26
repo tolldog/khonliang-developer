@@ -527,6 +527,18 @@ class GitClient:
                 "stage requires explicit paths; pass the files to add or "
                 "use stage(['.'], allow_all=True) to opt into a bulk add"
             )
+        # Empty / whitespace-only entries would silently misbehave —
+        # ``os.path.normpath("") == "."`` so the wildcard guard would
+        # mis-fire on ``[""]``, and with ``allow_all=True`` an empty
+        # string would slip into ``repo.index.add([""])`` and stage
+        # either nothing or garbage. Reject explicitly here so the
+        # caller's bug surfaces at the boundary, not three layers down.
+        blanks = [p for p in paths if not isinstance(p, str) or not p.strip()]
+        if blanks:
+            raise GitGuardError(
+                f"stage refused empty / whitespace-only entries {blanks!r}: "
+                f"every path must be a non-empty string"
+            )
         cli_flags = [p for p in paths if p in _STAGE_CLI_FLAG_TOKENS]
         if cli_flags:
             raise GitGuardError(
