@@ -115,13 +115,19 @@ class GitGuardError(GitClientError):
 # round-trip in the hot path.
 PROTECTED_BRANCHES: tuple[str, ...] = ("main", "master")
 
-# Stage shortcuts that pull in untracked files indiscriminately.
-# ``stage`` refuses these unless ``allow_all=True`` so a caller
-# composing ``add -A`` from a chained shell pipeline can't quietly
-# capture unrelated dotfiles / build output. The recovery path is
-# to pass explicit relative paths.
-_STAGE_WILDCARD_TOKENS: frozenset[str] = frozenset({
-    ".", "-A", "--all", "-u", "--update",
+# Wildcard pathspec — bulk-add the entire working tree. Refused
+# unless ``allow_all=True`` so a wrong-cwd ``stage(["."])`` can't
+# quietly capture unrelated untracked files. The recovery path is
+# explicit relative paths.
+_STAGE_WILDCARD_PATHSPEC: str = "."
+
+# CLI flags that callers sometimes try to pass as pathspecs after
+# composing a chained shell command in their head ("git add -A").
+# These are not pathspecs at all — ``repo.index.add(["-A"])`` would
+# silently fail to do what the caller meant — so refuse them
+# unconditionally with a message that points at the right primitive.
+_STAGE_CLI_FLAG_TOKENS: frozenset[str] = frozenset({
+    "-A", "--all", "-u", "--update",
 })
 
 
@@ -464,25 +470,37 @@ class GitClient:
         """Stage the given paths (relative to repo root).
 
         ``paths`` must be a non-empty list of explicit paths. The
-        wildcard tokens ``.``, ``-A``, ``--all``, ``-u``,
-        ``--update`` are refused unless ``allow_all=True`` —
-        a chained shell pipeline that composed ``git add -A``
-        from a wrong cwd captures unrelated untracked files and
-        produces commits whose content doesn't match the
-        message. Explicit paths force the caller to know what
-        they're staging.
+        wildcard pathspec ``.`` is refused unless ``allow_all=True`` —
+        a chained shell pipeline that composed ``git add -A`` from a
+        wrong cwd captures unrelated untracked files and produces
+        commits whose content doesn't match the message. Explicit
+        paths force the caller to know what they're staging.
+
+        CLI flags like ``-A`` / ``--all`` / ``-u`` / ``--update``
+        are refused unconditionally: those are git command-line
+        switches, not pathspecs, so passing them through to
+        ``repo.index.add`` would silently fail to do what the caller
+        meant. The recovery path is ``stage(["."], allow_all=True)``
+        for bulk-add.
         """
         if not paths:
             raise GitGuardError(
                 "stage requires explicit paths; pass the files to add or "
-                "use allow_all=True to opt into a bulk add"
+                "use stage(['.'], allow_all=True) to opt into a bulk add"
             )
-        wildcards = [p for p in paths if p in _STAGE_WILDCARD_TOKENS]
+        cli_flags = [p for p in paths if p in _STAGE_CLI_FLAG_TOKENS]
+        if cli_flags:
+            raise GitGuardError(
+                f"stage refused CLI flag tokens {cli_flags!r}: those are "
+                f"git command-line switches, not pathspecs. Use "
+                f"stage(['.'], allow_all=True) for bulk-add."
+            )
+        wildcards = [p for p in paths if p == _STAGE_WILDCARD_PATHSPEC]
         if wildcards and not allow_all:
             raise GitGuardError(
-                f"stage refused wildcard paths {wildcards!r}: pass explicit "
-                f"relative paths, or set allow_all=True if you really want "
-                f"to capture every change in the working tree"
+                f"stage refused wildcard pathspec {wildcards!r}: pass "
+                f"explicit relative paths, or set allow_all=True if you "
+                f"really want to capture every change in the working tree"
             )
         repo = self._get_repo()
         try:

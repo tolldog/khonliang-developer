@@ -3118,7 +3118,10 @@ class DeveloperAgent(BaseAgent):
         try:
             staged = GitClient(cwd).stage(
                 paths,
-                allow_all=bool(args.get("allow_all", False)),
+                # ``_bool_arg`` is the safe parser at the bus boundary —
+                # naive ``bool("false")`` is True, which would silently
+                # disable the wildcard guard for string-boolean callers.
+                allow_all=_bool_arg(args, "allow_all", default=False),
             )
         except GitClientError as e:
             await self._safe_report_gap("git_stage", str(e))
@@ -3234,9 +3237,13 @@ class DeveloperAgent(BaseAgent):
             result = client.push(
                 remote=args.get("remote") or "origin",
                 branch=branch,
-                force=bool(args.get("force", False)),
-                set_upstream=bool(args.get("set_upstream", False)),
-                allow_main=bool(args.get("allow_main", False)),
+                # ``_bool_arg`` over naive ``bool()`` so a stringified
+                # "false" / "0" from the bus boundary doesn't silently
+                # flip the guard — protected-branch refusal would be
+                # bypassed, force-push would happen unintentionally.
+                force=_bool_arg(args, "force", default=False),
+                set_upstream=_bool_arg(args, "set_upstream", default=False),
+                allow_main=_bool_arg(args, "allow_main", default=False),
             )
         except GitClientError as e:
             await self._safe_report_gap("git_push", str(e))
@@ -3264,7 +3271,7 @@ class DeveloperAgent(BaseAgent):
                 paths=paths,
                 remote=args.get("remote") or "origin",
                 co_authors=co_authors or None,
-                set_upstream=bool(args.get("set_upstream", False)),
+                set_upstream=_bool_arg(args, "set_upstream", default=False),
             )
         except GitClientError as e:
             await self._safe_report_gap("git_pr_commit_push", str(e))

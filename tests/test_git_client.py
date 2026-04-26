@@ -27,6 +27,7 @@ from developer.git_client import (
     GitCommit,
     GitConflictError,
     GitDestructiveError,
+    GitGuardError,
     GitNotFoundError,
     GitUncommittedError,
     GitUpstreamError,
@@ -472,8 +473,6 @@ def test_fetch_unknown_remote_raises_not_found(client):
 # Guards (fr_developer_44fc7dde)
 # ---------------------------------------------------------------------------
 
-from developer.git_client import GitGuardError
-
 
 def test_stage_refuses_empty_paths(client):
     with pytest.raises(GitGuardError, match="explicit paths"):
@@ -485,14 +484,26 @@ def test_stage_refuses_dot_wildcard(client):
         client.stage(["."])
 
 
-def test_stage_refuses_dash_a(client):
-    with pytest.raises(GitGuardError, match="wildcard"):
+def test_stage_refuses_dash_a_unconditionally(client):
+    """``-A`` / ``--all`` / ``-u`` / ``--update`` are CLI flags, not
+    pathspecs — passing them to ``repo.index.add`` would silently
+    misbehave. Refuse even with ``allow_all=True``; the recovery
+    path is ``stage(["."], allow_all=True)``.
+    """
+    with pytest.raises(GitGuardError, match="CLI flag tokens"):
         client.stage(["-A"])
+    with pytest.raises(GitGuardError, match="CLI flag tokens"):
+        client.stage(["-A"], allow_all=True)
+    with pytest.raises(GitGuardError, match="CLI flag tokens"):
+        client.stage(["--all"], allow_all=True)
+    with pytest.raises(GitGuardError, match="CLI flag tokens"):
+        client.stage(["-u"], allow_all=True)
 
 
-def test_stage_allow_all_accepts_wildcard(client, repo_path):
+def test_stage_allow_all_accepts_dot_pathspec(client, repo_path):
     """``allow_all=True`` is the explicit opt-in for callers who really
-    do want to capture every change in the working tree.
+    do want to capture every change in the working tree. Only ``.``
+    is the supported bulk-add pathspec.
     """
     (repo_path / "b.txt").write_text("hi\n")
     staged = client.stage(["."], allow_all=True)
