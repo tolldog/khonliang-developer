@@ -784,12 +784,24 @@ class GitClient:
 
         Returns ``{"commit": GitCommit-as-dict, "push": push-result}``.
         """
+        # Validate every arg up front so a guard failure can't
+        # leave files half-staged. The composite's contract is
+        # "fail fast before any side effect" — that's only true
+        # if message + paths are checked before stage() runs.
         if not branch:
             raise GitGuardError("pr_commit_push requires an explicit branch")
         if branch in PROTECTED_BRANCHES:
             raise GitGuardError(
                 f"pr_commit_push refused: {branch!r} is protected. "
                 f"Use a feature branch."
+            )
+        if not message or not message.strip():
+            raise GitGuardError(
+                "pr_commit_push requires a non-empty message"
+            )
+        if not paths:
+            raise GitGuardError(
+                "pr_commit_push requires explicit paths"
             )
         current = self.current_branch()
         if current != branch:

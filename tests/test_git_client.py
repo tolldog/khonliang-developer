@@ -651,3 +651,24 @@ def test_pr_commit_push_refuses_wildcard_paths(client, repo_path):
     _run("checkout", "-b", "feat/x", cwd=repo_path)
     with pytest.raises(GitGuardError, match="wildcard"):
         client.pr_commit_push("feat/x", "subject", ["."])
+
+
+def test_pr_commit_push_validates_message_before_staging(client, repo_path):
+    """Empty / whitespace-only message must fail before stage() runs
+    so a guard failure doesn't leave files half-staged. Without this
+    check, the underlying commit() would refuse on empty message but
+    only after stage() already mutated the index.
+    """
+    _run("checkout", "-b", "feat/z", cwd=repo_path)
+    (repo_path / "z.txt").write_text("z\n")
+    with pytest.raises(GitGuardError, match="non-empty message"):
+        client.pr_commit_push("feat/z", "   ", ["z.txt"])
+    # No staging side effect — file is still untracked.
+    assert "z.txt" in client.status().untracked
+    assert "z.txt" not in client.status().staged
+
+
+def test_pr_commit_push_validates_paths_before_staging(client, repo_path):
+    _run("checkout", "-b", "feat/z", cwd=repo_path)
+    with pytest.raises(GitGuardError, match="explicit paths"):
+        client.pr_commit_push("feat/z", "subject", [])
