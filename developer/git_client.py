@@ -22,11 +22,50 @@ switch on the specific cause without parsing messages.
 from __future__ import annotations
 
 import logging
+import os.path
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _is_wildcard_pathspec(p: str) -> bool:
+    """True for ``.`` and any equivalent (``./``, ``.//``, etc).
+
+    The bare ``.`` check would be bypassed by trailing-separator
+    forms like ``./`` — ``os.path.normpath`` collapses them all
+    back to ``_STAGE_WILDCARD_PATHSPEC`` so the guard catches
+    every variant.
+    """
+    return os.path.normpath(p) == _STAGE_WILDCARD_PATHSPEC
+
+
+def _resolve_push_dst_branch(branch: str) -> str:
+    """Pull the destination branch out of a push refspec.
+
+    Refspecs come in three shapes:
+
+    * Bare branch name (``"feat/x"``) — src and dst are the same;
+      return as-is.
+    * Colon form (``"<src>:<dst>"``) — return only the dst. ``HEAD:main``
+      and ``main:main`` both push to ``main``, so the protected-branch
+      check has to look at the dst, not the literal arg.
+    * Force-update prefix ``+<refspec>`` — git treats ``+main`` and
+      ``+main:main`` as force-update equivalents; without stripping
+      the ``+`` the dst-comparison would silently miss them and the
+      protected-branch guard would be bypassed.
+
+    ``refs/heads/main`` is normalized to ``main`` so a ref-style dst
+    triggers the same guard. ``refs/tags/...`` is left alone (tag pushes
+    aren't branch pushes).
+    """
+    if branch.startswith("+"):
+        branch = branch[1:]
+    dst = branch.split(":", 1)[1] if ":" in branch else branch
+    if dst.startswith("refs/heads/"):
+        dst = dst[len("refs/heads/"):]
+    return dst
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +134,40 @@ class GitUpstreamError(GitClientError):
 
 class GitDestructiveError(GitClientError):
     """Destructive op attempted without the required explicit flag."""
+
+
+class GitGuardError(GitClientError):
+    """Operation refused by a primitive-level safety guard.
+
+    Distinct from GitDestructiveError so callers can catch
+    "I refused for a structural reason" (wrong branch,
+    protected push, wildcard staging) separately from
+    "you asked me to do something destructive". The error
+    message names the recovery path.
+    """
+
+
+# Branches that ``push`` refuses to write to without explicit
+# ``allow_main=True``. Single source of truth so callers and tests
+# agree. Adding a project-level branch_protection config is a
+# future extension; keeping the list constant avoids a config
+# round-trip in the hot path.
+PROTECTED_BRANCHES: tuple[str, ...] = ("main", "master")
+
+# Wildcard pathspec — bulk-add the entire working tree. Refused
+# unless ``allow_all=True`` so a wrong-cwd ``stage(["."])`` can't
+# quietly capture unrelated untracked files. The recovery path is
+# explicit relative paths.
+_STAGE_WILDCARD_PATHSPEC: str = "."
+
+# CLI flags that callers sometimes try to pass as pathspecs after
+# composing a chained shell command in their head ("git add -A").
+# These are not pathspecs at all — ``repo.index.add(["-A"])`` would
+# silently fail to do what the caller meant — so refuse them
+# unconditionally with a message that points at the right primitive.
+_STAGE_CLI_FLAG_TOKENS: frozenset[str] = frozenset({
+    "-A", "--all", "-u", "--update",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -432,8 +505,57 @@ class GitClient:
             raise GitClientError(f"delete_branch failed: {e}") from e
         return name
 
-    def stage(self, paths: list[str]) -> list[str]:
-        """Stage the given paths (relative to repo root)."""
+    def stage(self, paths: list[str], *, allow_all: bool = False) -> list[str]:
+        """Stage the given paths (relative to repo root).
+
+        ``paths`` must be a non-empty list of explicit paths. The
+        wildcard pathspec ``.`` is refused unless ``allow_all=True`` —
+        a chained shell pipeline that composed ``git add -A`` from a
+        wrong cwd captures unrelated untracked files and produces
+        commits whose content doesn't match the message. Explicit
+        paths force the caller to know what they're staging.
+
+        CLI flags like ``-A`` / ``--all`` / ``-u`` / ``--update``
+        are refused unconditionally: those are git command-line
+        switches, not pathspecs, so passing them through to
+        ``repo.index.add`` would silently fail to do what the caller
+        meant. The recovery path is ``stage(["."], allow_all=True)``
+        for bulk-add.
+        """
+        if not paths:
+            raise GitGuardError(
+                "stage requires explicit paths; pass the files to add or "
+                "use stage(['.'], allow_all=True) to opt into a bulk add"
+            )
+        # Empty / whitespace-only entries would silently misbehave —
+        # ``os.path.normpath("") == "."`` so the wildcard guard would
+        # mis-fire on ``[""]``, and with ``allow_all=True`` an empty
+        # string would slip into ``repo.index.add([""])`` and stage
+        # either nothing or garbage. Reject explicitly here so the
+        # caller's bug surfaces at the boundary, not three layers down.
+        blanks = [p for p in paths if not isinstance(p, str) or not p.strip()]
+        if blanks:
+            raise GitGuardError(
+                f"stage refused empty / whitespace-only entries {blanks!r}: "
+                f"every path must be a non-empty string"
+            )
+        cli_flags = [p for p in paths if p in _STAGE_CLI_FLAG_TOKENS]
+        if cli_flags:
+            raise GitGuardError(
+                f"stage refused CLI flag tokens {cli_flags!r}: those are "
+                f"git command-line switches, not pathspecs. Use "
+                f"stage(['.'], allow_all=True) for bulk-add."
+            )
+        # ``_is_wildcard_pathspec`` normalizes equivalents (``./``,
+        # ``.//``) — without that, callers could bypass the guard with
+        # a trailing-separator variant.
+        wildcards = [p for p in paths if _is_wildcard_pathspec(p)]
+        if wildcards and not allow_all:
+            raise GitGuardError(
+                f"stage refused wildcard pathspec {wildcards!r}: pass "
+                f"explicit relative paths, or set allow_all=True if you "
+                f"really want to capture every change in the working tree"
+            )
         repo = self._get_repo()
         try:
             repo.index.add(paths)
@@ -455,6 +577,7 @@ class GitClient:
         author: Optional[str] = None,
         co_authors: Optional[list[str]] = None,
         amend: bool = False,
+        branch_hint: str = "",
     ) -> GitCommit:
         """Commit the staged changes.
 
@@ -463,10 +586,25 @@ class GitClient:
 
         ``amend=True`` rewrites the previous commit — destructive if that
         commit is already pushed. Logged at INFO.
+
+        ``branch_hint`` (optional): if set, refuse the commit when the
+        cwd's current branch doesn't match. Catches the wrong-cwd
+        composition where a chained pipeline references one branch in
+        the message but lands the commit on a different branch.
+        Empty string disables the check (legacy callers).
         """
         repo = self._get_repo()
         if not message or not message.strip():
             raise GitClientError("commit requires a non-empty message")
+        if branch_hint:
+            current = self.current_branch()
+            if current != branch_hint:
+                raise GitGuardError(
+                    f"branch_hint mismatch: expected {branch_hint!r}, "
+                    f"cwd is on {current!r}. Refusing the commit so a "
+                    f"wrong-cwd pipeline doesn't land work on the wrong "
+                    f"branch. Switch branches or correct the hint."
+                )
 
         # Pre-check for empty staging — GitPython's index.commit happily
         # creates empty commits; we want to refuse explicitly so callers
@@ -584,6 +722,7 @@ class GitClient:
     def push(
         self, remote: str = "origin", branch: Optional[str] = None, *,
         force: bool = False, set_upstream: bool = False,
+        allow_main: bool = False,
     ) -> dict[str, Any]:
         """Push to ``remote``.
 
@@ -592,10 +731,29 @@ class GitClient:
         captures the bypass.
 
         ``set_upstream=True`` is equivalent to ``git push -u``.
+
+        ``allow_main=False`` (default) refuses to push when the resolved
+        branch matches a name in ``PROTECTED_BRANCHES`` (``main``,
+        ``master``). The ecosystem convention is branch → PR → review
+        → merge; bypass is rare enough that callers should opt in
+        explicitly when they need it.
         """
         repo = self._get_repo()
         current = self.current_branch()
         branch_to_push = branch or current
+
+        # Resolve the destination side of the refspec — ``HEAD:main``
+        # and ``main:main`` both push to main, and ``refs/heads/main``
+        # is the same destination by another name. Without this the
+        # guard would only catch a bare ``"main"`` arg.
+        dst_branch = _resolve_push_dst_branch(branch_to_push)
+        if dst_branch in PROTECTED_BRANCHES and not allow_main:
+            raise GitGuardError(
+                f"push refused: {branch_to_push!r} resolves to protected "
+                f"branch {dst_branch!r}. Use a feature branch + PR, or "
+                f"pass allow_main=True for the rare cases where direct-"
+                f"to-{dst_branch} is intentional (release tags, etc.)."
+            )
 
         try:
             args = []
@@ -623,6 +781,78 @@ class GitClient:
             "branch": branch_to_push,
             "force": force,
             "set_upstream": set_upstream,
+        }
+
+    def pr_commit_push(
+        self, branch: str, message: str, paths: list[str], *,
+        remote: str = "origin",
+        co_authors: Optional[list[str]] = None,
+        set_upstream: bool = False,
+    ) -> dict[str, Any]:
+        """Stage explicit ``paths``, commit with ``message``, push.
+
+        One-call composite that gates every step on ``branch`` matching
+        the cwd's current branch — so a chained pipeline composed from
+        the wrong cwd refuses fast instead of landing wrong-content
+        commits with mismatched messages.
+
+        Refuses if ``branch`` is in ``PROTECTED_BRANCHES`` (push would
+        refuse anyway, but failing here is faster and avoids a stray
+        commit on the local protected branch). ``paths`` must be
+        explicit; bulk-add inputs (``.``, ``./``, etc) are
+        intentionally **not** supported by this composite — there is
+        no ``allow_all`` opt-in. The composite is the canonical
+        path for "ship a known set of changes to a feature branch";
+        bulk staging is rare enough to keep separate. If you really
+        need it, call ``stage(["."], allow_all=True)`` then
+        ``commit`` / ``push`` directly.
+
+        Returns ``{"commit": GitCommit-as-dict, "push": push-result}``.
+        """
+        # Validate every arg up front so a guard failure can't
+        # leave files half-staged. The composite's contract is
+        # "fail fast before any side effect" — that's only true
+        # if message + paths are checked before stage() runs.
+        if not branch:
+            raise GitGuardError("pr_commit_push requires an explicit branch")
+        if branch in PROTECTED_BRANCHES:
+            raise GitGuardError(
+                f"pr_commit_push refused: {branch!r} is protected. "
+                f"Use a feature branch."
+            )
+        if not message or not message.strip():
+            raise GitGuardError(
+                "pr_commit_push requires a non-empty message"
+            )
+        if not paths:
+            raise GitGuardError(
+                "pr_commit_push requires explicit paths"
+            )
+        current = self.current_branch()
+        if current != branch:
+            raise GitGuardError(
+                f"branch mismatch: pr_commit_push expects {branch!r}, "
+                f"cwd is on {current!r}. Switch branches or correct "
+                f"the call so the commit lands where the message says."
+            )
+        self.stage(paths)
+        commit = self.commit(
+            message,
+            co_authors=co_authors,
+            branch_hint=branch,
+        )
+        push = self.push(
+            remote=remote,
+            branch=branch,
+            set_upstream=set_upstream,
+        )
+        return {
+            "commit": {
+                "sha": commit.sha,
+                "short_sha": commit.short_sha,
+                "message": commit.message,
+            },
+            "push": push,
         }
 
 

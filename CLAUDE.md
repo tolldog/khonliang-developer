@@ -104,6 +104,24 @@ When in doubt: if it's about producing artifacts (specs, code, FRs, worktrees), 
 - Build repo-directed cleanup/documentation workflows so developer can audit a
   repo, propose cleanup, apply scoped edits, and leave distilled artifacts.
 
+## Git mutation primitives (fr_developer_44fc7dde)
+
+Prefer `developer.git_pr_commit_push(cwd, branch, message, paths)` over
+chained bash `git add/commit/push` for any mutating sequence. The composite
+fails fast on branch mismatch (cwd-vs-declared), refuses wildcard staging,
+and refuses protected-branch targets — closing the wrong-cwd trap that
+landed Episode 19's mis-routed direct-to-main push.
+
+`git_push`, `git_commit`, and `git_stage` ship with the same guards in
+isolation: `allow_main=False` for protected-branch refusal, `branch_hint`
+for commit-vs-cwd verification, `allow_all=False` for wildcard refusal.
+Pass the opt-in only for the rare cases where bypass is intentional
+(release tagging, intentional bulk add, etc.).
+
+When bash is unavoidable, always pin the cwd in the same invocation:
+`cd /abs/path && git ...`. Never compose a chained pipeline that relies on
+the ambient shell cwd.
+
 ## MCP tool response convention
 
 Same as researcher: token-efficient, no preamble, data-only, default to brief.

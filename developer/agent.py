@@ -631,12 +631,24 @@ class DeveloperAgent(BaseAgent):
                   {"cwd": {"type": "string", "required": True},
                    "message": {"type": "string", "required": True},
                    "co_authors": {"type": "string", "default": "",
-                                  "description": "comma-separated Name <email> list"}},
+                                  "description": "comma-separated Name <email> list"},
+                   "branch_hint": {"type": "string", "default": "",
+                                   "description": "if set, refuse the commit when the "
+                                   "cwd's current branch doesn't match — catches "
+                                   "wrong-cwd composition where the message names a "
+                                   "different branch than where it lands"}},
                   since="0.5.0"),
             Skill("git_stage", "Stage paths for commit",
                   {"cwd": {"type": "string", "required": True},
                    "paths": {"type": "string", "required": True,
-                             "description": "comma-separated paths"}},
+                             "description": "comma-separated paths"},
+                   "allow_all": {"type": "boolean", "default": False,
+                                 "description": "opt in to the wildcard "
+                                 "pathspec '.'; refused by default so a "
+                                 "wrong-cwd add doesn't capture unrelated "
+                                 "files. CLI flags (-A/--all/-u/--update) "
+                                 "are refused unconditionally — they are "
+                                 "git command-line switches, not pathspecs"}},
                   since="0.7.0"),
             Skill("git_unstage", "Unstage paths while keeping working-tree changes",
                   {"cwd": {"type": "string", "required": True},
@@ -673,8 +685,33 @@ class DeveloperAgent(BaseAgent):
                    "remote": {"type": "string", "default": "origin"},
                    "branch": {"type": "string", "default": ""},
                    "force": {"type": "boolean", "default": False},
-                   "set_upstream": {"type": "boolean", "default": False}},
+                   "set_upstream": {"type": "boolean", "default": False},
+                   "allow_main": {"type": "boolean", "default": False,
+                                  "description": "refuse-by-default for pushes "
+                                  "to protected branches (main/master); pass True "
+                                  "for the rare cases where direct-push is "
+                                  "intentional"}},
                   since="0.7.0"),
+            # fr_developer_44fc7dde: composite stage+commit+push gated on
+            # the cwd's branch matching the caller's expectation. Refuses
+            # protected-branch targets and wildcard staging — the canonical
+            # mutation primitive that the PR-automation loop
+            # (fr_developer_35fe69af) will consume.
+            Skill("git_pr_commit_push",
+                  "Stage explicit paths, commit, push — gated on branch match",
+                  {"cwd": {"type": "string", "required": True},
+                   "branch": {"type": "string", "required": True,
+                              "description": "the branch the caller expects to "
+                              "be on; refuses if cwd is on a different branch"},
+                   "message": {"type": "string", "required": True},
+                   "paths": {"type": "string", "required": True,
+                             "description": "comma-separated explicit paths to "
+                             "stage; wildcards refused"},
+                   "remote": {"type": "string", "default": "origin"},
+                   "co_authors": {"type": "string", "default": "",
+                                  "description": "comma-separated Name <email> list"},
+                   "set_upstream": {"type": "boolean", "default": False}},
+                  since="0.16.0"),
             Skill("git_show", "Resolve and summarize a commit",
                   {"cwd": {"type": "string", "required": True},
                    "ref": {"type": "string", "required": True}},
@@ -3032,8 +3069,8 @@ class DeveloperAgent(BaseAgent):
             return {"error": "cwd is required"}
         try:
             branches = GitClient(cwd).list_branches(
-                local=bool(args.get("local", True)),
-                remote=bool(args.get("remote", False)),
+                local=_bool_arg(args, "local", default=True),
+                remote=_bool_arg(args, "remote", default=False),
             )
         except GitClientError as e:
             await self._safe_report_gap("git_branches", str(e))
@@ -3063,6 +3100,7 @@ class DeveloperAgent(BaseAgent):
             commit = GitClient(cwd).commit(
                 message=message,
                 co_authors=co_authors or None,
+                branch_hint=str(args.get("branch_hint", "") or ""),
             )
         except GitClientError as e:
             await self._safe_report_gap("git_commit", str(e))
@@ -3081,7 +3119,13 @@ class DeveloperAgent(BaseAgent):
         if not cwd or not paths:
             return {"error": "cwd and paths are required"}
         try:
-            staged = GitClient(cwd).stage(paths)
+            staged = GitClient(cwd).stage(
+                paths,
+                # ``_bool_arg`` is the safe parser at the bus boundary —
+                # naive ``bool("false")`` is True, which would silently
+                # disable the wildcard guard for string-boolean callers.
+                allow_all=_bool_arg(args, "allow_all", default=False),
+            )
         except GitClientError as e:
             await self._safe_report_gap("git_stage", str(e))
             return {"error": str(e)}
@@ -3111,7 +3155,7 @@ class DeveloperAgent(BaseAgent):
         try:
             branch = GitClient(cwd).checkout(
                 ref,
-                new_branch=bool(args.get("new_branch", False)),
+                new_branch=_bool_arg(args, "new_branch", default=False),
             )
         except GitClientError as e:
             await self._safe_report_gap("git_checkout", str(e))
@@ -3142,15 +3186,16 @@ class DeveloperAgent(BaseAgent):
         name = args.get("name", "")
         if not cwd or not name:
             return {"error": "cwd and name are required"}
+        # ``force`` is destructive — naive ``bool("false")`` would
+        # silently enable unmerged-branch deletion for string-boolean
+        # callers. ``_bool_arg`` is the safe parser at the bus boundary.
+        force = _bool_arg(args, "force", default=False)
         try:
-            branch = GitClient(cwd).delete_branch(
-                name,
-                force=bool(args.get("force", False)),
-            )
+            branch = GitClient(cwd).delete_branch(name, force=force)
         except GitClientError as e:
             await self._safe_report_gap("git_delete_branch", str(e))
             return {"error": str(e)}
-        return {"deleted": branch, "force": bool(args.get("force", False))}
+        return {"deleted": branch, "force": force}
 
     @handler("git_fetch")
     async def handle_git_fetch(self, args):
@@ -3175,7 +3220,7 @@ class DeveloperAgent(BaseAgent):
             branch = GitClient(cwd).pull(
                 remote=args.get("remote") or None,
                 branch=args.get("branch") or None,
-                ff_only=bool(args.get("ff_only", True)),
+                ff_only=_bool_arg(args, "ff_only", default=True),
             )
         except GitClientError as e:
             await self._safe_report_gap("git_pull", str(e))
@@ -3196,11 +3241,44 @@ class DeveloperAgent(BaseAgent):
             result = client.push(
                 remote=args.get("remote") or "origin",
                 branch=branch,
-                force=bool(args.get("force", False)),
-                set_upstream=bool(args.get("set_upstream", False)),
+                # ``_bool_arg`` over naive ``bool()`` so a stringified
+                # "false" / "0" from the bus boundary doesn't silently
+                # flip the guard — protected-branch refusal would be
+                # bypassed, force-push would happen unintentionally.
+                force=_bool_arg(args, "force", default=False),
+                set_upstream=_bool_arg(args, "set_upstream", default=False),
+                allow_main=_bool_arg(args, "allow_main", default=False),
             )
         except GitClientError as e:
             await self._safe_report_gap("git_push", str(e))
+            return {"error": str(e)}
+        return result
+
+    @handler("git_pr_commit_push")
+    async def handle_git_pr_commit_push(self, args):
+        from developer.git_client import GitClient, GitClientError
+        cwd = args.get("cwd", "")
+        branch = args.get("branch", "")
+        message = args.get("message", "")
+        paths = _parse_paths(args.get("paths", []))
+        if not cwd or not branch or not message or not paths:
+            return {"error": "cwd, branch, message, and paths are required"}
+        co_raw = args.get("co_authors", "")
+        if isinstance(co_raw, list):
+            co_authors = [str(c).strip() for c in co_raw if str(c).strip()]
+        else:
+            co_authors = [c.strip() for c in str(co_raw).split(",") if c.strip()]
+        try:
+            result = GitClient(cwd).pr_commit_push(
+                branch=branch,
+                message=message,
+                paths=paths,
+                remote=args.get("remote") or "origin",
+                co_authors=co_authors or None,
+                set_upstream=_bool_arg(args, "set_upstream", default=False),
+            )
+        except GitClientError as e:
+            await self._safe_report_gap("git_pr_commit_push", str(e))
             return {"error": str(e)}
         return result
 

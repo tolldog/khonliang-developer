@@ -394,6 +394,9 @@ async def test_git_pull_and_push_handlers(harness, git_repo, monkeypatch):
         "remote": "origin",
         "branch": "main",
         "set_upstream": True,
+        # Test concern is the push pathway, not the new
+        # protected-branch guard — opt past it explicitly.
+        "allow_main": True,
     })
     assert pushed == {
         "remote": "origin",
@@ -416,6 +419,85 @@ async def test_git_stage_handler_treats_none_paths_as_missing(harness, git_repo)
     result = await harness.call("git_stage", {"cwd": str(git_repo), "paths": None})
     assert "error" in result
     assert "paths are required" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_git_push_handler_refuses_main_without_allow_main(harness, git_repo):
+    """Bus skill must surface the GitGuardError as a clean error
+    envelope, not crash. Recovery path is mentioned in the message.
+    """
+    result = await harness.call("git_push", {
+        "cwd": str(git_repo),
+        "remote": "origin",
+        "branch": "main",
+    })
+    assert "error" in result
+    assert "protected branch" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_git_stage_handler_refuses_wildcard_without_allow_all(harness, git_repo):
+    result = await harness.call("git_stage", {
+        "cwd": str(git_repo),
+        "paths": ".",
+    })
+    assert "error" in result
+    assert "wildcard" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_git_commit_handler_refuses_branch_hint_mismatch(harness, git_repo):
+    (git_repo / "x.txt").write_text("x\n")
+    import subprocess as _sub
+    _sub.run(["git", "add", "x.txt"], cwd=str(git_repo), check=True)
+    result = await harness.call("git_commit", {
+        "cwd": str(git_repo),
+        "message": "subject",
+        "branch_hint": "some-other-branch",
+    })
+    assert "error" in result
+    assert "branch_hint mismatch" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_git_pr_commit_push_handler_happy_path(harness, git_repo, monkeypatch):
+    import subprocess as _sub
+    from git.cmd import Git as _GitCmd
+
+    _sub.run(["git", "checkout", "-b", "feat/x"], cwd=str(git_repo), check=True,
+             stdout=_sub.DEVNULL, stderr=_sub.DEVNULL)
+    (git_repo / "y.txt").write_text("y\n")
+    push_calls: list[tuple] = []
+
+    def fake_push(self_git, *args, **kwargs):
+        push_calls.append(args)
+        return ""
+
+    monkeypatch.setattr(_GitCmd, "push", fake_push, raising=False)
+
+    result = await harness.call("git_pr_commit_push", {
+        "cwd": str(git_repo),
+        "branch": "feat/x",
+        "message": "add y",
+        "paths": "y.txt",
+        "set_upstream": True,
+    })
+    assert result["commit"]["message"] == "add y"
+    assert result["push"]["branch"] == "feat/x"
+    assert push_calls == [("-u", "origin", "feat/x")]
+
+
+@pytest.mark.asyncio
+async def test_git_pr_commit_push_handler_refuses_main(harness, git_repo):
+    """Composite skill rejects a protected target before any side effect."""
+    result = await harness.call("git_pr_commit_push", {
+        "cwd": str(git_repo),
+        "branch": "main",
+        "message": "subject",
+        "paths": "x.txt",
+    })
+    assert "error" in result
+    assert "protected" in result["error"]
 
 
 @pytest.mark.asyncio
