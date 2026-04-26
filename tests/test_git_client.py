@@ -530,8 +530,9 @@ def test_stage_refuses_dot_slash_wildcard_equivalents(client):
 
 def test_stage_allow_all_accepts_dot_pathspec(client, repo_path):
     """``allow_all=True`` is the explicit opt-in for callers who really
-    do want to capture every change in the working tree. Only ``.``
-    is the supported bulk-add pathspec.
+    do want to capture every change in the working tree. Any
+    ``_is_wildcard_pathspec``-equivalent (``.``, ``./``, ``.//``)
+    works once the opt-in is set — the canonical form is ``.``.
     """
     (repo_path / "b.txt").write_text("hi\n")
     staged = client.stage(["."], allow_all=True)
