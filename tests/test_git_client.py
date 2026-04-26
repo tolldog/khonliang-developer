@@ -373,7 +373,10 @@ def test_push_without_force_returns_structured_shape(client, repo_path):
         calls.append((args, kwargs))
         return ""
     with patch.object(_GitCmd, "push", _fake_push, create=True):
-        result = client.push(remote="origin", branch="main")
+        # repo_path's default branch is main; the protected-branch guard
+        # would refuse this push without allow_main=True, but this test's
+        # concern is the structured-shape return, not the guard.
+        result = client.push(remote="origin", branch="main", allow_main=True)
     assert result["remote"] == "origin"
     assert result["branch"] == "main"
     assert result["force"] is False
@@ -385,7 +388,7 @@ def test_push_force_is_logged_at_info(client, repo_path, caplog):
         return ""
     with patch.object(_GitCmd, "push", _fake_push, create=True):
         with caplog.at_level(_l.INFO, logger="developer.git_client"):
-            result = client.push(force=True)
+            result = client.push(force=True, allow_main=True)
     assert result["force"] is True
     # Force=True must hit the audit log
     assert any("force=True" in rec.message for rec in caplog.records)
@@ -402,7 +405,7 @@ def test_push_rejected_raises_upstream_error(client, repo_path):
         )
     with patch.object(_GitCmd, "push", _fake_push, create=True):
         with pytest.raises(GitUpstreamError, match="non-fast-forward"):
-            client.push()
+            client.push(allow_main=True)
 
 
 def test_pull_ff_only_is_default(client, repo_path):
@@ -463,3 +466,141 @@ def test_pull_conflict_raises_conflict_error(client, repo_path):
 def test_fetch_unknown_remote_raises_not_found(client):
     with pytest.raises(GitNotFoundError, match="not configured"):
         client.fetch(remote="never-configured")
+
+
+# ---------------------------------------------------------------------------
+# Guards (fr_developer_44fc7dde)
+# ---------------------------------------------------------------------------
+
+from developer.git_client import GitGuardError
+
+
+def test_stage_refuses_empty_paths(client):
+    with pytest.raises(GitGuardError, match="explicit paths"):
+        client.stage([])
+
+
+def test_stage_refuses_dot_wildcard(client):
+    with pytest.raises(GitGuardError, match="wildcard"):
+        client.stage(["."])
+
+
+def test_stage_refuses_dash_a(client):
+    with pytest.raises(GitGuardError, match="wildcard"):
+        client.stage(["-A"])
+
+
+def test_stage_allow_all_accepts_wildcard(client, repo_path):
+    """``allow_all=True`` is the explicit opt-in for callers who really
+    do want to capture every change in the working tree.
+    """
+    (repo_path / "b.txt").write_text("hi\n")
+    staged = client.stage(["."], allow_all=True)
+    assert staged == ["."]
+    # Bulk add captured the new file (status returns paths with ./ prefix).
+    assert any("b.txt" in p for p in client.status().staged)
+
+
+def test_commit_refuses_branch_hint_mismatch(client, repo_path):
+    """branch_hint is the strict guard against wrong-cwd commits — if
+    the message names branch X but the cwd is on branch Y, refuse so
+    the misroute fails fast instead of landing on Y.
+    """
+    (repo_path / "b.txt").write_text("hi\n")
+    client.stage(["b.txt"])
+    with pytest.raises(GitGuardError, match="branch_hint mismatch"):
+        client.commit("subject", branch_hint="some-other-branch")
+
+
+def test_commit_branch_hint_match_succeeds(client, repo_path):
+    (repo_path / "b.txt").write_text("hi\n")
+    client.stage(["b.txt"])
+    commit = client.commit("subject", branch_hint="main")
+    assert commit.message == "subject"
+
+
+def test_commit_no_branch_hint_skips_check(client, repo_path):
+    """Empty branch_hint preserves the legacy behavior — callers that
+    haven't migrated still work.
+    """
+    (repo_path / "b.txt").write_text("hi\n")
+    client.stage(["b.txt"])
+    commit = client.commit("subject")
+    assert commit.message == "subject"
+
+
+def test_push_refuses_main_without_allow_main(client, repo_path):
+    """The headline guard: ``main`` is the protected branch, refuse-by-
+    default. The error message must point at the recovery path
+    (feature branch + PR).
+    """
+    with pytest.raises(GitGuardError, match="protected branch"):
+        client.push(branch="main")
+
+
+def test_push_refuses_master_without_allow_main(client, repo_path):
+    with pytest.raises(GitGuardError, match="protected branch"):
+        client.push(branch="master")
+
+
+def test_push_refuses_current_branch_when_protected(client, repo_path):
+    """Without an explicit branch arg, ``push`` resolves to the cwd's
+    current branch — which is ``main`` in repo_path. Same guard fires.
+    """
+    with pytest.raises(GitGuardError, match="protected branch"):
+        client.push()
+
+
+def test_push_feature_branch_does_not_trigger_guard(client, repo_path):
+    """Sanity check: pushing a non-protected branch goes through the
+    normal path (which here hits the not-configured-remote, not the
+    guard).
+    """
+    _run("checkout", "-b", "feat/x", cwd=repo_path)
+    # No remote configured in the test repo → push fails with a non-
+    # guard error. The point is the guard didn't catch it.
+    with pytest.raises(Exception) as exc_info:
+        client.push(branch="feat/x")
+    assert not isinstance(exc_info.value, GitGuardError)
+
+
+# -- pr_commit_push composite ---------------------------------------------
+
+
+def test_pr_commit_push_refuses_protected_branch(client, repo_path):
+    with pytest.raises(GitGuardError, match="protected"):
+        client.pr_commit_push("main", "subject", ["b.txt"])
+
+
+def test_pr_commit_push_refuses_branch_mismatch(client, repo_path):
+    """cwd is on main; caller asks for feat/x → fail fast before any
+    side effect.
+    """
+    (repo_path / "b.txt").write_text("hi\n")
+    with pytest.raises(GitGuardError, match="branch mismatch"):
+        client.pr_commit_push("feat/x", "subject", ["b.txt"])
+    # No side effect — file still untracked, nothing staged.
+    assert "b.txt" in client.status().untracked
+    assert "b.txt" not in client.status().staged
+
+
+def test_pr_commit_push_happy_path(client, repo_path):
+    """Full happy path against a feature branch: stage → commit →
+    push (mocked). Returns ``{commit, push}`` shape.
+    """
+    _run("checkout", "-b", "feat/x", cwd=repo_path)
+    (repo_path / "b.txt").write_text("hi\n")
+    with patch.object(_GitCmd, "push", lambda *_a, **_kw: "", create=True):
+        result = client.pr_commit_push(
+            "feat/x", "add b.txt", ["b.txt"],
+        )
+    assert result["commit"]["message"] == "add b.txt"
+    assert result["push"]["branch"] == "feat/x"
+    # Commit landed on feat/x, not main.
+    assert client.current_branch() == "feat/x"
+
+
+def test_pr_commit_push_refuses_wildcard_paths(client, repo_path):
+    _run("checkout", "-b", "feat/x", cwd=repo_path)
+    with pytest.raises(GitGuardError, match="wildcard"):
+        client.pr_commit_push("feat/x", "subject", ["."])

@@ -97,6 +97,34 @@ class GitDestructiveError(GitClientError):
     """Destructive op attempted without the required explicit flag."""
 
 
+class GitGuardError(GitClientError):
+    """Operation refused by a primitive-level safety guard.
+
+    Distinct from GitDestructiveError so callers can catch
+    "I refused for a structural reason" (wrong branch,
+    protected push, wildcard staging) separately from
+    "you asked me to do something destructive". The error
+    message names the recovery path.
+    """
+
+
+# Branches that ``push`` refuses to write to without explicit
+# ``allow_main=True``. Single source of truth so callers and tests
+# agree. Adding a project-level branch_protection config is a
+# future extension; keeping the list constant avoids a config
+# round-trip in the hot path.
+PROTECTED_BRANCHES: tuple[str, ...] = ("main", "master")
+
+# Stage shortcuts that pull in untracked files indiscriminately.
+# ``stage`` refuses these unless ``allow_all=True`` so a caller
+# composing ``add -A`` from a chained shell pipeline can't quietly
+# capture unrelated dotfiles / build output. The recovery path is
+# to pass explicit relative paths.
+_STAGE_WILDCARD_TOKENS: frozenset[str] = frozenset({
+    ".", "-A", "--all", "-u", "--update",
+})
+
+
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
@@ -432,8 +460,30 @@ class GitClient:
             raise GitClientError(f"delete_branch failed: {e}") from e
         return name
 
-    def stage(self, paths: list[str]) -> list[str]:
-        """Stage the given paths (relative to repo root)."""
+    def stage(self, paths: list[str], *, allow_all: bool = False) -> list[str]:
+        """Stage the given paths (relative to repo root).
+
+        ``paths`` must be a non-empty list of explicit paths. The
+        wildcard tokens ``.``, ``-A``, ``--all``, ``-u``,
+        ``--update`` are refused unless ``allow_all=True`` —
+        a chained shell pipeline that composed ``git add -A``
+        from a wrong cwd captures unrelated untracked files and
+        produces commits whose content doesn't match the
+        message. Explicit paths force the caller to know what
+        they're staging.
+        """
+        if not paths:
+            raise GitGuardError(
+                "stage requires explicit paths; pass the files to add or "
+                "use allow_all=True to opt into a bulk add"
+            )
+        wildcards = [p for p in paths if p in _STAGE_WILDCARD_TOKENS]
+        if wildcards and not allow_all:
+            raise GitGuardError(
+                f"stage refused wildcard paths {wildcards!r}: pass explicit "
+                f"relative paths, or set allow_all=True if you really want "
+                f"to capture every change in the working tree"
+            )
         repo = self._get_repo()
         try:
             repo.index.add(paths)
@@ -455,6 +505,7 @@ class GitClient:
         author: Optional[str] = None,
         co_authors: Optional[list[str]] = None,
         amend: bool = False,
+        branch_hint: str = "",
     ) -> GitCommit:
         """Commit the staged changes.
 
@@ -463,10 +514,25 @@ class GitClient:
 
         ``amend=True`` rewrites the previous commit — destructive if that
         commit is already pushed. Logged at INFO.
+
+        ``branch_hint`` (optional): if set, refuse the commit when the
+        cwd's current branch doesn't match. Catches the wrong-cwd
+        composition where a chained pipeline references one branch in
+        the message but lands the commit on a different branch.
+        Empty string disables the check (legacy callers).
         """
         repo = self._get_repo()
         if not message or not message.strip():
             raise GitClientError("commit requires a non-empty message")
+        if branch_hint:
+            current = self.current_branch()
+            if current != branch_hint:
+                raise GitGuardError(
+                    f"branch_hint mismatch: expected {branch_hint!r}, "
+                    f"cwd is on {current!r}. Refusing the commit so a "
+                    f"wrong-cwd pipeline doesn't land work on the wrong "
+                    f"branch. Switch branches or correct the hint."
+                )
 
         # Pre-check for empty staging — GitPython's index.commit happily
         # creates empty commits; we want to refuse explicitly so callers
@@ -584,6 +650,7 @@ class GitClient:
     def push(
         self, remote: str = "origin", branch: Optional[str] = None, *,
         force: bool = False, set_upstream: bool = False,
+        allow_main: bool = False,
     ) -> dict[str, Any]:
         """Push to ``remote``.
 
@@ -592,10 +659,24 @@ class GitClient:
         captures the bypass.
 
         ``set_upstream=True`` is equivalent to ``git push -u``.
+
+        ``allow_main=False`` (default) refuses to push when the resolved
+        branch matches a name in ``PROTECTED_BRANCHES`` (``main``,
+        ``master``). The ecosystem convention is branch → PR → review
+        → merge; bypass is rare enough that callers should opt in
+        explicitly when they need it.
         """
         repo = self._get_repo()
         current = self.current_branch()
         branch_to_push = branch or current
+
+        if branch_to_push in PROTECTED_BRANCHES and not allow_main:
+            raise GitGuardError(
+                f"push refused: {branch_to_push!r} is a protected branch. "
+                f"Use a feature branch + PR, or pass allow_main=True for "
+                f"the rare cases where direct-to-{branch_to_push} is "
+                f"intentional (release tags, etc.)."
+            )
 
         try:
             args = []
@@ -623,6 +704,60 @@ class GitClient:
             "branch": branch_to_push,
             "force": force,
             "set_upstream": set_upstream,
+        }
+
+    def pr_commit_push(
+        self, branch: str, message: str, paths: list[str], *,
+        remote: str = "origin",
+        co_authors: Optional[list[str]] = None,
+        set_upstream: bool = False,
+    ) -> dict[str, Any]:
+        """Stage explicit ``paths``, commit with ``message``, push.
+
+        One-call composite that gates every step on ``branch`` matching
+        the cwd's current branch — so a chained pipeline composed from
+        the wrong cwd refuses fast instead of landing wrong-content
+        commits with mismatched messages.
+
+        Refuses if ``branch`` is in ``PROTECTED_BRANCHES`` (push would
+        refuse anyway, but failing here is faster and avoids a stray
+        commit on the local protected branch). ``paths`` must be
+        explicit (no wildcards — same rules as ``stage``).
+
+        Returns ``{"commit": GitCommit-as-dict, "push": push-result}``.
+        """
+        if not branch:
+            raise GitGuardError("pr_commit_push requires an explicit branch")
+        if branch in PROTECTED_BRANCHES:
+            raise GitGuardError(
+                f"pr_commit_push refused: {branch!r} is protected. "
+                f"Use a feature branch."
+            )
+        current = self.current_branch()
+        if current != branch:
+            raise GitGuardError(
+                f"branch mismatch: pr_commit_push expects {branch!r}, "
+                f"cwd is on {current!r}. Switch branches or correct "
+                f"the call so the commit lands where the message says."
+            )
+        self.stage(paths)
+        commit = self.commit(
+            message,
+            co_authors=co_authors,
+            branch_hint=branch,
+        )
+        push = self.push(
+            remote=remote,
+            branch=branch,
+            set_upstream=set_upstream,
+        )
+        return {
+            "commit": {
+                "sha": commit.sha,
+                "short_sha": commit.short_sha,
+                "message": commit.message,
+            },
+            "push": push,
         }
 
 

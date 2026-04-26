@@ -631,12 +631,21 @@ class DeveloperAgent(BaseAgent):
                   {"cwd": {"type": "string", "required": True},
                    "message": {"type": "string", "required": True},
                    "co_authors": {"type": "string", "default": "",
-                                  "description": "comma-separated Name <email> list"}},
+                                  "description": "comma-separated Name <email> list"},
+                   "branch_hint": {"type": "string", "default": "",
+                                   "description": "if set, refuse the commit when the "
+                                   "cwd's current branch doesn't match — catches "
+                                   "wrong-cwd composition where the message names a "
+                                   "different branch than where it lands"}},
                   since="0.5.0"),
             Skill("git_stage", "Stage paths for commit",
                   {"cwd": {"type": "string", "required": True},
                    "paths": {"type": "string", "required": True,
-                             "description": "comma-separated paths"}},
+                             "description": "comma-separated paths"},
+                   "allow_all": {"type": "boolean", "default": False,
+                                 "description": "opt in to wildcard tokens "
+                                 "('.', '-A', '--all', '-u'); refused by default "
+                                 "so a wrong-cwd add doesn't capture unrelated files"}},
                   since="0.7.0"),
             Skill("git_unstage", "Unstage paths while keeping working-tree changes",
                   {"cwd": {"type": "string", "required": True},
@@ -673,8 +682,33 @@ class DeveloperAgent(BaseAgent):
                    "remote": {"type": "string", "default": "origin"},
                    "branch": {"type": "string", "default": ""},
                    "force": {"type": "boolean", "default": False},
-                   "set_upstream": {"type": "boolean", "default": False}},
+                   "set_upstream": {"type": "boolean", "default": False},
+                   "allow_main": {"type": "boolean", "default": False,
+                                  "description": "refuse-by-default for pushes "
+                                  "to protected branches (main/master); pass True "
+                                  "for the rare cases where direct-push is "
+                                  "intentional"}},
                   since="0.7.0"),
+            # fr_developer_44fc7dde: composite stage+commit+push gated on
+            # the cwd's branch matching the caller's expectation. Refuses
+            # protected-branch targets and wildcard staging — the canonical
+            # mutation primitive that the PR-automation loop
+            # (fr_developer_35fe69af) will consume.
+            Skill("git_pr_commit_push",
+                  "Stage explicit paths, commit, push — gated on branch match",
+                  {"cwd": {"type": "string", "required": True},
+                   "branch": {"type": "string", "required": True,
+                              "description": "the branch the caller expects to "
+                              "be on; refuses if cwd is on a different branch"},
+                   "message": {"type": "string", "required": True},
+                   "paths": {"type": "string", "required": True,
+                             "description": "comma-separated explicit paths to "
+                             "stage; wildcards refused"},
+                   "remote": {"type": "string", "default": "origin"},
+                   "co_authors": {"type": "string", "default": "",
+                                  "description": "comma-separated Name <email> list"},
+                   "set_upstream": {"type": "boolean", "default": False}},
+                  since="0.16.0"),
             Skill("git_show", "Resolve and summarize a commit",
                   {"cwd": {"type": "string", "required": True},
                    "ref": {"type": "string", "required": True}},
@@ -3063,6 +3097,7 @@ class DeveloperAgent(BaseAgent):
             commit = GitClient(cwd).commit(
                 message=message,
                 co_authors=co_authors or None,
+                branch_hint=str(args.get("branch_hint", "") or ""),
             )
         except GitClientError as e:
             await self._safe_report_gap("git_commit", str(e))
@@ -3081,7 +3116,10 @@ class DeveloperAgent(BaseAgent):
         if not cwd or not paths:
             return {"error": "cwd and paths are required"}
         try:
-            staged = GitClient(cwd).stage(paths)
+            staged = GitClient(cwd).stage(
+                paths,
+                allow_all=bool(args.get("allow_all", False)),
+            )
         except GitClientError as e:
             await self._safe_report_gap("git_stage", str(e))
             return {"error": str(e)}
@@ -3198,9 +3236,38 @@ class DeveloperAgent(BaseAgent):
                 branch=branch,
                 force=bool(args.get("force", False)),
                 set_upstream=bool(args.get("set_upstream", False)),
+                allow_main=bool(args.get("allow_main", False)),
             )
         except GitClientError as e:
             await self._safe_report_gap("git_push", str(e))
+            return {"error": str(e)}
+        return result
+
+    @handler("git_pr_commit_push")
+    async def handle_git_pr_commit_push(self, args):
+        from developer.git_client import GitClient, GitClientError
+        cwd = args.get("cwd", "")
+        branch = args.get("branch", "")
+        message = args.get("message", "")
+        paths = _parse_paths(args.get("paths", []))
+        if not cwd or not branch or not message or not paths:
+            return {"error": "cwd, branch, message, and paths are required"}
+        co_raw = args.get("co_authors", "")
+        if isinstance(co_raw, list):
+            co_authors = [str(c).strip() for c in co_raw if str(c).strip()]
+        else:
+            co_authors = [c.strip() for c in str(co_raw).split(",") if c.strip()]
+        try:
+            result = GitClient(cwd).pr_commit_push(
+                branch=branch,
+                message=message,
+                paths=paths,
+                remote=args.get("remote") or "origin",
+                co_authors=co_authors or None,
+                set_upstream=bool(args.get("set_upstream", False)),
+            )
+        except GitClientError as e:
+            await self._safe_report_gap("git_pr_commit_push", str(e))
             return {"error": str(e)}
         return result
 
