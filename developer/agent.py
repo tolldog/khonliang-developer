@@ -23,7 +23,14 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from khonliang_bus import BaseAgent, Skill, Collaboration, handler
+from khonliang_bus import (
+    BaseAgent,
+    Collaboration,
+    Skill,
+    Welcome,
+    WelcomeEntryPoint,
+    handler,
+)
 
 from developer import fr_drafting
 from developer import integration_scan
@@ -93,6 +100,56 @@ logger = logging.getLogger(__name__)
 class DeveloperAgent(BaseAgent):
     agent_type = "developer"
     module_name = "developer.agent"
+
+    # Cold-start orientation surface (fr_khonliang-bus-lib_6a82732c).
+    # Read by an ephemeral external LLM session via the welcome skill —
+    # tells it what this agent owns, where to drill in, and what to
+    # delegate to siblings. Editorial fields only; auto-derived fields
+    # (identity, skill catalog) come from BaseAgent.
+    WELCOME = Welcome(
+        role="development lifecycle authority",
+        mission=(
+            "Owns FR / spec / milestone / work-unit lifecycle, git + PR "
+            "operations, and dispatch to Claude. Researcher feeds context; "
+            "reviewer reviews; store persists artifacts; this agent "
+            "orchestrates the development cycle end-to-end."
+        ),
+        not_responsible_for=[
+            "paper / RSS / GitHub ingestion (researcher)",
+            "verdict rendering on diffs (reviewer)",
+            "artifact storage backend (store)",
+            "corpus classification + taxonomy (librarian)",
+        ],
+        delegates_to={
+            "researcher": "evidence + concept retrieval via brief_on / find_relevant",
+            "reviewer": "code review via review_diff / review_pr",
+            "store": "large-payload artifact_create / artifact_get",
+            "librarian": "corpus health + taxonomy + classification",
+        },
+        entry_points=[
+            WelcomeEntryPoint(
+                skill="draft_fr_from_request",
+                when_to_use="any feature-extension request — produces a promote-ready FR draft with corpus motivation and code evidence",
+            ),
+            WelcomeEntryPoint(
+                skill="next_work_unit",
+                when_to_use="what's queued next; bundles related FRs by concept and dependency",
+            ),
+            WelcomeEntryPoint(
+                skill="prepare_development_handoff",
+                when_to_use="load context (spec + evidence + worktree) for an in-progress milestone",
+            ),
+            WelcomeEntryPoint(
+                skill="git_pr_commit_push",
+                when_to_use="canonical safe path for stage + commit + push gated on branch match",
+            ),
+            WelcomeEntryPoint(
+                skill="log_dogfood",
+                when_to_use="capture a friction / UX observation cheap (<100ms local write); triage later",
+            ),
+        ],
+        guide_skill="developer_guide",
+    )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
