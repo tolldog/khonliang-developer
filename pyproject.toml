@@ -27,7 +27,7 @@ dependencies = [
     "khonliang-researcher-lib",
     "pyyaml>=6.0",
     "mcp>=1.0.0",
-    "khonliang-bus-lib",
+    "khonliang-bus-lib>=0.5.0",  # >=0.5.0 for Welcome / WelcomeEntryPoint exports
     # Native GitHub API access — we reach for the SDK before shelling out
     # to `gh`. Used by PR-watcher / review-ingest work (fr_developer_5559d499,
     # fr_developer_d5642f3e). githubkit is async-native and type-forward,
