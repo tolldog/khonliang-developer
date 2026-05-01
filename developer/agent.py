@@ -2090,6 +2090,11 @@ class DeveloperAgent(BaseAgent):
                     return next_result
                 work_unit = next_result.get("work_unit") or {}
                 source = next_result.get("source", "work_unit")
+            # Enrich work_unit FRs with their full descriptions from
+            # fr_store before storing — gives draft_spec the design-intent
+            # prose, not just title + priority. Read-only lookup; missing
+            # FRs render as empty (no-op in the renderer).
+            work_unit = _enrich_work_unit_with_fr_descriptions(work_unit, self.pipeline.frs)
             # Phase 3 pass-through: empty `project` maps to None =
             # preserve-existing-or-default (store's documented
             # re-propose semantics); an explicit slug — including
@@ -2320,6 +2325,12 @@ class DeveloperAgent(BaseAgent):
                 work_unit = next_result.get("work_unit") or {}
                 source = next_result.get("source", "work_unit")
                 remaining = next_result.get("remaining")
+
+            # Same enrichment as propose_milestone_from_work_unit — pull
+            # full FR descriptions into the work_unit so the resulting
+            # milestone's draft_spec carries design intent, not just titles.
+            # See _enrich_work_unit_with_fr_descriptions.
+            work_unit = _enrich_work_unit_with_fr_descriptions(work_unit, self.pipeline.frs)
 
             milestone = self.pipeline.milestones.propose_from_work_unit(
                 work_unit,
@@ -4399,6 +4410,44 @@ def _parse_work_unit_arg(value) -> dict:
     if "error" in parsed:
         raise ValueError(parsed["error"])
     return parsed
+
+
+def _enrich_work_unit_with_fr_descriptions(work_unit: dict, fr_store) -> dict:
+    """Look up each FR's full description from ``fr_store`` and inject it
+    into the work_unit's ``frs`` entries as ``full_description``.
+
+    Without this, milestone draft_spec markdown only carries each FR's
+    title + priority — too thin to brief a handoff session against.
+    With this, draft_spec gets the FR's actual design-intent prose
+    (broker stub patterns, multi-axis routing notes, etc.) inlined as
+    an indented sub-block per FR (see ``_draft_spec`` in
+    milestone_store.py).
+
+    Existing fields on each fr dict are preserved. FRs whose lookup
+    misses get an empty ``full_description`` (the renderer no-ops on
+    empty). Non-dict fr items (bare-string ids) pass through untouched.
+    """
+    if not isinstance(work_unit, dict):
+        return work_unit
+    frs = work_unit.get("frs") or []
+    if not frs:
+        return work_unit
+    enriched = []
+    for fr in frs:
+        if isinstance(fr, dict):
+            fr_id = (fr.get("fr_id") or fr.get("id") or "").strip()
+            full_description = ""
+            if fr_id:
+                try:
+                    stored = fr_store.get(fr_id)
+                except Exception:  # noqa: BLE001 — read-only enrichment, never fail propose
+                    stored = None
+                if stored is not None:
+                    full_description = str(getattr(stored, "description", "") or "").strip()
+            enriched.append({**fr, "full_description": full_description})
+        else:
+            enriched.append(fr)
+    return {**work_unit, "frs": enriched}
 
 
 def _compact_jsonish(value, *, limit: int = 1200) -> str:

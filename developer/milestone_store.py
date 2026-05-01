@@ -997,6 +997,23 @@ def _draft_spec(
         if isinstance(fr, dict):
             fr_id = _fr_id_from_item(fr)
             lines.append(f"- `{fr_id}` {_fr_description_with_priority(fr)}".rstrip())
+            full_description = str(fr.get("full_description") or "").strip()
+            if full_description:
+                # Inline the FR's full description as an indented sub-block
+                # under the bullet so a handoff brief carries the actual
+                # design intent (broker stub-then-swap, three-mode invocation,
+                # five-layer overhead model, etc.) — not just the title +
+                # priority. Caller must populate ``full_description`` on the
+                # work_unit's frs before storing the milestone; agent.py
+                # `_enrich_work_unit_with_fr_descriptions` does that lookup
+                # against fr_store at propose / handoff time.
+                lines.append("")
+                for desc_line in full_description.splitlines():
+                    if desc_line.strip():
+                        lines.append(f"    {desc_line.rstrip()}")
+                    else:
+                        lines.append("")
+                lines.append("")
         else:
             lines.append(f"- `{str(fr).strip()}`")
     lines.extend([

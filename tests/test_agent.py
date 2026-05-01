@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from khonliang_bus.testing import AgentTestHarness
 from developer.agent import DeveloperAgent
@@ -1121,6 +1123,56 @@ async def test_propose_milestone_accepts_json_work_unit(harness):
 
     assert result["milestone"]["title"] == "Small milestone"
     assert result["milestone"]["fr_ids"] == ["fr_developer_33333333"]
+
+
+@pytest.mark.asyncio
+async def test_propose_milestone_inlines_full_fr_description_in_draft_spec(harness):
+    """The work_unit-only `description` field is just the FR title; a real
+    handoff brief needs the FR's full description (the design-intent prose)
+    inlined under the bullet so the receiving session has actual content
+    to work from. Regression guard for ``fr_developer_3763aaf3``.
+    """
+    rich_description = (
+        "Multi-paragraph design intent.\n"
+        "\n"
+        "First paragraph explains the broker stub-then-swap pattern: ship\n"
+        "passthrough on day one, swap when broker lands, signature stable.\n"
+        "\n"
+        "Second paragraph notes the three-mode invocation surface.\n"
+    )
+    fr = harness.agent.pipeline.frs.promote(
+        target="benchmark",
+        title="bench: submit_via_broker stub-then-swap",
+        description=rich_description,
+        priority="high",
+        concept="benchmark-agent",
+    )
+
+    work_unit = json.dumps({
+        "name": "MS-bench-Q slice",
+        "targets": ["benchmark"],
+        "frs": [{"fr_id": fr.id, "description": "bench: submit_via_broker stub-then-swap",
+                 "priority": "high"}],
+    })
+    result = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": work_unit,
+        "title": "MS-bench-Q test",
+        "summary": "verify draft_spec carries full FR descriptions",
+    })
+
+    draft = result["milestone"]["draft_spec"]
+    # Bullet line still present
+    assert f"`{fr.id}`" in draft
+    # Each non-blank line of the rich description appears as an indented sub-block
+    for substring in [
+        "Multi-paragraph design intent.",
+        "First paragraph explains the broker stub-then-swap pattern",
+        "passthrough on day one",
+        "Second paragraph notes the three-mode invocation surface.",
+    ]:
+        assert f"    {substring}" in draft or f"    {substring.rstrip()}" in draft, (
+            f"draft_spec missing inlined description line {substring!r}\n---draft---\n{draft}"
+        )
 
 
 @pytest.mark.asyncio
