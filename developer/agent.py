@@ -444,7 +444,11 @@ class DeveloperAgent(BaseAgent):
                                "description": "maximum FRs per implementation bundle"}},
                   since="0.2.0"),
             Skill("propose_milestone_from_work_unit",
-                  "Create a durable milestone from a provided or top-ranked work unit",
+                  "Create a durable milestone from a provided or top-ranked work unit. "
+                  "Returns ``{milestone: {id, title, target, status, fr_ids, "
+                  "draft_spec, project, ...}}``; the new milestone id is at "
+                  "``result.milestone.id`` (NOT ``result.id`` / "
+                  "``result.milestone_id``). On error: ``{error: <message>}``.",
                   {"target": {"type": "string", "default": ""},
                    "title": {"type": "string", "default": ""},
                    "summary": {"type": "string", "default": ""},
@@ -488,7 +492,12 @@ class DeveloperAgent(BaseAgent):
                              "from terminal states)"}},
                   since="0.16.0"),
             Skill("supersede_milestone",
-                  "Mark one milestone as superseded by another. Does not cascade to FRs.",
+                  "Mark one milestone as superseded by another. Does not cascade to FRs. "
+                  "Returns ``{milestone: {id, status, superseded_by, ...}}`` for "
+                  "the superseded milestone (the ``superseded_id`` arg, now in "
+                  "``superseded`` status); the superseding milestone id appears "
+                  "at ``result.milestone.superseded_by``. On error: "
+                  "``{error: <message>}``.",
                   {"superseded_id": {"type": "string", "required": True},
                    "superseded_by_id": {"type": "string", "required": True},
                    "rationale": {"type": "string", "default": ""}},
@@ -514,7 +523,13 @@ class DeveloperAgent(BaseAgent):
                    "apply": {"type": "boolean", "default": False}},
                   since="0.10.0"),
             Skill("prepare_development_handoff",
-                  "Return a compact bundle → milestone → draft spec handoff for implementation",
+                  "Return a compact bundle → milestone → draft spec handoff for implementation. "
+                  "Returns ``{status: 'ready'|'needs_review', source, "
+                  "milestone: {id, ...}, work_unit, scope_review, draft_spec, "
+                  "suggested_next_actions, [remaining_work_units]}``; the new "
+                  "milestone id is at ``result.milestone.id`` (NOT "
+                  "``result.id`` / ``result.milestone_id``). On error: "
+                  "``{error: <message>}``.",
                   {"target": {"type": "string", "default": ""},
                    "title": {"type": "string", "default": ""},
                    "summary": {"type": "string", "default": ""},
