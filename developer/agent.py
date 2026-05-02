@@ -2101,13 +2101,13 @@ class DeveloperAgent(BaseAgent):
             fr_descriptions = _build_fr_descriptions_map(
                 work_unit, self.pipeline.frs
             )
-            # When the lookup yields no descriptions at all (transient
-            # store outage, all FRs missing, etc.) pass ``None`` so
-            # ``propose_from_work_unit`` preserves any sidecar cached
-            # from a prior successful propose. Sending ``{}`` would
-            # explicitly clear it, regressing handoff briefs on every
-            # re-propose during a degraded fr_store window. PR #64
-            # review pass-6 finding 1.
+            # Empty lookup (all FRs unresolvable / store outage) →
+            # ``None`` so the store preserves the cached sidecar
+            # wholesale. Non-empty lookup → pass through; the store
+            # now overlays a partial map onto the existing sidecar
+            # rather than replacing wholesale, so a partially-degraded
+            # lookup keeps prose for the FRs that previously resolved.
+            # PR #64 pass-6 + pass-7 findings.
             fr_descriptions_arg = fr_descriptions if fr_descriptions else None
             # Phase 3 pass-through: empty `project` maps to None =
             # preserve-existing-or-default (store's documented

@@ -347,6 +347,40 @@ def test_propose_from_work_unit_re_propose_preserves_existing_fr_descriptions(pi
     assert "Cached on first propose." not in third.draft_spec
 
 
+def test_propose_from_work_unit_re_propose_overlays_partial_fr_descriptions(pipeline):
+    """A partial ``fr_descriptions`` map on re-propose overlays onto
+    the existing sidecar — incoming entries replace, FRs not present
+    in the incoming map keep their previously-cached prose. Closes
+    the regression where a degraded ``fr_store`` (some FRs not
+    resolvable on this propose) would strip cached prose for the FRs
+    that DID resolve last time. PR #64 review pass-7 finding.
+    """
+    work_unit = _work_unit()
+    initial = {
+        "fr_developer_11111111": "First FR cached prose.",
+        "fr_developer_22222222": "Second FR cached prose.",
+    }
+    first = pipeline.milestones.propose_from_work_unit(
+        work_unit, fr_descriptions=initial
+    )
+    assert first.fr_descriptions == initial
+
+    # Simulate a degraded fr_store that only resolves the first FR
+    # this time around. The agent-layer helper would return a partial
+    # map; the store should overlay rather than replace.
+    partial = {"fr_developer_11111111": "First FR refreshed prose."}
+    second = pipeline.milestones.propose_from_work_unit(
+        work_unit, fr_descriptions=partial
+    )
+    assert second.id == first.id
+    assert second.fr_descriptions == {
+        "fr_developer_11111111": "First FR refreshed prose.",  # overlay
+        "fr_developer_22222222": "Second FR cached prose.",    # preserved
+    }
+    assert "First FR refreshed prose." in second.draft_spec
+    assert "Second FR cached prose." in second.draft_spec
+
+
 def test_review_scope_flags_duplicates_and_review_terms(pipeline):
     work_unit = {
         "name": "Cluster 1",

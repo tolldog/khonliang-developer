@@ -303,9 +303,17 @@ class MilestoneStore:
         persisted, every later mutation that calls
         :meth:`_refresh_draft_spec` re-renders with the cached
         descriptions intact instead of regressing to thin briefs.
-        Defaults to ``{}`` when omitted, so existing store-level
-        callers see no behavior change. PR #64 review pass-4 finding
-        1 + pass-5 finding 1.
+
+        Re-propose semantics (PR #64 pass-7 finding):
+        - ``None`` → preserve the existing milestone's sidecar wholesale
+          (callers that don't know about the sidecar — pre-PR-#64 code —
+          won't wipe it).
+        - ``{}`` → explicit clear (caller-driven wipe).
+        - partial dict → overlay onto the existing sidecar: incoming
+          ``fr_id`` entries replace, FRs not present in the incoming
+          map keep their previously-cached prose. Prevents a degraded
+          ``fr_store`` (some FRs not resolvable) from stripping prose
+          for the FRs that did resolve last time.
         """
         if not isinstance(work_unit, dict) or not work_unit:
             raise MilestoneError("work_unit is required")
@@ -350,14 +358,17 @@ class MilestoneStore:
             superseded_by = existing.superseded_by
             if preserve_existing_project:
                 project = existing.project or DEFAULT_PROJECT
-            # Preserve cached FR descriptions on re-propose when the
-            # caller doesn't pass a fresh map. Pre-existing callers
-            # that didn't know about ``fr_descriptions`` won't wipe
-            # the sidecar; callers that explicitly pass an empty dict
-            # to clear it can still do so by passing ``{}`` (not
-            # ``None``).
+            # Re-propose sidecar policy: ``None`` preserves wholesale,
+            # ``{}`` clears, partial dict overlays onto existing so a
+            # degraded ``fr_store`` lookup (only some FRs resolvable)
+            # doesn't strip prose for the FRs that did resolve last
+            # time. PR #64 pass-7 finding.
             if fr_descriptions is None:
                 fr_descriptions = dict(existing.fr_descriptions)
+            elif fr_descriptions:
+                merged = dict(existing.fr_descriptions)
+                merged.update(fr_descriptions)
+                fr_descriptions = merged
         else:
             notes_history = [{
                 "at": now,
