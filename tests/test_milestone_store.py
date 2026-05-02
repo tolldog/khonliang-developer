@@ -186,13 +186,16 @@ def test_propose_from_work_unit_inlines_full_description_in_draft_spec(pipeline)
     milestone = pipeline.milestones.propose_from_work_unit(work_unit)
 
     draft = milestone.draft_spec
-    # First FR's full_description rendered as an indented sub-block
+    # First FR's full_description rendered as a 2-space-indented
+    # continuation paragraph (GFM treats 4-space-indented content
+    # under a list item as a code block; 2-space indent keeps it as
+    # readable prose). PR #64 pass-9 fix.
     for substring in [
         "Multi-paragraph design intent inlined directly at store level.",
         "Second paragraph: store-tier callers shouldn't need to route",
         "through the agent just to get this rendering.",
     ]:
-        assert f"    {substring}" in draft, (
+        assert f"  {substring}" in draft, (
             f"draft_spec missing inlined description line {substring!r}\n"
             f"---draft---\n{draft}"
         )

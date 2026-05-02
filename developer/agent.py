@@ -2351,6 +2351,17 @@ class DeveloperAgent(BaseAgent):
             )
             fr_descriptions_arg = fr_descriptions if fr_descriptions else None
 
+            # Forward the caller's ``project`` arg through to
+            # ``propose_from_work_unit`` so a handoff for a non-default
+            # project lands the milestone under that project rather
+            # than the previously-stored or DEFAULT_PROJECT slug.
+            # Same pass-through semantics as
+            # ``handle_propose_milestone_from_work_unit``: empty / None
+            # → preserve existing or default; explicit slug overrides.
+            # PR #64 review pass-9 suppressed-low-confidence finding.
+            handoff_project_raw = str(args.get("project") or "").strip()
+            handoff_project = handoff_project_raw or None
+
             milestone = self.pipeline.milestones.propose_from_work_unit(
                 work_unit,
                 fr_descriptions=fr_descriptions_arg,
@@ -2358,6 +2369,7 @@ class DeveloperAgent(BaseAgent):
                 title=args.get("title", ""),
                 summary=args.get("summary", ""),
                 source=source,
+                project=handoff_project,
             )
             review_terms = _parse_paths(args.get("review_terms", "AutoGen,GRA"))
             review = self.pipeline.milestones.review_scope(

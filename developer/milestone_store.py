@@ -1102,15 +1102,20 @@ def _draft_spec(
             lines.append(f"- `{fr_id}`")
             full_description = str(descriptions.get(fr_id) or "").strip()
         if full_description:
-            # Inline the FR's full description as an indented sub-block
-            # under the bullet so a handoff brief carries the actual
-            # design intent (broker stub-then-swap, three-mode invocation,
-            # five-layer overhead model, etc.) — not just the title +
-            # priority.
+            # Inline the FR's full description as a continuation
+            # paragraph under the bullet so a handoff brief carries
+            # the actual design intent (broker stub-then-swap,
+            # three-mode invocation, five-layer overhead model, etc.)
+            # — not just the title + priority. Two-space indent (not
+            # four) so GitHub-flavored markdown renders this as
+            # paragraph prose continuing the bullet rather than as a
+            # preformatted code block — four-space-indented content
+            # under a list item is the GFM code-block trigger. PR #64
+            # review pass-9 finding.
             lines.append("")
             for desc_line in full_description.splitlines():
                 if desc_line.strip():
-                    lines.append(f"    {desc_line.rstrip()}")
+                    lines.append(f"  {desc_line.rstrip()}")
                 else:
                     lines.append("")
             lines.append("")

@@ -1170,7 +1170,9 @@ async def test_propose_milestone_inlines_full_fr_description_in_draft_spec(harne
         "passthrough on day one",
         "Second paragraph notes the three-mode invocation surface.",
     ]:
-        assert f"    {substring}" in draft or f"    {substring.rstrip()}" in draft, (
+        # Two-space indent (continuation paragraph) — pass-9 fix from
+        # four-space (code block) to keep GFM rendering as prose.
+        assert f"  {substring}" in draft or f"  {substring.rstrip()}" in draft, (
             f"draft_spec missing inlined description line {substring!r}\n---draft---\n{draft}"
         )
 
@@ -1290,7 +1292,7 @@ async def test_propose_milestone_enriches_bare_string_fr_items(harness):
         "This FR was referenced by id-only, but the bullet still needs",
         "the full description inlined.",
     ]:
-        assert f"    {substring}" in draft, (
+        assert f"  {substring}" in draft, (
             f"draft_spec missing inlined description line {substring!r} for bare-string fr\n"
             f"---draft---\n{draft}"
         )
@@ -1748,6 +1750,32 @@ async def test_prepare_development_handoff_flags_review_terms(harness):
 
 
 @pytest.mark.asyncio
+async def test_prepare_development_handoff_forwards_project_arg(harness):
+    """``prepare_development_handoff`` must forward the caller's
+    ``project`` arg to ``propose_from_work_unit`` so non-default-project
+    handoffs land the milestone under the right project slug. Without
+    forwarding, the milestone falls back to ``DEFAULT_PROJECT`` (or
+    the previously-stored project on a re-handoff), breaking project
+    partitioning. PR #64 review pass-9 suppressed-low-confidence
+    finding.
+    """
+    work_unit = json.dumps({
+        "name": "Cluster X (1 FR, targets: developer)",
+        "targets": ["developer"],
+        "frs": [{"fr_id": "fr_developer_77777777", "description": "x", "priority": "high"}],
+    })
+    result = await harness.call("prepare_development_handoff", {
+        "work_unit": work_unit,
+        "project": "benchmark-platform",
+    })
+    assert result.get("status") in ("ready", "needs_review")
+    assert result["milestone"]["project"] == "benchmark-platform", (
+        f"prepare_development_handoff didn't forward project; got "
+        f"{result['milestone']['project']!r} for project='benchmark-platform'"
+    )
+
+
+@pytest.mark.asyncio
 async def test_prepare_development_handoff_inlines_full_fr_description_in_draft_spec(harness):
     """`prepare_development_handoff` shares the same enrichment hook as
     ``propose_milestone_from_work_unit`` (PR #64): the work_unit's FR
@@ -1796,7 +1824,7 @@ async def test_prepare_development_handoff_inlines_full_fr_description_in_draft_
         "intent prose, not just the bullet's title.",
         "Second paragraph: bench draft_spec must carry this content too.",
     ]:
-        assert f"    {substring}" in draft or f"    {substring.rstrip()}" in draft, (
+        assert f"  {substring}" in draft or f"  {substring.rstrip()}" in draft, (
             f"draft_spec missing inlined description line {substring!r}\n---draft---\n{draft}"
         )
 
