@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from khonliang_bus.testing import AgentTestHarness
 from developer.agent import DeveloperAgent
@@ -1124,6 +1126,405 @@ async def test_propose_milestone_accepts_json_work_unit(harness):
 
 
 @pytest.mark.asyncio
+async def test_propose_milestone_inlines_full_fr_description_in_draft_spec(harness):
+    """The work_unit-only `description` field is just the FR title; a real
+    handoff brief needs the FR's full description (the design-intent prose)
+    inlined under the bullet so the receiving session has actual content
+    to work from. Regression guard for ``fr_developer_3763aaf3``.
+    """
+    rich_description = (
+        "Multi-paragraph design intent.\n"
+        "\n"
+        "First paragraph explains the broker stub-then-swap pattern: ship\n"
+        "passthrough on day one, swap when broker lands, signature stable.\n"
+        "\n"
+        "Second paragraph notes the three-mode invocation surface.\n"
+    )
+    fr = harness.agent.pipeline.frs.promote(
+        target="benchmark",
+        title="bench: submit_via_broker stub-then-swap",
+        description=rich_description,
+        priority="high",
+        concept="benchmark-agent",
+    )
+
+    work_unit = json.dumps({
+        "name": "MS-bench-Q slice",
+        "targets": ["benchmark"],
+        "frs": [{"fr_id": fr.id, "description": "bench: submit_via_broker stub-then-swap",
+                 "priority": "high"}],
+    })
+    result = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": work_unit,
+        "title": "MS-bench-Q test",
+        "summary": "verify draft_spec carries full FR descriptions",
+    })
+
+    draft = result["milestone"]["draft_spec"]
+    # Bullet line still present
+    assert f"`{fr.id}`" in draft
+    # Each non-blank line of the rich description appears as an indented sub-block
+    for substring in [
+        "Multi-paragraph design intent.",
+        "First paragraph explains the broker stub-then-swap pattern",
+        "passthrough on day one",
+        "Second paragraph notes the three-mode invocation surface.",
+    ]:
+        # Two-space indent (continuation paragraph) — pass-9 fix from
+        # four-space (code block) to keep GFM rendering as prose.
+        assert f"  {substring}" in draft or f"  {substring.rstrip()}" in draft, (
+            f"draft_spec missing inlined description line {substring!r}\n---draft---\n{draft}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_propose_milestone_does_not_follow_merge_redirects_in_enrichment(harness):
+    """The work_unit bullet shows the original ``fr_id``; the inlined
+    description must come from the same FR, not whatever a merge-redirect
+    chain points at. PR #64 review finding 1 — without
+    ``follow_redirect=False`` on the lookup, a merged FR's bullet would
+    silently get the resolved FR's description, producing an inconsistent
+    handoff brief.
+    """
+    source = harness.agent.pipeline.frs.promote(
+        target="benchmark",
+        title="bench: source FR pre-merge",
+        description="SOURCE description: pre-merge intent.",
+        priority="high",
+    )
+    # FRStore.merge requires >=2 sources; create a sibling so we can
+    # exercise the merge path. The sibling is incidental — the test
+    # asserts redirect behavior on `source`.
+    sibling = harness.agent.pipeline.frs.promote(
+        target="benchmark",
+        title="bench: sibling source FR",
+        description="SIBLING description.",
+        priority="high",
+    )
+    target = harness.agent.pipeline.frs.merge(
+        source_ids=[source.id, sibling.id],
+        title="bench: target FR post-merge",
+        description="TARGET description: this should NOT appear under the source bullet.",
+        priority="high",
+    )
+
+    work_unit = json.dumps({
+        "name": "merge-redirect work unit",
+        "targets": ["benchmark"],
+        # Bundle references the original (now-merged) source id
+        "frs": [{"fr_id": source.id, "description": "bench: source FR pre-merge",
+                 "priority": "high"}],
+    })
+    result = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": work_unit,
+        "title": "merge-redirect test",
+    })
+    draft = result["milestone"]["draft_spec"]
+
+    # The bullet keeps the source id; the description must match the source FR
+    assert f"`{source.id}`" in draft
+    assert "SOURCE description" in draft
+    # Critically, the target FR's description must NOT have leaked in
+    assert "TARGET description" not in draft
+
+
+@pytest.mark.asyncio
+async def test_propose_milestone_preserves_existing_full_description_on_lookup_miss(harness):
+    """When fr_store.get returns None (FR removed, transient error, etc.)
+    a pre-existing ``full_description`` already on the work_unit's fr
+    dict must be preserved — silent overwrite to empty would wipe a
+    cached good value across re-propose cycles. PR #64 review finding 2.
+    """
+    cached_description = "Cached design intent that must survive a lookup miss."
+    work_unit = json.dumps({
+        "name": "preserve cached on miss",
+        "targets": ["benchmark"],
+        "frs": [{
+            "fr_id": "fr_benchmark_does_not_exist",  # lookup will miss
+            "description": "bench: ghost FR",
+            "priority": "high",
+            "full_description": cached_description,
+        }],
+    })
+    result = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": work_unit,
+        "title": "lookup-miss preserve test",
+    })
+    draft = result["milestone"]["draft_spec"]
+    assert cached_description in draft, (
+        f"cached full_description was wiped by lookup miss\n---draft---\n{draft}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_propose_milestone_enriches_bare_string_fr_items(harness):
+    """``propose_from_work_unit`` accepts bare-string fr items
+    (``"frs": ["fr_developer_..."]``); the enrichment pass must coerce
+    them into dicts and look up full_description so they get the same
+    inlined design-intent prose as the dict-shape entries. PR #64
+    pass-3 finding 1.
+    """
+    rich_description = (
+        "Bare-string-shape design intent.\n"
+        "\n"
+        "This FR was referenced by id-only, but the bullet still needs\n"
+        "the full description inlined.\n"
+    )
+    fr = harness.agent.pipeline.frs.promote(
+        target="benchmark",
+        title="bench: bare-string enrichment",
+        description=rich_description,
+        priority="high",
+    )
+    work_unit = json.dumps({
+        "name": "bare-string work unit",
+        "targets": ["benchmark"],
+        "frs": [fr.id],  # bare-string shape, not a dict
+    })
+    result = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": work_unit,
+        "title": "bare-string enrichment test",
+    })
+    draft = result["milestone"]["draft_spec"]
+    assert f"`{fr.id}`" in draft
+    for substring in [
+        "Bare-string-shape design intent.",
+        "This FR was referenced by id-only, but the bullet still needs",
+        "the full description inlined.",
+    ]:
+        assert f"  {substring}" in draft, (
+            f"draft_spec missing inlined description line {substring!r} for bare-string fr\n"
+            f"---draft---\n{draft}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_propose_milestone_aggregates_fr_store_failures_into_one_warning(harness, caplog):
+    """When fr_store.get raises for many FRs, ``_build_fr_descriptions_map``
+    must emit a SINGLE aggregated warning rather than one per FR. The
+    aggregated line includes a failure count, total FR count, and a
+    bounded sample list. PR #64 review pass-8 finding 1.
+
+    Without aggregation, a 5+-FR work_unit on a degraded store
+    would log five separate warnings + tracebacks, drowning the real
+    outage signal.
+    """
+    import logging
+
+    # Promote 5 FRs so we can build a multi-fr work_unit.
+    fr_ids = []
+    for i in range(5):
+        fr = harness.agent.pipeline.frs.promote(
+            target="benchmark",
+            title=f"bench: aggregate-log fr {i}",
+            description=f"description {i}",
+            priority="high",
+        )
+        fr_ids.append(fr.id)
+
+    work_unit = json.dumps({
+        "name": "aggregate log work unit",
+        "targets": ["benchmark"],
+        "frs": [{"fr_id": fid, "description": "x", "priority": "high"} for fid in fr_ids],
+    })
+
+    # Force fr_store.get to raise for every lookup.
+    real_get = harness.agent.pipeline.frs.get
+
+    def boom(fr_id, *, follow_redirect=True):
+        raise RuntimeError(f"simulated store outage for {fr_id}")
+
+    harness.agent.pipeline.frs.get = boom
+    try:
+        with caplog.at_level(logging.WARNING, logger="developer.agent"):
+            await harness.call("propose_milestone_from_work_unit", {
+                "work_unit": work_unit,
+                "title": "aggregate log test",
+            })
+    finally:
+        harness.agent.pipeline.frs.get = real_get
+
+    # Count warnings emitted by _build_fr_descriptions_map.
+    aggregate_records = [
+        r for r in caplog.records
+        if "_build_fr_descriptions_map" in r.getMessage()
+    ]
+    assert len(aggregate_records) == 1, (
+        f"expected one aggregated warning per call, got {len(aggregate_records)}: "
+        f"{[r.getMessage() for r in aggregate_records]}"
+    )
+    msg = aggregate_records[0].getMessage()
+    # Failure count + total FR count appear in the message
+    assert "5 fr_store.get failure(s)" in msg, msg
+    assert "across 5 work_unit FR(s)" in msg, msg
+    # Sample list bounded — not all 5 fr_ids appear (capped at the
+    # _FR_LOOKUP_FAILURE_LOG_LIMIT samples + a "..." truncation marker).
+    assert "(further failures truncated from log)" in msg, msg
+
+
+@pytest.mark.asyncio
+async def test_propose_milestone_does_not_wipe_sidecar_when_lookup_yields_empty(harness):
+    """Regression guard for PR #64 review pass-6 finding 1: a
+    re-propose where ``_build_fr_descriptions_map`` returns ``{}``
+    (transient store outage, all FRs missing) must NOT wipe a
+    previously-cached ``fr_descriptions`` sidecar on the milestone.
+    The agent passes ``fr_descriptions=None`` in that case so the
+    store's preserve-on-None semantics kicks in.
+
+    Without this guard, every re-propose during a degraded fr_store
+    window would clear the cached prose and regress handoff briefs.
+    """
+    fr = harness.agent.pipeline.frs.promote(
+        target="benchmark",
+        title="bench: sidecar preservation guard",
+        description="Cached design intent that must survive a degraded re-propose.",
+        priority="high",
+    )
+    work_unit_payload = {
+        "name": "sidecar preserve work unit",
+        "targets": ["benchmark"],
+        "frs": [{"fr_id": fr.id, "description": "bench: sidecar preservation guard",
+                 "priority": "high"}],
+    }
+    # First propose — sidecar populated from a working fr_store.
+    first = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": json.dumps(work_unit_payload),
+        "title": "sidecar preserve test",
+    })
+    assert "Cached design intent" in first["milestone"]["draft_spec"]
+    # `fr_descriptions` is intentionally NOT in `to_public_dict()` (its
+    # prose is already inlined in `draft_spec`; PR #64 pass-8 finding
+    # 2). Read it from the milestone object directly via the store.
+    first_milestone = harness.agent.pipeline.milestones.get(first["milestone"]["id"])
+    assert first_milestone is not None
+    cached_descriptions = dict(first_milestone.fr_descriptions)
+    assert cached_descriptions[fr.id] == (
+        "Cached design intent that must survive a degraded re-propose."
+    )
+
+    # Simulate a degraded re-propose: monkey-patch fr_store.get to
+    # return None for every lookup so _build_fr_descriptions_map
+    # produces an empty map. The agent must pass None to the store
+    # so the cached sidecar persists.
+    real_get = harness.agent.pipeline.frs.get
+    harness.agent.pipeline.frs.get = lambda fr_id, *, follow_redirect=True: None
+    try:
+        second = await harness.call("propose_milestone_from_work_unit", {
+            "work_unit": json.dumps(work_unit_payload),
+            "title": "sidecar preserve test",
+        })
+    finally:
+        harness.agent.pipeline.frs.get = real_get
+
+    # Re-propose's idempotent on (target, title, fr_ids) so the
+    # milestone id matches.
+    assert second["milestone"]["id"] == first["milestone"]["id"]
+    # The cached sidecar must have survived the empty-lookup re-propose.
+    second_milestone = harness.agent.pipeline.milestones.get(second["milestone"]["id"])
+    assert second_milestone is not None
+    assert second_milestone.fr_descriptions == cached_descriptions, (
+        f"sidecar was wiped by empty fr_store lookup on re-propose: "
+        f"{second_milestone.fr_descriptions!r}"
+    )
+    assert "Cached design intent" in second["milestone"]["draft_spec"]
+
+
+@pytest.mark.asyncio
+async def test_propose_milestone_preserves_bare_string_in_persisted_work_unit(harness):
+    """The render-only enrichment view must NOT mutate the persisted
+    ``work_unit`` shape. Callers that round-trip the JSON or diff it
+    against the original payload expect bare-string fr items to stay
+    bare strings even after the agent enriches the draft_spec view.
+    PR #64 review pass-4 finding 1.
+    """
+    fr = harness.agent.pipeline.frs.promote(
+        target="benchmark",
+        title="bench: persist-shape guard",
+        description="Persist-shape design intent.",
+        priority="high",
+    )
+    work_unit = json.dumps({
+        "name": "persist-shape work unit",
+        "targets": ["benchmark"],
+        "frs": [fr.id],  # bare-string shape must round-trip unchanged
+    })
+    result = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": work_unit,
+        "title": "persist-shape test",
+    })
+    persisted = result["milestone"]["work_unit"]["frs"]
+    assert persisted == [fr.id], (
+        f"bare-string fr was mutated by enrichment on the persisted "
+        f"work_unit: {persisted!r}"
+    )
+    # Sanity: draft_spec still got the enriched view
+    assert "Persist-shape design intent." in result["milestone"]["draft_spec"]
+
+
+@pytest.mark.asyncio
+async def test_propose_milestone_does_not_crash_on_non_string_fr_id(harness):
+    """A payload like ``{"frs": [{"id": 123}]}`` must not raise an
+    AttributeError in the enrichment pass — downstream validation
+    (``_fr_id_from_item`` coerces with ``str(...)``) is the right place
+    to reject it. The enrichment helper now matches that coercion so
+    it doesn't crash before the real error path runs. PR #64 pass-3
+    finding 2.
+    """
+    work_unit = {
+        "name": "non-string id payload",
+        "targets": ["benchmark"],
+        "frs": [{"id": 12345, "description": "weird shape", "priority": "low"}],
+    }
+    # Should hit downstream validation (id coerces to "12345" string,
+    # which doesn't match any real FR — milestone_store accepts the
+    # coerced id and the milestone proposes with a bogus id, but the
+    # enrichment helper itself MUST NOT crash with AttributeError.
+    # The user-facing failure mode is downstream's problem; we just
+    # verify the enrichment doesn't blow up first.
+    result = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": json.dumps(work_unit),
+        "title": "non-string id test",
+    })
+    # Either the call succeeds with the coerced string id, or it
+    # surfaces a downstream error — either is acceptable; the
+    # forbidden behavior is an AttributeError from .strip() on int.
+    assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_propose_milestone_rejects_non_list_frs_at_downstream(harness):
+    """A payload with ``"frs": "fr_developer_123"`` (a string instead
+    of a list) used to be rejected by ``propose_from_work_unit``'s
+    ``isinstance(frs, list)`` check. The enrichment helper must not
+    silently rewrite it into a list of characters — that would
+    bypass downstream validation and produce a bogus milestone with
+    each character treated as an FR id. PR #64 pass-3 finding 3.
+    """
+    work_unit = {
+        "name": "malformed frs payload",
+        "targets": ["benchmark"],
+        "frs": "fr_developer_should_be_in_a_list",  # string, not list
+    }
+    result = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": json.dumps(work_unit),
+        "title": "non-list frs test",
+    })
+    # Downstream validation should fire — either as an explicit error
+    # field or as a non-success status. The forbidden behavior is a
+    # successfully-stored milestone whose fr_ids list is the per-char
+    # explosion of the malformed string.
+    if "milestone" in result:
+        fr_ids = result["milestone"].get("fr_ids") or []
+        assert "f" not in fr_ids, (
+            f"non-list frs string was iterated character-by-character: {fr_ids!r}"
+        )
+    else:
+        assert "error" in result or result.get("status") not in (None, "ok"), (
+            f"expected downstream validation error for non-list frs, got: {result!r}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_update_milestone_frs_rejects_wrong_arg_names(harness):
     """`add` / `remove` / `add_frs` / `remove_frs` are the obvious-but-wrong
     shapes a caller reaches for; without rejection they get dropped silently
@@ -1346,6 +1747,86 @@ async def test_prepare_development_handoff_flags_review_terms(harness):
     assert result["suggested_next_actions"][-1] == (
         "refine or split the milestone before implementation"
     )
+
+
+@pytest.mark.asyncio
+async def test_prepare_development_handoff_forwards_project_arg(harness):
+    """``prepare_development_handoff`` must forward the caller's
+    ``project`` arg to ``propose_from_work_unit`` so non-default-project
+    handoffs land the milestone under the right project slug. Without
+    forwarding, the milestone falls back to ``DEFAULT_PROJECT`` (or
+    the previously-stored project on a re-handoff), breaking project
+    partitioning. PR #64 review pass-9 suppressed-low-confidence
+    finding.
+    """
+    work_unit = json.dumps({
+        "name": "Cluster X (1 FR, targets: developer)",
+        "targets": ["developer"],
+        "frs": [{"fr_id": "fr_developer_77777777", "description": "x", "priority": "high"}],
+    })
+    result = await harness.call("prepare_development_handoff", {
+        "work_unit": work_unit,
+        "project": "benchmark-platform",
+    })
+    assert result.get("status") in ("ready", "needs_review")
+    assert result["milestone"]["project"] == "benchmark-platform", (
+        f"prepare_development_handoff didn't forward project; got "
+        f"{result['milestone']['project']!r} for project='benchmark-platform'"
+    )
+
+
+@pytest.mark.asyncio
+async def test_prepare_development_handoff_inlines_full_fr_description_in_draft_spec(harness):
+    """`prepare_development_handoff` shares the same enrichment hook as
+    ``propose_milestone_from_work_unit`` (PR #64): the work_unit's FR
+    bullets must carry the FR's full design-intent description, not
+    just the title. Without a parallel test on this path, a regression
+    in the handoff flow (e.g. someone removes the enrichment call from
+    ``handle_prepare_development_handoff`` while keeping the propose
+    path's call) would slip through. Regression guard for
+    ``fr_developer_3763aaf3`` on the handoff entry point.
+    """
+    rich_description = (
+        "Multi-paragraph design intent for the handoff path.\n"
+        "\n"
+        "First paragraph: the receiving session needs the FR's actual\n"
+        "intent prose, not just the bullet's title.\n"
+        "\n"
+        "Second paragraph: bench draft_spec must carry this content too.\n"
+    )
+    fr = harness.agent.pipeline.frs.promote(
+        target="benchmark",
+        title="bench: handoff enrichment guard",
+        description=rich_description,
+        priority="high",
+        concept="benchmark-agent",
+    )
+
+    work_unit = json.dumps({
+        "name": "MS-bench-handoff slice",
+        "targets": ["benchmark"],
+        "frs": [{"fr_id": fr.id, "description": "bench: handoff enrichment guard",
+                 "priority": "high"}],
+    })
+    result = await harness.call("prepare_development_handoff", {
+        "work_unit": work_unit,
+        "title": "MS-bench-handoff test",
+        "summary": "verify draft_spec carries full FR descriptions on handoff path",
+    })
+
+    draft = result["draft_spec"]
+    # Bullet line still present
+    assert f"`{fr.id}`" in draft
+    # Each non-blank line of the rich description appears as an indented sub-block
+    for substring in [
+        "Multi-paragraph design intent for the handoff path.",
+        "First paragraph: the receiving session needs the FR's actual",
+        "intent prose, not just the bullet's title.",
+        "Second paragraph: bench draft_spec must carry this content too.",
+    ]:
+        assert f"  {substring}" in draft or f"  {substring.rstrip()}" in draft, (
+            f"draft_spec missing inlined description line {substring!r}\n---draft---\n{draft}"
+        )
 
 
 @pytest.mark.asyncio

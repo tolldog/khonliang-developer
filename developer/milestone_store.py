@@ -134,6 +134,14 @@ class Milestone:
     summary: str
     fr_ids: list[str] = field(default_factory=list)
     work_unit: dict[str, Any] = field(default_factory=dict)
+    # Sidecar mapping ``fr_id -> full description`` populated by the
+    # agent at propose / handoff time (lookup against fr_store). Lives
+    # alongside ``work_unit`` rather than inside it so the persisted
+    # work_unit shape stays exactly what the caller supplied (bare
+    # strings stay bare; dict items don't gain spurious keys), while
+    # ``_refresh_draft_spec`` can still re-render full FR descriptions
+    # after every mutation. PR #64 review pass-5 finding 1.
+    fr_descriptions: dict[str, str] = field(default_factory=dict)
     source: str = "work_unit"
     rank: int = 0
     draft_spec: str = ""
@@ -147,6 +155,13 @@ class Milestone:
     project: str = DEFAULT_PROJECT
 
     def to_public_dict(self) -> dict[str, Any]:
+        # ``fr_descriptions`` is intentionally excluded — its prose is
+        # already inlined into ``draft_spec``, so re-emitting it on the
+        # public payload doubles the byte cost of every get_milestone /
+        # list_milestones / handoff response and bloats bus + LLM
+        # context for callers who never re-render. The sidecar is
+        # internal state for ``_refresh_draft_spec``; the public-facing
+        # output is ``draft_spec``. PR #64 review pass-8 finding 2.
         return {
             "id": self.id,
             "title": self.title,
@@ -267,6 +282,7 @@ class MilestoneStore:
         summary: str = "",
         source: str = "work_unit",
         project: Optional[str] = None,
+        fr_descriptions: Optional[dict[str, str]] = None,
     ) -> Milestone:
         """Create or update a proposed milestone from a ranked work unit.
 
@@ -281,6 +297,29 @@ class MilestoneStore:
           overrides any previously-stored project — that's how callers
           deliberately move a milestone back to the default project,
           which a plain-string default couldn't express.
+
+        ``fr_descriptions`` is an optional ``fr_id -> description``
+        mapping persisted alongside ``work_unit`` and consumed by
+        :func:`_draft_spec` (and :meth:`_refresh_draft_spec`) when
+        rendering each FR bullet. Lives outside ``work_unit`` so the
+        persisted ``work_unit`` shape (returned in the milestone
+        payload and round-tripped by callers) stays exactly what the
+        caller supplied — bare-string fr items stay bare strings, dict
+        items don't gain spurious keys. Because this sidecar is
+        persisted, every later mutation that calls
+        :meth:`_refresh_draft_spec` re-renders with the cached
+        descriptions intact instead of regressing to thin briefs.
+
+        Re-propose semantics (PR #64 pass-7 finding):
+        - ``None`` → preserve the existing milestone's sidecar wholesale
+          (callers that don't know about the sidecar — pre-PR-#64 code —
+          won't wipe it).
+        - ``{}`` → explicit clear (caller-driven wipe).
+        - partial dict → overlay onto the existing sidecar: incoming
+          ``fr_id`` entries replace, FRs not present in the incoming
+          map keep their previously-cached prose. Prevents a degraded
+          ``fr_store`` (some FRs not resolvable) from stripping prose
+          for the FRs that did resolve last time.
         """
         if not isinstance(work_unit, dict) or not work_unit:
             raise MilestoneError("work_unit is required")
@@ -325,6 +364,17 @@ class MilestoneStore:
             superseded_by = existing.superseded_by
             if preserve_existing_project:
                 project = existing.project or DEFAULT_PROJECT
+            # Re-propose sidecar policy: ``None`` preserves wholesale,
+            # ``{}`` clears, partial dict overlays onto existing so a
+            # degraded ``fr_store`` lookup (only some FRs resolvable)
+            # doesn't strip prose for the FRs that did resolve last
+            # time. PR #64 pass-7 finding.
+            if fr_descriptions is None:
+                fr_descriptions = dict(existing.fr_descriptions)
+            elif fr_descriptions:
+                merged = dict(existing.fr_descriptions)
+                merged.update(fr_descriptions)
+                fr_descriptions = merged
         else:
             notes_history = [{
                 "at": now,
@@ -334,6 +384,15 @@ class MilestoneStore:
             superseded_by = ""
             if preserve_existing_project:
                 project = DEFAULT_PROJECT
+        # Filter the final sidecar to the milestone's current ``fr_ids``
+        # so orphan entries from FRs no longer in the bundle don't
+        # accumulate across mutations / re-proposes. PR #64 pass-8
+        # finding 3.
+        if fr_descriptions:
+            fr_id_set = set(fr_ids)
+            fr_descriptions = {
+                fid: desc for fid, desc in fr_descriptions.items() if fid in fr_id_set
+            }
         milestone = Milestone(
             id=milestone_id,
             title=milestone_title,
@@ -350,7 +409,9 @@ class MilestoneStore:
                 milestone_summary,
                 work_unit,
                 status=status,
+                fr_descriptions=dict(fr_descriptions or {}),
             ),
+            fr_descriptions=dict(fr_descriptions or {}),
             notes_history=notes_history,
             superseded_by=superseded_by,
             project=project,
@@ -646,6 +707,18 @@ class MilestoneStore:
         # the id alone so downstream helpers don't crash on missing
         # keys. PR #43 Copilot R6 finding 2.
         _sync_work_unit_frs(milestone.work_unit, new_ids)
+        # Drop fr_descriptions entries for FRs that were removed from
+        # the bundle; same orphan-filter as ``propose_from_work_unit``.
+        # Without this, removed-FR prose lingers in the persisted
+        # sidecar across status transitions and re-renders. PR #64
+        # review pass-8 finding 3 (mutation path).
+        if milestone.fr_descriptions:
+            new_id_set = set(new_ids)
+            milestone.fr_descriptions = {
+                fid: desc
+                for fid, desc in milestone.fr_descriptions.items()
+                if fid in new_id_set
+            }
         audit = {
             "at": now,
             "status": milestone.status,
@@ -821,6 +894,7 @@ class MilestoneStore:
             milestone.summary,
             milestone.work_unit,
             status=milestone.status,
+            fr_descriptions=milestone.fr_descriptions,
         )
 
     def _store(self, milestone: Milestone) -> None:
@@ -840,6 +914,7 @@ class MilestoneStore:
                 "project": milestone.project or DEFAULT_PROJECT,
                 "fr_ids": list(milestone.fr_ids),
                 "work_unit": dict(milestone.work_unit),
+                "fr_descriptions": dict(milestone.fr_descriptions),
                 "source": milestone.source,
                 "rank": milestone.rank,
                 "draft_spec": milestone.draft_spec,
@@ -907,6 +982,9 @@ def _milestone_from_entry(entry: KnowledgeEntry) -> Milestone:
         summary=entry.content,
         fr_ids=list(meta.get("fr_ids") or []),
         work_unit=dict(meta.get("work_unit") or {}),
+        # ``fr_descriptions`` was added in PR #64 pass-5; default to {}
+        # on read so older records load without a migration pass.
+        fr_descriptions=dict(meta.get("fr_descriptions") or {}),
         source=meta.get("source", "work_unit"),
         rank=int(meta.get("rank") or 0),
         draft_spec=meta.get("draft_spec", ""),
@@ -979,7 +1057,25 @@ def _draft_spec(
     work_unit: dict[str, Any],
     *,
     status: str = MILESTONE_STATUS_PROPOSED,
+    fr_descriptions: Optional[dict[str, str]] = None,
 ) -> str:
+    """Render the milestone's draft_spec markdown.
+
+    ``fr_descriptions`` is an optional ``fr_id -> description`` map
+    consumed for the inlined sub-block under each FR bullet. The
+    fallback hierarchy per FR is:
+
+    1. ``fr_descriptions[fr_id]`` if present (sidecar map persisted
+       on the milestone — survives mutations / re-renders).
+    2. ``fr["full_description"]`` if the work_unit dict carries one
+       directly (store-tier callers that pre-populate the field
+       without going through the agent).
+
+    Either form is optional; an FR without a description renders as
+    a bare bullet line. PR #64 review pass-5 finding 1 introduced
+    the sidecar map so ``_refresh_draft_spec`` can re-render with
+    descriptions intact after every mutation.
+    """
     lines = [
         f"# {title}",
         "",
@@ -993,12 +1089,36 @@ def _draft_spec(
         "## Feature Requests",
         "",
     ]
+    descriptions = fr_descriptions or {}
     for fr in work_unit.get("frs") or []:
         if isinstance(fr, dict):
             fr_id = _fr_id_from_item(fr)
             lines.append(f"- `{fr_id}` {_fr_description_with_priority(fr)}".rstrip())
+            sidecar_description = str(descriptions.get(fr_id) or "").strip()
+            inline_description = str(fr.get("full_description") or "").strip()
+            full_description = sidecar_description or inline_description
         else:
-            lines.append(f"- `{str(fr).strip()}`")
+            fr_id = str(fr).strip()
+            lines.append(f"- `{fr_id}`")
+            full_description = str(descriptions.get(fr_id) or "").strip()
+        if full_description:
+            # Inline the FR's full description as a continuation
+            # paragraph under the bullet so a handoff brief carries
+            # the actual design intent (broker stub-then-swap,
+            # three-mode invocation, five-layer overhead model, etc.)
+            # — not just the title + priority. Two-space indent (not
+            # four) so GitHub-flavored markdown renders this as
+            # paragraph prose continuing the bullet rather than as a
+            # preformatted code block — four-space-indented content
+            # under a list item is the GFM code-block trigger. PR #64
+            # review pass-9 finding.
+            lines.append("")
+            for desc_line in full_description.splitlines():
+                if desc_line.strip():
+                    lines.append(f"  {desc_line.rstrip()}")
+                else:
+                    lines.append("")
+            lines.append("")
     lines.extend([
         "",
         "## Acceptance Criteria",

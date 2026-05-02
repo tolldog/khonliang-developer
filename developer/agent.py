@@ -2090,6 +2090,25 @@ class DeveloperAgent(BaseAgent):
                     return next_result
                 work_unit = next_result.get("work_unit") or {}
                 source = next_result.get("source", "work_unit")
+            # Build the ``fr_id -> full description`` sidecar map so
+            # draft_spec carries each FR's design-intent prose, and so
+            # later mutations (update_status / supersede / update_frs
+            # → _refresh_draft_spec) re-render with the same prose
+            # intact. The persisted ``work_unit`` shape stays exactly
+            # what the caller passed; descriptions live in their own
+            # bucket on the milestone. PR #64 review pass-4 finding 1
+            # + pass-5 finding 1.
+            fr_descriptions = _build_fr_descriptions_map(
+                work_unit, self.pipeline.frs
+            )
+            # Empty lookup (all FRs unresolvable / store outage) →
+            # ``None`` so the store preserves the cached sidecar
+            # wholesale. Non-empty lookup → pass through; the store
+            # now overlays a partial map onto the existing sidecar
+            # rather than replacing wholesale, so a partially-degraded
+            # lookup keeps prose for the FRs that previously resolved.
+            # PR #64 pass-6 + pass-7 findings.
+            fr_descriptions_arg = fr_descriptions if fr_descriptions else None
             # Phase 3 pass-through: empty `project` maps to None =
             # preserve-existing-or-default (store's documented
             # re-propose semantics); an explicit slug — including
@@ -2098,6 +2117,7 @@ class DeveloperAgent(BaseAgent):
             project = project_raw or None
             milestone = self.pipeline.milestones.propose_from_work_unit(
                 work_unit,
+                fr_descriptions=fr_descriptions_arg,
                 target=args.get("target", ""),
                 title=args.get("title", ""),
                 summary=args.get("summary", ""),
@@ -2321,12 +2341,35 @@ class DeveloperAgent(BaseAgent):
                 source = next_result.get("source", "work_unit")
                 remaining = next_result.get("remaining")
 
+            # Same sidecar build + preserve-on-empty contract as
+            # propose_milestone_from_work_unit; see that handler for
+            # the persistence-vs-render rationale and the pass-6
+            # ``None``-when-empty preservation guard. PR #64 review
+            # pass-4 finding 1 + pass-5 finding 1 + pass-6 finding 1.
+            fr_descriptions = _build_fr_descriptions_map(
+                work_unit, self.pipeline.frs
+            )
+            fr_descriptions_arg = fr_descriptions if fr_descriptions else None
+
+            # Forward the caller's ``project`` arg through to
+            # ``propose_from_work_unit`` so a handoff for a non-default
+            # project lands the milestone under that project rather
+            # than the previously-stored or DEFAULT_PROJECT slug.
+            # Same pass-through semantics as
+            # ``handle_propose_milestone_from_work_unit``: empty / None
+            # → preserve existing or default; explicit slug overrides.
+            # PR #64 review pass-9 suppressed-low-confidence finding.
+            handoff_project_raw = str(args.get("project") or "").strip()
+            handoff_project = handoff_project_raw or None
+
             milestone = self.pipeline.milestones.propose_from_work_unit(
                 work_unit,
+                fr_descriptions=fr_descriptions_arg,
                 target=args.get("target", ""),
                 title=args.get("title", ""),
                 summary=args.get("summary", ""),
                 source=source,
+                project=handoff_project,
             )
             review_terms = _parse_paths(args.get("review_terms", "AutoGen,GRA"))
             review = self.pipeline.milestones.review_scope(
@@ -4399,6 +4442,108 @@ def _parse_work_unit_arg(value) -> dict:
     if "error" in parsed:
         raise ValueError(parsed["error"])
     return parsed
+
+
+# Cap on how many ``(fr_id, exception)`` samples the aggregated
+# fr_store-failure warning includes per call. Keeps the log line
+# bounded on a fully-down store + large work_unit; the failure count
+# itself stays accurate. PR #64 review pass-8 finding 1.
+_FR_LOOKUP_FAILURE_LOG_LIMIT = 3
+
+
+def _build_fr_descriptions_map(work_unit: dict, fr_store) -> dict[str, str]:
+    """Return ``fr_id -> full description`` map for ``work_unit``'s FRs.
+
+    The map is persisted on the milestone (``Milestone.fr_descriptions``)
+    and consumed by ``_draft_spec`` when rendering each FR bullet's
+    inline sub-block. Persisted alongside ``work_unit`` rather than
+    inside it so:
+
+    - the persisted ``work_unit`` shape stays exactly what the caller
+      passed (bare strings stay bare; dict items don't gain spurious
+      keys; round-trip / diff against the original is clean);
+    - every later mutation that calls ``_refresh_draft_spec`` re-renders
+      with descriptions intact instead of regressing to thin briefs.
+
+    Tolerates every ``work_unit["frs"]`` shape ``propose_from_work_unit``
+    itself accepts:
+
+    - bare-string fr ids (``"frs": ["fr_developer_..."]``);
+    - dict items with ``fr_id`` or ``id``;
+    - non-string ids inside dicts (``{"id": 123}``) — coerced via
+      ``str(...)`` to match ``_fr_id_from_item``'s behavior so the
+      helper doesn't crash before downstream validation runs.
+
+    A non-list ``frs`` (or non-dict ``work_unit``) returns an empty
+    map; downstream ``propose_from_work_unit`` validation surfaces the
+    shape error.
+
+    Lookup uses ``follow_redirect=False`` so a merged FR's bullet
+    (which still shows the original fr_id) doesn't pull the resolved
+    FR's description from a redirect chain. Failures from the store
+    are collected and emitted as a single aggregated warning at the
+    end of the call instead of one warning + traceback per FR — a
+    systemic store outage on a 5+-FR work_unit was flooding logs and
+    drowning the real signal. The aggregated warning includes the
+    failure count, total work_unit FR count, and the first few
+    ``(fr_id, exception)`` samples for triage. PR #64 review pass-8
+    finding 1.
+    """
+    if not isinstance(work_unit, dict):
+        return {}
+    frs = work_unit.get("frs")
+    if not isinstance(frs, list) or not frs:
+        return {}
+
+    descriptions: dict[str, str] = {}
+    failure_samples: list[tuple[str, str]] = []  # bounded samples for log
+    failure_count = 0  # accurate total, independent of sample cap
+    for fr in frs:
+        if isinstance(fr, dict):
+            fr_id = str(fr.get("fr_id") or fr.get("id") or "").strip()
+        elif isinstance(fr, str):
+            fr_id = fr.strip()
+        else:
+            continue
+        if not fr_id or fr_id in descriptions:
+            continue
+        try:
+            # follow_redirect=False so the description we inline
+            # corresponds to the fr_id rendered in the bullet, not
+            # whatever FR a merge-redirect chain points at.
+            stored = fr_store.get(fr_id, follow_redirect=False)
+        except Exception as exc:  # noqa: BLE001 — read-only lookup, never fail propose
+            # Collect, don't log per-FR; the aggregated warning below
+            # fires once at the end of the call. Cap the sample list
+            # at ``_FR_LOOKUP_FAILURE_LOG_LIMIT`` so a 100-FR
+            # work_unit on a fully-down store doesn't bloat the log
+            # line either; the failure count stays accurate via the
+            # separate counter.
+            failure_count += 1
+            if len(failure_samples) < _FR_LOOKUP_FAILURE_LOG_LIMIT:
+                failure_samples.append((fr_id, f"{type(exc).__name__}: {exc}"))
+            continue
+        if stored is None:
+            continue
+        description = str(getattr(stored, "description", "") or "").strip()
+        if description:
+            descriptions[fr_id] = description
+    if failure_count:
+        # One warning per work_unit instead of N. Operators see the
+        # outage signal without per-FR traceback noise; the bounded
+        # sample list is enough to identify the failure mode.
+        sample_pairs = list(failure_samples)
+        if failure_count > len(failure_samples):
+            sample_pairs.append(("...", "(further failures truncated from log)"))
+        logger.warning(
+            "_build_fr_descriptions_map: %d fr_store.get failure(s) across "
+            "%d work_unit FR(s); rendering bullets without inlined "
+            "description for failed lookups. Samples: %s",
+            failure_count,
+            len(frs),
+            "; ".join(f"{fid}={msg}" for fid, msg in sample_pairs),
+        )
+    return descriptions
 
 
 def _compact_jsonish(value, *, limit: int = 1200) -> str:
