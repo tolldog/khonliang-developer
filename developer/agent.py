@@ -2090,13 +2090,15 @@ class DeveloperAgent(BaseAgent):
                     return next_result
                 work_unit = next_result.get("work_unit") or {}
                 source = next_result.get("source", "work_unit")
-            # Build a render-only enriched view of work_unit so
-            # draft_spec carries each FR's full design-intent prose.
-            # The original `work_unit` is what gets persisted on the
-            # milestone (and round-tripped by callers); the enriched
-            # copy only flows into `_draft_spec`. PR #64 review pass-4
-            # finding 1.
-            enriched_for_render = _enrich_work_unit_with_fr_descriptions(
+            # Build the ``fr_id -> full description`` sidecar map so
+            # draft_spec carries each FR's design-intent prose, and so
+            # later mutations (update_status / supersede / update_frs
+            # → _refresh_draft_spec) re-render with the same prose
+            # intact. The persisted ``work_unit`` shape stays exactly
+            # what the caller passed; descriptions live in their own
+            # bucket on the milestone. PR #64 review pass-4 finding 1
+            # + pass-5 finding 1.
+            fr_descriptions = _build_fr_descriptions_map(
                 work_unit, self.pipeline.frs
             )
             # Phase 3 pass-through: empty `project` maps to None =
@@ -2107,7 +2109,7 @@ class DeveloperAgent(BaseAgent):
             project = project_raw or None
             milestone = self.pipeline.milestones.propose_from_work_unit(
                 work_unit,
-                draft_spec_work_unit=enriched_for_render,
+                fr_descriptions=fr_descriptions,
                 target=args.get("target", ""),
                 title=args.get("title", ""),
                 summary=args.get("summary", ""),
@@ -2331,17 +2333,16 @@ class DeveloperAgent(BaseAgent):
                 source = next_result.get("source", "work_unit")
                 remaining = next_result.get("remaining")
 
-            # Render-only enrichment: see propose_milestone_from_work_unit
-            # for rationale. The persisted `work_unit` stays untouched;
-            # only `_draft_spec` sees the enriched shape. PR #64 review
-            # pass-4 finding 1.
-            enriched_for_render = _enrich_work_unit_with_fr_descriptions(
+            # Same sidecar build as propose_milestone_from_work_unit;
+            # see that handler for the persistence-vs-render rationale.
+            # PR #64 review pass-4 finding 1 + pass-5 finding 1.
+            fr_descriptions = _build_fr_descriptions_map(
                 work_unit, self.pipeline.frs
             )
 
             milestone = self.pipeline.milestones.propose_from_work_unit(
                 work_unit,
-                draft_spec_work_unit=enriched_for_render,
+                fr_descriptions=fr_descriptions,
                 target=args.get("target", ""),
                 title=args.get("title", ""),
                 summary=args.get("summary", ""),
@@ -4420,108 +4421,78 @@ def _parse_work_unit_arg(value) -> dict:
     return parsed
 
 
-def _enrich_work_unit_with_fr_descriptions(work_unit: dict, fr_store) -> dict:
-    """Look up each FR's full description from ``fr_store`` and inject it
-    into the work_unit's ``frs`` entries as ``full_description``.
+def _build_fr_descriptions_map(work_unit: dict, fr_store) -> dict[str, str]:
+    """Return ``fr_id -> full description`` map for ``work_unit``'s FRs.
 
-    Without this, milestone draft_spec markdown only carries each FR's
-    title + priority — too thin to brief a handoff session against.
-    With this, draft_spec gets the FR's actual design-intent prose
-    (broker stub patterns, multi-axis routing notes, etc.) inlined as
-    an indented sub-block per FR (see ``_draft_spec`` in
-    milestone_store.py).
+    The map is persisted on the milestone (``Milestone.fr_descriptions``)
+    and consumed by ``_draft_spec`` when rendering each FR bullet's
+    inline sub-block. Persisted alongside ``work_unit`` rather than
+    inside it so:
 
-    Lookup uses ``follow_redirect=False`` so a merged FR's bullet (which
-    still shows the original fr_id + title) doesn't get the resolved
-    FR's description silently substituted underneath — that would
-    produce an inconsistent handoff brief where the bullet identifies
-    one FR and the body describes a different one. PR #64 review
-    finding 1.
+    - the persisted ``work_unit`` shape stays exactly what the caller
+      passed (bare strings stay bare; dict items don't gain spurious
+      keys; round-trip / diff against the original is clean);
+    - every later mutation that calls ``_refresh_draft_spec`` re-renders
+      with descriptions intact instead of regressing to thin briefs.
 
-    On lookup miss or transient error, any pre-existing
-    ``full_description`` already on the fr dict is preserved (re-propose
-    paths, cached enrichment from a prior call). Only overwrite when
-    the lookup actually returns a non-empty description. PR #64
-    review finding 2.
+    Tolerates every ``work_unit["frs"]`` shape ``propose_from_work_unit``
+    itself accepts:
 
-    Bare-string fr items (``"frs": ["fr_developer_..."]``) are also a
-    valid input shape per ``propose_from_work_unit``; they're coerced
-    into ``{"fr_id": s, "full_description": ...}`` dicts here so the
-    same enrichment treatment applies (``_draft_spec`` tolerates either
-    shape — see ``milestone_store._fr_id_from_item``). PR #64 review
-    pass-3 finding 1.
+    - bare-string fr ids (``"frs": ["fr_developer_..."]``);
+    - dict items with ``fr_id`` or ``id``;
+    - non-string ids inside dicts (``{"id": 123}``) — coerced via
+      ``str(...)`` to match ``_fr_id_from_item``'s behavior so the
+      helper doesn't crash before downstream validation runs.
 
-    A non-list ``frs`` (e.g. a bare string or a dict accidentally
-    wrapped at this level) is left untouched so the downstream
-    ``isinstance(frs, list)`` validation in
-    ``propose_from_work_unit`` still rejects it cleanly. Without this
-    guard we'd transform a malformed payload into a list of characters /
-    keys and silently produce a bogus milestone. PR #64 review pass-3
-    finding 3.
+    A non-list ``frs`` (or non-dict ``work_unit``) returns an empty
+    map; downstream ``propose_from_work_unit`` validation surfaces the
+    shape error.
 
-    Existing fields on each fr dict are preserved.
+    Lookup uses ``follow_redirect=False`` so a merged FR's bullet
+    (which still shows the original fr_id) doesn't pull the resolved
+    FR's description from a redirect chain. Failures from the store
+    log a warning with ``exc_info=True`` and degrade to no-description
+    for that bullet — never fails the propose/handoff flow.
     """
     if not isinstance(work_unit, dict):
-        return work_unit
+        return {}
     frs = work_unit.get("frs")
     if not isinstance(frs, list) or not frs:
-        return work_unit
+        return {}
 
-    def _lookup(fr_id: str) -> str:
-        if not fr_id:
-            return ""
+    descriptions: dict[str, str] = {}
+    for fr in frs:
+        if isinstance(fr, dict):
+            fr_id = str(fr.get("fr_id") or fr.get("id") or "").strip()
+        elif isinstance(fr, str):
+            fr_id = fr.strip()
+        else:
+            continue
+        if not fr_id or fr_id in descriptions:
+            continue
         try:
             # follow_redirect=False so the description we inline
-            # corresponds to the fr_id rendered in the bullet,
-            # not whatever FR a merge-redirect chain points at.
+            # corresponds to the fr_id rendered in the bullet, not
+            # whatever FR a merge-redirect chain points at.
             stored = fr_store.get(fr_id, follow_redirect=False)
-        except Exception as exc:  # noqa: BLE001 — read-only enrichment, never fail propose
+        except Exception as exc:  # noqa: BLE001 — read-only lookup, never fail propose
             # Don't fail the propose/handoff flow on a transient store
             # error, but surface a warning so a systemic store failure
             # (DB issue, redirect-cycle bug, etc.) doesn't silently
-            # produce thin briefs forever — without this log, the
-            # regression is invisible in production. PR #64 review
-            # pass-4 finding 2.
+            # produce thin briefs forever.
             logger.warning(
-                "_enrich_work_unit_with_fr_descriptions: fr_store.get(%s) "
+                "_build_fr_descriptions_map: fr_store.get(%s) "
                 "failed (%s: %s); rendering bullet without inlined description",
                 fr_id, type(exc).__name__, exc,
                 exc_info=True,
             )
-            stored = None
+            continue
         if stored is None:
-            return ""
-        return str(getattr(stored, "description", "") or "").strip()
-
-    enriched = []
-    for fr in frs:
-        if isinstance(fr, dict):
-            # ``str(... or "").strip()`` matches ``_fr_id_from_item``'s
-            # coercion so a non-string id (``{"id": 123}``) doesn't
-            # crash here before downstream validation runs. PR #64
-            # review pass-3 finding 2.
-            fr_id = str(fr.get("fr_id") or fr.get("id") or "").strip()
-            looked_up_description = _lookup(fr_id)
-            existing_description = str(fr.get("full_description") or "").strip()
-            # Preserve cached value when lookup misses or errors; only
-            # overwrite when the live lookup produced non-empty content.
-            final_description = looked_up_description or existing_description
-            enriched.append({**fr, "full_description": final_description})
-        elif isinstance(fr, str):
-            # Bare-string FR id: enrich into a minimal dict so the
-            # draft_spec renderer can inline the description. Keep the
-            # original string id under ``fr_id`` so ``_fr_id_from_item``
-            # picks it up identically.
-            fr_id = fr.strip()
-            enriched.append({
-                "fr_id": fr_id,
-                "full_description": _lookup(fr_id),
-            })
-        else:
-            # Unknown item type — pass through untouched and let
-            # downstream validation surface the shape error.
-            enriched.append(fr)
-    return {**work_unit, "frs": enriched}
+            continue
+        description = str(getattr(stored, "description", "") or "").strip()
+        if description:
+            descriptions[fr_id] = description
+    return descriptions
 
 
 def _compact_jsonish(value, *, limit: int = 1200) -> str:

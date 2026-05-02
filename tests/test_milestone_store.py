@@ -168,13 +168,12 @@ def test_draft_spec_appends_priority_when_description_omits_it(pipeline):
 
 def test_propose_from_work_unit_inlines_full_description_in_draft_spec(pipeline):
     """Store-level coverage for the ``full_description`` rendering path
-    in ``_draft_spec``. Agent-level enrichment (via
-    ``_enrich_work_unit_with_fr_descriptions``) is what populates this
-    field in production, but the store accepts pre-populated
-    ``full_description`` directly so any future caller (a different
-    agent, a migration script, a test harness) gets the same render
-    treatment without going through the agent. PR #64 review pass-4
-    finding 3.
+    in ``_draft_spec``. The agent populates this via the
+    ``fr_descriptions`` sidecar in production, but ``_draft_spec``
+    also honors a ``full_description`` field on the work_unit fr dict
+    directly — store-tier callers (alternate agents, migrations,
+    test harnesses) get the same render treatment without routing
+    through the agent. PR #64 review pass-4 finding 3.
     """
     work_unit = _work_unit()
     work_unit["frs"][0]["full_description"] = (
@@ -201,6 +200,35 @@ def test_propose_from_work_unit_inlines_full_description_in_draft_spec(pipeline)
     assert "fr_developer_22222222" in draft
 
 
+def test_propose_from_work_unit_persists_fr_descriptions_sidecar(pipeline):
+    """The ``fr_descriptions`` sidecar map populates ``_draft_spec``'s
+    inlined sub-blocks AND survives on the milestone so later
+    mutations (``_refresh_draft_spec`` consumers) re-render with the
+    same prose. This test exercises the contract from the store's
+    perspective; the persistence-and-mutation guarantee gets its own
+    test below. PR #64 review pass-5 finding 1.
+    """
+    work_unit = _work_unit()
+    fr_descriptions = {
+        "fr_developer_11111111": "AAAA cached description",
+        "fr_developer_22222222": "BBBB cached description",
+    }
+
+    milestone = pipeline.milestones.propose_from_work_unit(
+        work_unit, fr_descriptions=fr_descriptions
+    )
+
+    # Sidecar appears in draft_spec
+    assert "AAAA cached description" in milestone.draft_spec
+    assert "BBBB cached description" in milestone.draft_spec
+    # …and is persisted on the milestone for later re-renders
+    assert milestone.fr_descriptions == fr_descriptions
+    # …and survives a get() round-trip via the store
+    loaded = pipeline.milestones.get(milestone.id)
+    assert loaded is not None
+    assert loaded.fr_descriptions == fr_descriptions
+
+
 def test_propose_from_work_unit_preserves_persisted_work_unit_shape(pipeline):
     """The persisted ``work_unit`` (returned via the milestone payload
     and round-tripped by callers) must match the original argument
@@ -208,10 +236,8 @@ def test_propose_from_work_unit_preserves_persisted_work_unit_shape(pipeline):
     their original keys without spurious additions. PR #64 review
     pass-4 finding 1.
 
-    The ``draft_spec_work_unit`` knob exists precisely so the agent
-    can pass an enriched render-only view without mutating the
-    persisted shape; this test exercises that contract from the
-    store's perspective.
+    Even with a non-empty ``fr_descriptions`` sidecar driving the
+    render, the persisted ``work_unit`` stays identical to the input.
     """
     original = {
         "name": "preserve work_unit shape",
@@ -225,26 +251,16 @@ def test_propose_from_work_unit_preserves_persisted_work_unit_shape(pipeline):
             },
         ],
     }
-    # Simulate an enriched render view (what the agent would build):
-    # bare string coerced into a dict, dict gets full_description.
-    rendered = {
-        **original,
-        "frs": [
-            {"fr_id": "fr_developer_aaaaaaaa", "full_description": "AAAA description"},
-            {
-                "fr_id": "fr_developer_bbbbbbbb",
-                "description": "second fr",
-                "priority": "high",
-                "full_description": "BBBB description",
-            },
-        ],
+    fr_descriptions = {
+        "fr_developer_aaaaaaaa": "AAAA description",
+        "fr_developer_bbbbbbbb": "BBBB description",
     }
 
     milestone = pipeline.milestones.propose_from_work_unit(
-        original, draft_spec_work_unit=rendered
+        original, fr_descriptions=fr_descriptions
     )
 
-    # draft_spec uses the enriched view (full_descriptions appear)
+    # draft_spec uses the sidecar (full_descriptions appear)
     assert "AAAA description" in milestone.draft_spec
     assert "BBBB description" in milestone.draft_spec
     # …but the persisted work_unit matches the *original* argument
@@ -259,21 +275,76 @@ def test_propose_from_work_unit_preserves_persisted_work_unit_shape(pipeline):
     }, f"dict-shape fr gained spurious keys on persistence: {persisted_frs[1]!r}"
 
 
-def test_propose_from_work_unit_default_draft_spec_view_falls_back_to_work_unit(pipeline):
-    """``draft_spec_work_unit=None`` (the default) must keep the
-    pre-existing behavior: ``_draft_spec`` is rendered from the same
-    ``work_unit`` dict that gets persisted. Backward-compat guard for
-    every store-level caller that doesn't pass the new kwarg.
+def test_mutations_preserve_full_descriptions_via_sidecar_refresh(pipeline):
+    """Critical regression guard for PR #64 review pass-5 finding 1:
+    every mutation that calls ``_refresh_draft_spec`` rebuilds
+    ``draft_spec`` from ``milestone.work_unit``; before the
+    ``fr_descriptions`` sidecar landed, the enriched FR prose vanished
+    on the first status / supersede / fr-update because the work_unit
+    didn't carry it and the sidecar didn't exist.
+
+    This test walks a milestone through ``update_status`` and
+    ``update_milestone_frs`` and asserts that draft_spec keeps the
+    full description on every refresh.
+    """
+    fr_descriptions = {
+        "fr_developer_11111111": "Persistent cached description.",
+    }
+
+    # Run update_frs first (requires status='proposed') then advance
+    # status — this exercises both refresh paths against the same
+    # sidecar.
+    milestone = pipeline.milestones.propose_from_work_unit(
+        _work_unit(), fr_descriptions=fr_descriptions
+    )
+    assert "Persistent cached description." in milestone.draft_spec
+
+    # update_frs -> _refresh_draft_spec re-renders
+    pipeline.milestones.update_frs(
+        milestone.id, remove_fr_ids=["fr_developer_22222222"]
+    )
+    after_frs = pipeline.milestones.get(milestone.id)
+    assert after_frs is not None
+    assert "Persistent cached description." in after_frs.draft_spec, (
+        "fr_description vanished on fr-list mutation:\n" + after_frs.draft_spec
+    )
+
+    # update_status -> _refresh_draft_spec re-renders
+    pipeline.milestones.update_status(
+        milestone.id, status=MILESTONE_STATUS_IN_PROGRESS
+    )
+    after_status = pipeline.milestones.get(milestone.id)
+    assert after_status is not None
+    assert "Persistent cached description." in after_status.draft_spec, (
+        "fr_description vanished on status mutation:\n" + after_status.draft_spec
+    )
+
+
+def test_propose_from_work_unit_re_propose_preserves_existing_fr_descriptions(pipeline):
+    """A re-propose call that doesn't pass ``fr_descriptions`` must
+    preserve the milestone's existing sidecar map. Pre-existing
+    callers that don't know about the new kwarg shouldn't wipe
+    descriptions that were cached on a prior propose. PR #64 review
+    pass-5 finding 1 (re-propose path).
     """
     work_unit = _work_unit()
-    work_unit["frs"][0]["full_description"] = "FROM_WORK_UNIT_DIRECT"
+    fr_descriptions = {"fr_developer_11111111": "Cached on first propose."}
+    first = pipeline.milestones.propose_from_work_unit(
+        work_unit, fr_descriptions=fr_descriptions
+    )
+    assert "Cached on first propose." in first.draft_spec
 
-    milestone = pipeline.milestones.propose_from_work_unit(work_unit)
+    # Re-propose without passing fr_descriptions should not wipe the
+    # cached map.
+    second = pipeline.milestones.propose_from_work_unit(work_unit)
+    assert second.id == first.id  # idempotent on (target, title, fr_ids)
+    assert second.fr_descriptions == fr_descriptions
+    assert "Cached on first propose." in second.draft_spec
 
-    # full_description from work_unit appears in draft_spec
-    assert "FROM_WORK_UNIT_DIRECT" in milestone.draft_spec
-    # …and the persisted work_unit still carries it (no shape change)
-    assert milestone.work_unit["frs"][0]["full_description"] == "FROM_WORK_UNIT_DIRECT"
+    # …but an explicit empty dict signals "clear it" and is honored.
+    third = pipeline.milestones.propose_from_work_unit(work_unit, fr_descriptions={})
+    assert third.fr_descriptions == {}
+    assert "Cached on first propose." not in third.draft_spec
 
 
 def test_review_scope_flags_duplicates_and_review_terms(pipeline):
