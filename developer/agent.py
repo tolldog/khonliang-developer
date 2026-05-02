@@ -2101,6 +2101,14 @@ class DeveloperAgent(BaseAgent):
             fr_descriptions = _build_fr_descriptions_map(
                 work_unit, self.pipeline.frs
             )
+            # When the lookup yields no descriptions at all (transient
+            # store outage, all FRs missing, etc.) pass ``None`` so
+            # ``propose_from_work_unit`` preserves any sidecar cached
+            # from a prior successful propose. Sending ``{}`` would
+            # explicitly clear it, regressing handoff briefs on every
+            # re-propose during a degraded fr_store window. PR #64
+            # review pass-6 finding 1.
+            fr_descriptions_arg = fr_descriptions if fr_descriptions else None
             # Phase 3 pass-through: empty `project` maps to None =
             # preserve-existing-or-default (store's documented
             # re-propose semantics); an explicit slug — including
@@ -2109,7 +2117,7 @@ class DeveloperAgent(BaseAgent):
             project = project_raw or None
             milestone = self.pipeline.milestones.propose_from_work_unit(
                 work_unit,
-                fr_descriptions=fr_descriptions,
+                fr_descriptions=fr_descriptions_arg,
                 target=args.get("target", ""),
                 title=args.get("title", ""),
                 summary=args.get("summary", ""),
@@ -2333,16 +2341,19 @@ class DeveloperAgent(BaseAgent):
                 source = next_result.get("source", "work_unit")
                 remaining = next_result.get("remaining")
 
-            # Same sidecar build as propose_milestone_from_work_unit;
-            # see that handler for the persistence-vs-render rationale.
-            # PR #64 review pass-4 finding 1 + pass-5 finding 1.
+            # Same sidecar build + preserve-on-empty contract as
+            # propose_milestone_from_work_unit; see that handler for
+            # the persistence-vs-render rationale and the pass-6
+            # ``None``-when-empty preservation guard. PR #64 review
+            # pass-4 finding 1 + pass-5 finding 1 + pass-6 finding 1.
             fr_descriptions = _build_fr_descriptions_map(
                 work_unit, self.pipeline.frs
             )
+            fr_descriptions_arg = fr_descriptions if fr_descriptions else None
 
             milestone = self.pipeline.milestones.propose_from_work_unit(
                 work_unit,
-                fr_descriptions=fr_descriptions,
+                fr_descriptions=fr_descriptions_arg,
                 target=args.get("target", ""),
                 title=args.get("title", ""),
                 summary=args.get("summary", ""),

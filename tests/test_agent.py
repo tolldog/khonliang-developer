@@ -1297,6 +1297,66 @@ async def test_propose_milestone_enriches_bare_string_fr_items(harness):
 
 
 @pytest.mark.asyncio
+async def test_propose_milestone_does_not_wipe_sidecar_when_lookup_yields_empty(harness):
+    """Regression guard for PR #64 review pass-6 finding 1: a
+    re-propose where ``_build_fr_descriptions_map`` returns ``{}``
+    (transient store outage, all FRs missing) must NOT wipe a
+    previously-cached ``fr_descriptions`` sidecar on the milestone.
+    The agent passes ``fr_descriptions=None`` in that case so the
+    store's preserve-on-None semantics kicks in.
+
+    Without this guard, every re-propose during a degraded fr_store
+    window would clear the cached prose and regress handoff briefs.
+    """
+    fr = harness.agent.pipeline.frs.promote(
+        target="benchmark",
+        title="bench: sidecar preservation guard",
+        description="Cached design intent that must survive a degraded re-propose.",
+        priority="high",
+    )
+    work_unit_payload = {
+        "name": "sidecar preserve work unit",
+        "targets": ["benchmark"],
+        "frs": [{"fr_id": fr.id, "description": "bench: sidecar preservation guard",
+                 "priority": "high"}],
+    }
+    # First propose — sidecar populated from a working fr_store.
+    first = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": json.dumps(work_unit_payload),
+        "title": "sidecar preserve test",
+    })
+    assert "Cached design intent" in first["milestone"]["draft_spec"]
+    cached_descriptions = first["milestone"]["fr_descriptions"]
+    assert cached_descriptions[fr.id] == (
+        "Cached design intent that must survive a degraded re-propose."
+    )
+
+    # Simulate a degraded re-propose: monkey-patch fr_store.get to
+    # return None for every lookup so _build_fr_descriptions_map
+    # produces an empty map. The agent must pass None to the store
+    # so the cached sidecar persists.
+    real_get = harness.agent.pipeline.frs.get
+    harness.agent.pipeline.frs.get = lambda fr_id, *, follow_redirect=True: None
+    try:
+        second = await harness.call("propose_milestone_from_work_unit", {
+            "work_unit": json.dumps(work_unit_payload),
+            "title": "sidecar preserve test",
+        })
+    finally:
+        harness.agent.pipeline.frs.get = real_get
+
+    # Re-propose's idempotent on (target, title, fr_ids) so the
+    # milestone id matches.
+    assert second["milestone"]["id"] == first["milestone"]["id"]
+    # The cached sidecar must have survived the empty-lookup re-propose.
+    assert second["milestone"]["fr_descriptions"] == cached_descriptions, (
+        f"sidecar was wiped by empty fr_store lookup on re-propose: "
+        f"{second['milestone']['fr_descriptions']!r}"
+    )
+    assert "Cached design intent" in second["milestone"]["draft_spec"]
+
+
+@pytest.mark.asyncio
 async def test_propose_milestone_preserves_bare_string_in_persisted_work_unit(harness):
     """The render-only enrichment view must NOT mutate the persisted
     ``work_unit`` shape. Callers that round-trip the JSON or diff it
