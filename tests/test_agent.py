@@ -1297,6 +1297,70 @@ async def test_propose_milestone_enriches_bare_string_fr_items(harness):
 
 
 @pytest.mark.asyncio
+async def test_propose_milestone_aggregates_fr_store_failures_into_one_warning(harness, caplog):
+    """When fr_store.get raises for many FRs, ``_build_fr_descriptions_map``
+    must emit a SINGLE aggregated warning rather than one per FR. The
+    aggregated line includes a failure count, total FR count, and a
+    bounded sample list. PR #64 review pass-8 finding 1.
+
+    Without aggregation, a 5+-FR work_unit on a degraded store
+    would log five separate warnings + tracebacks, drowning the real
+    outage signal.
+    """
+    import logging
+
+    # Promote 5 FRs so we can build a multi-fr work_unit.
+    fr_ids = []
+    for i in range(5):
+        fr = harness.agent.pipeline.frs.promote(
+            target="benchmark",
+            title=f"bench: aggregate-log fr {i}",
+            description=f"description {i}",
+            priority="high",
+        )
+        fr_ids.append(fr.id)
+
+    work_unit = json.dumps({
+        "name": "aggregate log work unit",
+        "targets": ["benchmark"],
+        "frs": [{"fr_id": fid, "description": "x", "priority": "high"} for fid in fr_ids],
+    })
+
+    # Force fr_store.get to raise for every lookup.
+    real_get = harness.agent.pipeline.frs.get
+
+    def boom(fr_id, *, follow_redirect=True):
+        raise RuntimeError(f"simulated store outage for {fr_id}")
+
+    harness.agent.pipeline.frs.get = boom
+    try:
+        with caplog.at_level(logging.WARNING, logger="developer.agent"):
+            await harness.call("propose_milestone_from_work_unit", {
+                "work_unit": work_unit,
+                "title": "aggregate log test",
+            })
+    finally:
+        harness.agent.pipeline.frs.get = real_get
+
+    # Count warnings emitted by _build_fr_descriptions_map.
+    aggregate_records = [
+        r for r in caplog.records
+        if "_build_fr_descriptions_map" in r.getMessage()
+    ]
+    assert len(aggregate_records) == 1, (
+        f"expected one aggregated warning per call, got {len(aggregate_records)}: "
+        f"{[r.getMessage() for r in aggregate_records]}"
+    )
+    msg = aggregate_records[0].getMessage()
+    # Failure count + total FR count appear in the message
+    assert "5 fr_store.get failure(s)" in msg, msg
+    assert "across 5 work_unit FR(s)" in msg, msg
+    # Sample list bounded — not all 5 fr_ids appear (capped at the
+    # _FR_LOOKUP_FAILURE_LOG_LIMIT samples + a "..." truncation marker).
+    assert "(further failures truncated from log)" in msg, msg
+
+
+@pytest.mark.asyncio
 async def test_propose_milestone_does_not_wipe_sidecar_when_lookup_yields_empty(harness):
     """Regression guard for PR #64 review pass-6 finding 1: a
     re-propose where ``_build_fr_descriptions_map`` returns ``{}``
@@ -1326,7 +1390,12 @@ async def test_propose_milestone_does_not_wipe_sidecar_when_lookup_yields_empty(
         "title": "sidecar preserve test",
     })
     assert "Cached design intent" in first["milestone"]["draft_spec"]
-    cached_descriptions = first["milestone"]["fr_descriptions"]
+    # `fr_descriptions` is intentionally NOT in `to_public_dict()` (its
+    # prose is already inlined in `draft_spec`; PR #64 pass-8 finding
+    # 2). Read it from the milestone object directly via the store.
+    first_milestone = harness.agent.pipeline.milestones.get(first["milestone"]["id"])
+    assert first_milestone is not None
+    cached_descriptions = dict(first_milestone.fr_descriptions)
     assert cached_descriptions[fr.id] == (
         "Cached design intent that must survive a degraded re-propose."
     )
@@ -1349,9 +1418,11 @@ async def test_propose_milestone_does_not_wipe_sidecar_when_lookup_yields_empty(
     # milestone id matches.
     assert second["milestone"]["id"] == first["milestone"]["id"]
     # The cached sidecar must have survived the empty-lookup re-propose.
-    assert second["milestone"]["fr_descriptions"] == cached_descriptions, (
+    second_milestone = harness.agent.pipeline.milestones.get(second["milestone"]["id"])
+    assert second_milestone is not None
+    assert second_milestone.fr_descriptions == cached_descriptions, (
         f"sidecar was wiped by empty fr_store lookup on re-propose: "
-        f"{second['milestone']['fr_descriptions']!r}"
+        f"{second_milestone.fr_descriptions!r}"
     )
     assert "Cached design intent" in second["milestone"]["draft_spec"]
 

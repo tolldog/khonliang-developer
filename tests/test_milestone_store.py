@@ -381,6 +381,86 @@ def test_propose_from_work_unit_re_propose_overlays_partial_fr_descriptions(pipe
     assert "Second FR cached prose." in second.draft_spec
 
 
+def test_propose_from_work_unit_filters_fr_descriptions_to_current_fr_ids(pipeline):
+    """The persisted sidecar is filtered to the milestone's current
+    ``fr_ids`` — orphan entries from FRs no longer in the bundle (or
+    never in it to begin with) don't accumulate. PR #64 review pass-8
+    finding 3.
+    """
+    work_unit = _work_unit()  # has 11111111 + 22222222
+    over_supplied = {
+        "fr_developer_11111111": "kept",
+        "fr_developer_22222222": "kept",
+        "fr_developer_99999999": "orphan — not in fr_ids",
+    }
+    milestone = pipeline.milestones.propose_from_work_unit(
+        work_unit, fr_descriptions=over_supplied
+    )
+    assert set(milestone.fr_descriptions) == {
+        "fr_developer_11111111",
+        "fr_developer_22222222",
+    }
+    assert "fr_developer_99999999" not in milestone.fr_descriptions
+
+
+def test_update_frs_remove_strips_orphan_from_fr_descriptions(pipeline):
+    """Removing an FR from the milestone via ``update_frs`` also drops
+    its sidecar entry — the same orphan-filter contract as
+    ``propose_from_work_unit``, applied at the mutation layer.
+    Without this, removed-FR prose lingers in the persisted sidecar
+    across status transitions and re-renders. PR #64 review pass-8
+    finding 3 (mutation path)."""
+    work_unit = _work_unit()
+    fr_descriptions = {
+        "fr_developer_11111111": "First FR prose",
+        "fr_developer_22222222": "Second FR prose",
+    }
+    first = pipeline.milestones.propose_from_work_unit(
+        work_unit, fr_descriptions=fr_descriptions
+    )
+    assert first.fr_descriptions == fr_descriptions
+
+    # Remove the second FR via the mutation API; the orphan filter
+    # in update_frs should drop the second FR's description.
+    pipeline.milestones.update_frs(
+        first.id, remove_fr_ids=["fr_developer_22222222"]
+    )
+    after = pipeline.milestones.get(first.id)
+    assert after is not None
+    assert after.fr_descriptions == {"fr_developer_11111111": "First FR prose"}, (
+        f"orphan FR description survived update_frs(remove): "
+        f"{after.fr_descriptions!r}"
+    )
+    # …and the rendered draft_spec no longer carries the orphan prose.
+    assert "Second FR prose" not in after.draft_spec
+    assert "First FR prose" in after.draft_spec
+
+
+def test_to_public_dict_excludes_fr_descriptions(pipeline):
+    """``Milestone.to_public_dict()`` intentionally omits
+    ``fr_descriptions`` — its prose is already inlined into
+    ``draft_spec``, and re-emitting it on every public payload bloats
+    bus + LLM context. The sidecar is internal state for
+    ``_refresh_draft_spec``; the public-facing rendering is
+    ``draft_spec``. PR #64 review pass-8 finding 2.
+    """
+    work_unit = _work_unit()
+    milestone = pipeline.milestones.propose_from_work_unit(
+        work_unit, fr_descriptions={"fr_developer_11111111": "internal cache"}
+    )
+    public = milestone.to_public_dict()
+    assert "fr_descriptions" not in public, (
+        "fr_descriptions leaked into public payload — bloats every "
+        "get_milestone / list_milestones / handoff response"
+    )
+    # …but the sidecar's prose is still inlined in draft_spec so the
+    # public rendering carries the description content.
+    assert "internal cache" in public["draft_spec"]
+    # …and the field is still present on the Milestone object itself
+    # (internal use; survives across get() round-trips).
+    assert milestone.fr_descriptions == {"fr_developer_11111111": "internal cache"}
+
+
 def test_review_scope_flags_duplicates_and_review_terms(pipeline):
     work_unit = {
         "name": "Cluster 1",

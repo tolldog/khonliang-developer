@@ -155,6 +155,13 @@ class Milestone:
     project: str = DEFAULT_PROJECT
 
     def to_public_dict(self) -> dict[str, Any]:
+        # ``fr_descriptions`` is intentionally excluded — its prose is
+        # already inlined into ``draft_spec``, so re-emitting it on the
+        # public payload doubles the byte cost of every get_milestone /
+        # list_milestones / handoff response and bloats bus + LLM
+        # context for callers who never re-render. The sidecar is
+        # internal state for ``_refresh_draft_spec``; the public-facing
+        # output is ``draft_spec``. PR #64 review pass-8 finding 2.
         return {
             "id": self.id,
             "title": self.title,
@@ -164,7 +171,6 @@ class Milestone:
             "project": self.project,
             "fr_ids": list(self.fr_ids),
             "work_unit": dict(self.work_unit),
-            "fr_descriptions": dict(self.fr_descriptions),
             "source": self.source,
             "rank": self.rank,
             "draft_spec": self.draft_spec,
@@ -378,6 +384,15 @@ class MilestoneStore:
             superseded_by = ""
             if preserve_existing_project:
                 project = DEFAULT_PROJECT
+        # Filter the final sidecar to the milestone's current ``fr_ids``
+        # so orphan entries from FRs no longer in the bundle don't
+        # accumulate across mutations / re-proposes. PR #64 pass-8
+        # finding 3.
+        if fr_descriptions:
+            fr_id_set = set(fr_ids)
+            fr_descriptions = {
+                fid: desc for fid, desc in fr_descriptions.items() if fid in fr_id_set
+            }
         milestone = Milestone(
             id=milestone_id,
             title=milestone_title,
@@ -692,6 +707,18 @@ class MilestoneStore:
         # the id alone so downstream helpers don't crash on missing
         # keys. PR #43 Copilot R6 finding 2.
         _sync_work_unit_frs(milestone.work_unit, new_ids)
+        # Drop fr_descriptions entries for FRs that were removed from
+        # the bundle; same orphan-filter as ``propose_from_work_unit``.
+        # Without this, removed-FR prose lingers in the persisted
+        # sidecar across status transitions and re-renders. PR #64
+        # review pass-8 finding 3 (mutation path).
+        if milestone.fr_descriptions:
+            new_id_set = set(new_ids)
+            milestone.fr_descriptions = {
+                fid: desc
+                for fid, desc in milestone.fr_descriptions.items()
+                if fid in new_id_set
+            }
         audit = {
             "at": now,
             "status": milestone.status,

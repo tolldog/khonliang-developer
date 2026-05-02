@@ -4432,6 +4432,13 @@ def _parse_work_unit_arg(value) -> dict:
     return parsed
 
 
+# Cap on how many ``(fr_id, exception)`` samples the aggregated
+# fr_store-failure warning includes per call. Keeps the log line
+# bounded on a fully-down store + large work_unit; the failure count
+# itself stays accurate. PR #64 review pass-8 finding 1.
+_FR_LOOKUP_FAILURE_LOG_LIMIT = 3
+
+
 def _build_fr_descriptions_map(work_unit: dict, fr_store) -> dict[str, str]:
     """Return ``fr_id -> full description`` map for ``work_unit``'s FRs.
 
@@ -4462,8 +4469,13 @@ def _build_fr_descriptions_map(work_unit: dict, fr_store) -> dict[str, str]:
     Lookup uses ``follow_redirect=False`` so a merged FR's bullet
     (which still shows the original fr_id) doesn't pull the resolved
     FR's description from a redirect chain. Failures from the store
-    log a warning with ``exc_info=True`` and degrade to no-description
-    for that bullet — never fails the propose/handoff flow.
+    are collected and emitted as a single aggregated warning at the
+    end of the call instead of one warning + traceback per FR — a
+    systemic store outage on a 5+-FR work_unit was flooding logs and
+    drowning the real signal. The aggregated warning includes the
+    failure count, total work_unit FR count, and the first few
+    ``(fr_id, exception)`` samples for triage. PR #64 review pass-8
+    finding 1.
     """
     if not isinstance(work_unit, dict):
         return {}
@@ -4472,6 +4484,8 @@ def _build_fr_descriptions_map(work_unit: dict, fr_store) -> dict[str, str]:
         return {}
 
     descriptions: dict[str, str] = {}
+    failure_samples: list[tuple[str, str]] = []  # bounded samples for log
+    failure_count = 0  # accurate total, independent of sample cap
     for fr in frs:
         if isinstance(fr, dict):
             fr_id = str(fr.get("fr_id") or fr.get("id") or "").strip()
@@ -4487,22 +4501,36 @@ def _build_fr_descriptions_map(work_unit: dict, fr_store) -> dict[str, str]:
             # whatever FR a merge-redirect chain points at.
             stored = fr_store.get(fr_id, follow_redirect=False)
         except Exception as exc:  # noqa: BLE001 — read-only lookup, never fail propose
-            # Don't fail the propose/handoff flow on a transient store
-            # error, but surface a warning so a systemic store failure
-            # (DB issue, redirect-cycle bug, etc.) doesn't silently
-            # produce thin briefs forever.
-            logger.warning(
-                "_build_fr_descriptions_map: fr_store.get(%s) "
-                "failed (%s: %s); rendering bullet without inlined description",
-                fr_id, type(exc).__name__, exc,
-                exc_info=True,
-            )
+            # Collect, don't log per-FR; the aggregated warning below
+            # fires once at the end of the call. Cap the sample list
+            # at ``_FR_LOOKUP_FAILURE_LOG_LIMIT`` so a 100-FR
+            # work_unit on a fully-down store doesn't bloat the log
+            # line either; the failure count stays accurate via the
+            # separate counter.
+            failure_count += 1
+            if len(failure_samples) < _FR_LOOKUP_FAILURE_LOG_LIMIT:
+                failure_samples.append((fr_id, f"{type(exc).__name__}: {exc}"))
             continue
         if stored is None:
             continue
         description = str(getattr(stored, "description", "") or "").strip()
         if description:
             descriptions[fr_id] = description
+    if failure_count:
+        # One warning per work_unit instead of N. Operators see the
+        # outage signal without per-FR traceback noise; the bounded
+        # sample list is enough to identify the failure mode.
+        sample_pairs = list(failure_samples)
+        if failure_count > len(failure_samples):
+            sample_pairs.append(("...", "(further failures truncated from log)"))
+        logger.warning(
+            "_build_fr_descriptions_map: %d fr_store.get failure(s) across "
+            "%d work_unit FR(s); rendering bullets without inlined "
+            "description for failed lookups. Samples: %s",
+            failure_count,
+            len(frs),
+            "; ".join(f"{fid}={msg}" for fid, msg in sample_pairs),
+        )
     return descriptions
 
 
