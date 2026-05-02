@@ -2090,11 +2090,15 @@ class DeveloperAgent(BaseAgent):
                     return next_result
                 work_unit = next_result.get("work_unit") or {}
                 source = next_result.get("source", "work_unit")
-            # Enrich work_unit FRs with their full descriptions from
-            # fr_store before storing — gives draft_spec the design-intent
-            # prose, not just title + priority. Read-only lookup; missing
-            # FRs render as empty (no-op in the renderer).
-            work_unit = _enrich_work_unit_with_fr_descriptions(work_unit, self.pipeline.frs)
+            # Build a render-only enriched view of work_unit so
+            # draft_spec carries each FR's full design-intent prose.
+            # The original `work_unit` is what gets persisted on the
+            # milestone (and round-tripped by callers); the enriched
+            # copy only flows into `_draft_spec`. PR #64 review pass-4
+            # finding 1.
+            enriched_for_render = _enrich_work_unit_with_fr_descriptions(
+                work_unit, self.pipeline.frs
+            )
             # Phase 3 pass-through: empty `project` maps to None =
             # preserve-existing-or-default (store's documented
             # re-propose semantics); an explicit slug — including
@@ -2103,6 +2107,7 @@ class DeveloperAgent(BaseAgent):
             project = project_raw or None
             milestone = self.pipeline.milestones.propose_from_work_unit(
                 work_unit,
+                draft_spec_work_unit=enriched_for_render,
                 target=args.get("target", ""),
                 title=args.get("title", ""),
                 summary=args.get("summary", ""),
@@ -2326,14 +2331,17 @@ class DeveloperAgent(BaseAgent):
                 source = next_result.get("source", "work_unit")
                 remaining = next_result.get("remaining")
 
-            # Same enrichment as propose_milestone_from_work_unit — pull
-            # full FR descriptions into the work_unit so the resulting
-            # milestone's draft_spec carries design intent, not just titles.
-            # See _enrich_work_unit_with_fr_descriptions.
-            work_unit = _enrich_work_unit_with_fr_descriptions(work_unit, self.pipeline.frs)
+            # Render-only enrichment: see propose_milestone_from_work_unit
+            # for rationale. The persisted `work_unit` stays untouched;
+            # only `_draft_spec` sees the enriched shape. PR #64 review
+            # pass-4 finding 1.
+            enriched_for_render = _enrich_work_unit_with_fr_descriptions(
+                work_unit, self.pipeline.frs
+            )
 
             milestone = self.pipeline.milestones.propose_from_work_unit(
                 work_unit,
+                draft_spec_work_unit=enriched_for_render,
                 target=args.get("target", ""),
                 title=args.get("title", ""),
                 summary=args.get("summary", ""),
@@ -4467,7 +4475,19 @@ def _enrich_work_unit_with_fr_descriptions(work_unit: dict, fr_store) -> dict:
             # corresponds to the fr_id rendered in the bullet,
             # not whatever FR a merge-redirect chain points at.
             stored = fr_store.get(fr_id, follow_redirect=False)
-        except Exception:  # noqa: BLE001 — read-only enrichment, never fail propose
+        except Exception as exc:  # noqa: BLE001 — read-only enrichment, never fail propose
+            # Don't fail the propose/handoff flow on a transient store
+            # error, but surface a warning so a systemic store failure
+            # (DB issue, redirect-cycle bug, etc.) doesn't silently
+            # produce thin briefs forever — without this log, the
+            # regression is invisible in production. PR #64 review
+            # pass-4 finding 2.
+            logger.warning(
+                "_enrich_work_unit_with_fr_descriptions: fr_store.get(%s) "
+                "failed (%s: %s); rendering bullet without inlined description",
+                fr_id, type(exc).__name__, exc,
+                exc_info=True,
+            )
             stored = None
         if stored is None:
             return ""

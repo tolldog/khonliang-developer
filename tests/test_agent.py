@@ -1297,6 +1297,38 @@ async def test_propose_milestone_enriches_bare_string_fr_items(harness):
 
 
 @pytest.mark.asyncio
+async def test_propose_milestone_preserves_bare_string_in_persisted_work_unit(harness):
+    """The render-only enrichment view must NOT mutate the persisted
+    ``work_unit`` shape. Callers that round-trip the JSON or diff it
+    against the original payload expect bare-string fr items to stay
+    bare strings even after the agent enriches the draft_spec view.
+    PR #64 review pass-4 finding 1.
+    """
+    fr = harness.agent.pipeline.frs.promote(
+        target="benchmark",
+        title="bench: persist-shape guard",
+        description="Persist-shape design intent.",
+        priority="high",
+    )
+    work_unit = json.dumps({
+        "name": "persist-shape work unit",
+        "targets": ["benchmark"],
+        "frs": [fr.id],  # bare-string shape must round-trip unchanged
+    })
+    result = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": work_unit,
+        "title": "persist-shape test",
+    })
+    persisted = result["milestone"]["work_unit"]["frs"]
+    assert persisted == [fr.id], (
+        f"bare-string fr was mutated by enrichment on the persisted "
+        f"work_unit: {persisted!r}"
+    )
+    # Sanity: draft_spec still got the enriched view
+    assert "Persist-shape design intent." in result["milestone"]["draft_spec"]
+
+
+@pytest.mark.asyncio
 async def test_propose_milestone_does_not_crash_on_non_string_fr_id(harness):
     """A payload like ``{"frs": [{"id": 123}]}`` must not raise an
     AttributeError in the enrichment pass — downstream validation

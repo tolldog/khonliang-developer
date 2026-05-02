@@ -166,6 +166,116 @@ def test_draft_spec_appends_priority_when_description_omits_it(pipeline):
     assert "Create milestone records [high]" in milestone.draft_spec
 
 
+def test_propose_from_work_unit_inlines_full_description_in_draft_spec(pipeline):
+    """Store-level coverage for the ``full_description`` rendering path
+    in ``_draft_spec``. Agent-level enrichment (via
+    ``_enrich_work_unit_with_fr_descriptions``) is what populates this
+    field in production, but the store accepts pre-populated
+    ``full_description`` directly so any future caller (a different
+    agent, a migration script, a test harness) gets the same render
+    treatment without going through the agent. PR #64 review pass-4
+    finding 3.
+    """
+    work_unit = _work_unit()
+    work_unit["frs"][0]["full_description"] = (
+        "Multi-paragraph design intent inlined directly at store level.\n"
+        "\n"
+        "Second paragraph: store-tier callers shouldn't need to route\n"
+        "through the agent just to get this rendering."
+    )
+
+    milestone = pipeline.milestones.propose_from_work_unit(work_unit)
+
+    draft = milestone.draft_spec
+    # First FR's full_description rendered as an indented sub-block
+    for substring in [
+        "Multi-paragraph design intent inlined directly at store level.",
+        "Second paragraph: store-tier callers shouldn't need to route",
+        "through the agent just to get this rendering.",
+    ]:
+        assert f"    {substring}" in draft, (
+            f"draft_spec missing inlined description line {substring!r}\n"
+            f"---draft---\n{draft}"
+        )
+    # Second FR (no full_description) renders as the bare bullet only
+    assert "fr_developer_22222222" in draft
+
+
+def test_propose_from_work_unit_preserves_persisted_work_unit_shape(pipeline):
+    """The persisted ``work_unit`` (returned via the milestone payload
+    and round-tripped by callers) must match the original argument
+    shape — bare-string fr items stay bare strings, dict items keep
+    their original keys without spurious additions. PR #64 review
+    pass-4 finding 1.
+
+    The ``draft_spec_work_unit`` knob exists precisely so the agent
+    can pass an enriched render-only view without mutating the
+    persisted shape; this test exercises that contract from the
+    store's perspective.
+    """
+    original = {
+        "name": "preserve work_unit shape",
+        "targets": ["developer"],
+        "frs": [
+            "fr_developer_aaaaaaaa",  # bare string — must persist as-is
+            {
+                "fr_id": "fr_developer_bbbbbbbb",
+                "description": "second fr",
+                "priority": "high",
+            },
+        ],
+    }
+    # Simulate an enriched render view (what the agent would build):
+    # bare string coerced into a dict, dict gets full_description.
+    rendered = {
+        **original,
+        "frs": [
+            {"fr_id": "fr_developer_aaaaaaaa", "full_description": "AAAA description"},
+            {
+                "fr_id": "fr_developer_bbbbbbbb",
+                "description": "second fr",
+                "priority": "high",
+                "full_description": "BBBB description",
+            },
+        ],
+    }
+
+    milestone = pipeline.milestones.propose_from_work_unit(
+        original, draft_spec_work_unit=rendered
+    )
+
+    # draft_spec uses the enriched view (full_descriptions appear)
+    assert "AAAA description" in milestone.draft_spec
+    assert "BBBB description" in milestone.draft_spec
+    # …but the persisted work_unit matches the *original* argument
+    persisted_frs = milestone.work_unit["frs"]
+    assert persisted_frs[0] == "fr_developer_aaaaaaaa", (
+        f"bare-string fr was mutated on persistence: {persisted_frs[0]!r}"
+    )
+    assert persisted_frs[1] == {
+        "fr_id": "fr_developer_bbbbbbbb",
+        "description": "second fr",
+        "priority": "high",
+    }, f"dict-shape fr gained spurious keys on persistence: {persisted_frs[1]!r}"
+
+
+def test_propose_from_work_unit_default_draft_spec_view_falls_back_to_work_unit(pipeline):
+    """``draft_spec_work_unit=None`` (the default) must keep the
+    pre-existing behavior: ``_draft_spec`` is rendered from the same
+    ``work_unit`` dict that gets persisted. Backward-compat guard for
+    every store-level caller that doesn't pass the new kwarg.
+    """
+    work_unit = _work_unit()
+    work_unit["frs"][0]["full_description"] = "FROM_WORK_UNIT_DIRECT"
+
+    milestone = pipeline.milestones.propose_from_work_unit(work_unit)
+
+    # full_description from work_unit appears in draft_spec
+    assert "FROM_WORK_UNIT_DIRECT" in milestone.draft_spec
+    # …and the persisted work_unit still carries it (no shape change)
+    assert milestone.work_unit["frs"][0]["full_description"] == "FROM_WORK_UNIT_DIRECT"
+
+
 def test_review_scope_flags_duplicates_and_review_terms(pipeline):
     work_unit = {
         "name": "Cluster 1",

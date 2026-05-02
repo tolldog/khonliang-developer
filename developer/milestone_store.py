@@ -267,6 +267,7 @@ class MilestoneStore:
         summary: str = "",
         source: str = "work_unit",
         project: Optional[str] = None,
+        draft_spec_work_unit: Optional[dict[str, Any]] = None,
     ) -> Milestone:
         """Create or update a proposed milestone from a ranked work unit.
 
@@ -281,6 +282,17 @@ class MilestoneStore:
           overrides any previously-stored project — that's how callers
           deliberately move a milestone back to the default project,
           which a plain-string default couldn't express.
+
+        ``draft_spec_work_unit`` is an optional render-only view used
+        by :func:`_draft_spec`. The persisted ``work_unit`` (returned
+        in the milestone payload and round-tripped by callers) is
+        always the original ``work_unit`` argument; the render view
+        lets the agent inject a preprocessed shape (e.g. bare-string
+        FR ids coerced into ``{"fr_id": ...}`` dicts with
+        ``full_description`` populated) without mutating what gets
+        stored. Defaults to ``work_unit`` when omitted, so existing
+        store-level callers see no behavior change. PR #64 review
+        pass-4 finding 1.
         """
         if not isinstance(work_unit, dict) or not work_unit:
             raise MilestoneError("work_unit is required")
@@ -348,7 +360,7 @@ class MilestoneStore:
                 milestone_title,
                 inferred_target,
                 milestone_summary,
-                work_unit,
+                draft_spec_work_unit if draft_spec_work_unit is not None else work_unit,
                 status=status,
             ),
             notes_history=notes_history,
