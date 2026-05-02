@@ -1480,6 +1480,60 @@ async def test_prepare_development_handoff_flags_review_terms(harness):
 
 
 @pytest.mark.asyncio
+async def test_prepare_development_handoff_inlines_full_fr_description_in_draft_spec(harness):
+    """`prepare_development_handoff` shares the same enrichment hook as
+    ``propose_milestone_from_work_unit`` (PR #64): the work_unit's FR
+    bullets must carry the FR's full design-intent description, not
+    just the title. Without a parallel test on this path, a regression
+    in the handoff flow (e.g. someone removes the enrichment call from
+    ``handle_prepare_development_handoff`` while keeping the propose
+    path's call) would slip through. Regression guard for
+    ``fr_developer_3763aaf3`` on the handoff entry point.
+    """
+    rich_description = (
+        "Multi-paragraph design intent for the handoff path.\n"
+        "\n"
+        "First paragraph: the receiving session needs the FR's actual\n"
+        "intent prose, not just the bullet's title.\n"
+        "\n"
+        "Second paragraph: bench draft_spec must carry this content too.\n"
+    )
+    fr = harness.agent.pipeline.frs.promote(
+        target="benchmark",
+        title="bench: handoff enrichment guard",
+        description=rich_description,
+        priority="high",
+        concept="benchmark-agent",
+    )
+
+    work_unit = json.dumps({
+        "name": "MS-bench-handoff slice",
+        "targets": ["benchmark"],
+        "frs": [{"fr_id": fr.id, "description": "bench: handoff enrichment guard",
+                 "priority": "high"}],
+    })
+    result = await harness.call("prepare_development_handoff", {
+        "work_unit": work_unit,
+        "title": "MS-bench-handoff test",
+        "summary": "verify draft_spec carries full FR descriptions on handoff path",
+    })
+
+    draft = result["draft_spec"]
+    # Bullet line still present
+    assert f"`{fr.id}`" in draft
+    # Each non-blank line of the rich description appears as an indented sub-block
+    for substring in [
+        "Multi-paragraph design intent for the handoff path.",
+        "First paragraph: the receiving session needs the FR's actual",
+        "intent prose, not just the bullet's title.",
+        "Second paragraph: bench draft_spec must carry this content too.",
+    ]:
+        assert f"    {substring}" in draft or f"    {substring.rstrip()}" in draft, (
+            f"draft_spec missing inlined description line {substring!r}\n---draft---\n{draft}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_create_session_checkpoint_handler(harness, git_repo):
     fr = harness.agent.pipeline.frs.promote(
         target="developer",
