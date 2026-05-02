@@ -790,6 +790,8 @@ class FRStore:
         *,
         target: Optional[str] = None,
         project: Optional[str] = None,
+        concept: Optional[str] = None,
+        fr_id_set: Optional[set[str]] = None,
     ) -> Optional[FR]:
         """Pick the highest-priority FR that's ready to work on.
 
@@ -807,12 +809,30 @@ class FRStore:
         ``project`` optionally restricts to a single project slug;
         None returns every project (cross-project view). Filtering is
         delegated to :meth:`list`, which normalizes the value.
+
+        ``concept`` optionally restricts to FRs whose ``concept`` field
+        matches exactly (whitespace-stripped). Closes the
+        ``fr_developer_39a58719`` dogfood gap: when actively building
+        one cluster, ``next_fr`` without this filter would surface
+        unrelated cross-project FRs — so callers had to manually
+        enumerate within their concept lane.
+
+        ``fr_id_set`` optionally restricts the search to a specific
+        set of FR ids — typically a milestone's bundle. The
+        ``handle_next_fr_local`` skill resolves this from a
+        ``milestone_id`` arg.
         """
+        target_norm = target or None
+        concept_norm = (concept or "").strip() or None
         candidates = []
         for fr in self.list(include_all=True, project=project):
             if fr.status not in (FR_STATUS_OPEN, FR_STATUS_PLANNED):
                 continue
-            if target and fr.target != target:
+            if target_norm and fr.target != target_norm:
+                continue
+            if concept_norm and (fr.concept or "").strip() != concept_norm:
+                continue
+            if fr_id_set is not None and fr.id not in fr_id_set:
                 continue
             if not self._deps_unblocked(fr):
                 continue

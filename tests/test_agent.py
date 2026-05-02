@@ -2817,6 +2817,105 @@ async def test_next_fr_local_filters_by_project(harness):
 
 
 @pytest.mark.asyncio
+async def test_next_fr_local_filters_by_concept(harness):
+    """``concept`` filter scopes the search to one concept tag — closes
+    the ``fr_developer_39a58719`` dogfood gap where the user was actively
+    building MS-bench-A through MS-bench-F and ``next_fr_local``
+    surfaced an unrelated months-old AIOS-derived FR instead of an
+    A1-tier benchmark FR within their active concept lane.
+    """
+    bench_a = await harness.call("promote_fr", {
+        "target": "benchmark", "title": "bench A1", "description": "x",
+        "priority": "high", "concept": "benchmark-agent",
+    })
+    other = await harness.call("promote_fr", {
+        "target": "developer", "title": "unrelated", "description": "y",
+        "priority": "high", "concept": "review-cycle-qol",
+    })
+    # No filter → could pick either; with concept filter, only the
+    # matching concept's FR can win.
+    scoped = await harness.call("next_fr_local", {"concept": "benchmark-agent"})
+    assert scoped["fr"] is not None
+    assert scoped["fr"]["id"] == bench_a["fr_id"]
+    # Empty concept = all concepts; sanity that the new arg defaults
+    # to the existing behavior.
+    unscoped = await harness.call("next_fr_local", {})
+    assert unscoped["fr"] is not None
+    assert unscoped["fr"]["id"] in (bench_a["fr_id"], other["fr_id"])
+
+
+@pytest.mark.asyncio
+async def test_next_fr_local_filters_by_milestone_id(harness):
+    """``milestone_id`` filter restricts the search to FRs in the
+    milestone's bundle. Useful for "what should I do next on this
+    specific milestone" — bypasses every other in-flight FR.
+    fr_developer_39a58719 dogfood case.
+    """
+    in_ms = await harness.call("promote_fr", {
+        "target": "developer", "title": "in milestone", "description": "x",
+        "priority": "high", "concept": "ms-cluster-x",
+    })
+    not_in_ms = await harness.call("promote_fr", {
+        "target": "developer", "title": "not in milestone", "description": "y",
+        "priority": "high", "concept": "other",
+    })
+    work_unit = json.dumps({
+        "name": "ms-cluster-x bundle",
+        "targets": ["developer"],
+        "frs": [{"fr_id": in_ms["fr_id"], "description": "in milestone",
+                 "priority": "high"}],
+    })
+    propose = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": work_unit,
+        "title": "ms-cluster-x test",
+    })
+    ms_id = propose["milestone"]["id"]
+
+    scoped = await harness.call("next_fr_local", {"milestone_id": ms_id})
+    assert scoped["fr"] is not None
+    assert scoped["fr"]["id"] == in_ms["fr_id"]
+    assert scoped["fr"]["id"] != not_in_ms["fr_id"]
+
+
+@pytest.mark.asyncio
+async def test_next_fr_local_returns_reason_for_unknown_milestone(harness):
+    """An unknown ``milestone_id`` returns ``{fr: null, reason: ...}``
+    rather than crashing or silently falling through to the unscoped
+    search. Caller-visible failure mode."""
+    result = await harness.call("next_fr_local", {
+        "milestone_id": "ms_developer_does_not_exist",
+    })
+    assert result["fr"] is None
+    assert "unknown milestone id" in result["reason"]
+
+
+@pytest.mark.asyncio
+async def test_next_fr_local_returns_reason_for_milestone_with_no_frs(harness):
+    """A milestone whose ``fr_ids`` is empty (rare — usually
+    propose_from_work_unit wouldn't produce one — but defensively
+    covered) surfaces a distinct reason rather than confusing
+    "no ready FRs" output."""
+    # Manually place a milestone with empty fr_ids via the store path.
+    from developer.milestone_store import Milestone, MILESTONE_STATUS_PROPOSED
+    empty_ms = Milestone(
+        id="ms_developer_empty_test",
+        title="empty bundle",
+        target="developer",
+        status=MILESTONE_STATUS_PROPOSED,
+        summary="empty",
+        fr_ids=[],
+        work_unit={"name": "empty", "targets": ["developer"], "frs": []},
+    )
+    harness.agent.pipeline.milestones._store(empty_ms)
+
+    result = await harness.call("next_fr_local", {
+        "milestone_id": "ms_developer_empty_test",
+    })
+    assert result["fr"] is None
+    assert "no FRs in its bundle" in result["reason"]
+
+
+@pytest.mark.asyncio
 async def test_file_bug_passes_project_through(harness):
     result = await harness.call("file_bug", {
         "target": "developer", "title": "b", "description": "d",

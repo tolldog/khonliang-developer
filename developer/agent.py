@@ -704,10 +704,20 @@ class DeveloperAgent(BaseAgent):
                    "notes": {"type": "string", "default": ""}},
                   since="0.6.0"),
             Skill("next_fr_local", "Pick the highest-priority open/planned FR "
-                  "whose deps are completed. Returns null when nothing's ready.",
+                  "whose deps are completed. Returns null when nothing's "
+                  "ready. Returns ``{fr: {id, ...}}`` on hit, "
+                  "``{fr: null, reason: ...}`` when no FR qualifies.",
                   {"target": {"type": "string", "default": ""},
                    "project": {"type": "string", "default": "",
-                               "description": "project slug to scope the search (Phase 3); empty returns all projects"}},
+                               "description": "project slug to scope the search (Phase 3); empty returns all projects"},
+                   "concept": {"type": "string", "default": "",
+                               "description": "concept tag to scope the search (fr_developer_39a58719); "
+                                              "empty returns all concepts. Useful when building one "
+                                              "cluster — bypasses unrelated cross-project FRs"},
+                   "milestone_id": {"type": "string", "default": "",
+                                    "description": "restrict search to FRs in this milestone's bundle "
+                                                   "(fr_developer_39a58719). Empty disables the filter; "
+                                                   "an unknown id returns ``{fr: null, reason: ...}``"}},
                   since="0.6.0"),
             # Native git operations (fr_developer_e778b9bf). Each takes a
             # `cwd` (repo path); destructive ops require explicit flags.
@@ -3041,9 +3051,50 @@ class DeveloperAgent(BaseAgent):
         # an explicit slug partitions the search.
         project_raw = str(args.get("project") or "").strip()
         project = project_raw or None
-        fr = self.pipeline.frs.next_fr(target=target, project=project)
+        # fr_developer_39a58719 dogfood: concept + milestone_id scope
+        # filters so callers actively building one cluster don't get
+        # unrelated cross-project FRs surfaced.
+        concept_raw = str(args.get("concept") or "").strip()
+        concept = concept_raw or None
+        milestone_id = str(args.get("milestone_id") or "").strip()
+        fr_id_set: Optional[set[str]] = None
+        if milestone_id:
+            milestone = self.pipeline.milestones.get(milestone_id)
+            if milestone is None:
+                return {
+                    "fr": None,
+                    "reason": f"unknown milestone id: {milestone_id!r}",
+                }
+            fr_id_set = set(milestone.fr_ids)
+            if not fr_id_set:
+                return {
+                    "fr": None,
+                    "reason": f"milestone {milestone_id!r} has no FRs in its bundle",
+                }
+        fr = self.pipeline.frs.next_fr(
+            target=target,
+            project=project,
+            concept=concept,
+            fr_id_set=fr_id_set,
+        )
         if fr is None:
-            return {"fr": None, "reason": "no ready FRs (all in-progress, blocked, or terminal)"}
+            scope = []
+            if target:
+                scope.append(f"target={target!r}")
+            if project:
+                scope.append(f"project={project!r}")
+            if concept:
+                scope.append(f"concept={concept!r}")
+            if milestone_id:
+                scope.append(f"milestone_id={milestone_id!r}")
+            scope_text = f" within {', '.join(scope)}" if scope else ""
+            return {
+                "fr": None,
+                "reason": (
+                    f"no ready FRs{scope_text} "
+                    "(all in-progress, blocked, or terminal)"
+                ),
+            }
         return {"fr": fr.to_public_dict()}
 
     # -- native git operations (fr_developer_e778b9bf) --
