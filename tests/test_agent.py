@@ -1176,6 +1176,85 @@ async def test_propose_milestone_inlines_full_fr_description_in_draft_spec(harne
 
 
 @pytest.mark.asyncio
+async def test_propose_milestone_does_not_follow_merge_redirects_in_enrichment(harness):
+    """The work_unit bullet shows the original ``fr_id``; the inlined
+    description must come from the same FR, not whatever a merge-redirect
+    chain points at. PR #64 review finding 1 — without
+    ``follow_redirect=False`` on the lookup, a merged FR's bullet would
+    silently get the resolved FR's description, producing an inconsistent
+    handoff brief.
+    """
+    source = harness.agent.pipeline.frs.promote(
+        target="benchmark",
+        title="bench: source FR pre-merge",
+        description="SOURCE description: pre-merge intent.",
+        priority="high",
+    )
+    # FRStore.merge requires >=2 sources; create a sibling so we can
+    # exercise the merge path. The sibling is incidental — the test
+    # asserts redirect behavior on `source`.
+    sibling = harness.agent.pipeline.frs.promote(
+        target="benchmark",
+        title="bench: sibling source FR",
+        description="SIBLING description.",
+        priority="high",
+    )
+    target = harness.agent.pipeline.frs.merge(
+        source_ids=[source.id, sibling.id],
+        title="bench: target FR post-merge",
+        description="TARGET description: this should NOT appear under the source bullet.",
+        priority="high",
+    )
+
+    work_unit = json.dumps({
+        "name": "merge-redirect work unit",
+        "targets": ["benchmark"],
+        # Bundle references the original (now-merged) source id
+        "frs": [{"fr_id": source.id, "description": "bench: source FR pre-merge",
+                 "priority": "high"}],
+    })
+    result = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": work_unit,
+        "title": "merge-redirect test",
+    })
+    draft = result["milestone"]["draft_spec"]
+
+    # The bullet keeps the source id; the description must match the source FR
+    assert f"`{source.id}`" in draft
+    assert "SOURCE description" in draft
+    # Critically, the target FR's description must NOT have leaked in
+    assert "TARGET description" not in draft
+
+
+@pytest.mark.asyncio
+async def test_propose_milestone_preserves_existing_full_description_on_lookup_miss(harness):
+    """When fr_store.get returns None (FR removed, transient error, etc.)
+    a pre-existing ``full_description`` already on the work_unit's fr
+    dict must be preserved — silent overwrite to empty would wipe a
+    cached good value across re-propose cycles. PR #64 review finding 2.
+    """
+    cached_description = "Cached design intent that must survive a lookup miss."
+    work_unit = json.dumps({
+        "name": "preserve cached on miss",
+        "targets": ["benchmark"],
+        "frs": [{
+            "fr_id": "fr_benchmark_does_not_exist",  # lookup will miss
+            "description": "bench: ghost FR",
+            "priority": "high",
+            "full_description": cached_description,
+        }],
+    })
+    result = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": work_unit,
+        "title": "lookup-miss preserve test",
+    })
+    draft = result["milestone"]["draft_spec"]
+    assert cached_description in draft, (
+        f"cached full_description was wiped by lookup miss\n---draft---\n{draft}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_update_milestone_frs_rejects_wrong_arg_names(harness):
     """`add` / `remove` / `add_frs` / `remove_frs` are the obvious-but-wrong
     shapes a caller reaches for; without rejection they get dropped silently

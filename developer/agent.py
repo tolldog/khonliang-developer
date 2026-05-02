@@ -4423,9 +4423,21 @@ def _enrich_work_unit_with_fr_descriptions(work_unit: dict, fr_store) -> dict:
     an indented sub-block per FR (see ``_draft_spec`` in
     milestone_store.py).
 
-    Existing fields on each fr dict are preserved. FRs whose lookup
-    misses get an empty ``full_description`` (the renderer no-ops on
-    empty). Non-dict fr items (bare-string ids) pass through untouched.
+    Lookup uses ``follow_redirect=False`` so a merged FR's bullet (which
+    still shows the original fr_id + title) doesn't get the resolved
+    FR's description silently substituted underneath — that would
+    produce an inconsistent handoff brief where the bullet identifies
+    one FR and the body describes a different one. PR #64 review
+    finding 1.
+
+    On lookup miss or transient error, any pre-existing
+    ``full_description`` already on the fr dict is preserved (re-propose
+    paths, cached enrichment from a prior call). Only overwrite when
+    the lookup actually returns a non-empty description. PR #64
+    review finding 2.
+
+    Existing fields on each fr dict are preserved. Non-dict fr items
+    (bare-string ids) pass through untouched.
     """
     if not isinstance(work_unit, dict):
         return work_unit
@@ -4436,15 +4448,22 @@ def _enrich_work_unit_with_fr_descriptions(work_unit: dict, fr_store) -> dict:
     for fr in frs:
         if isinstance(fr, dict):
             fr_id = (fr.get("fr_id") or fr.get("id") or "").strip()
-            full_description = ""
+            looked_up_description = ""
             if fr_id:
                 try:
-                    stored = fr_store.get(fr_id)
+                    # follow_redirect=False so the description we inline
+                    # corresponds to the fr_id rendered in the bullet,
+                    # not whatever FR a merge-redirect chain points at.
+                    stored = fr_store.get(fr_id, follow_redirect=False)
                 except Exception:  # noqa: BLE001 — read-only enrichment, never fail propose
                     stored = None
                 if stored is not None:
-                    full_description = str(getattr(stored, "description", "") or "").strip()
-            enriched.append({**fr, "full_description": full_description})
+                    looked_up_description = str(getattr(stored, "description", "") or "").strip()
+            existing_description = str(fr.get("full_description") or "").strip()
+            # Preserve cached value when lookup misses or errors; only
+            # overwrite when the live lookup produced non-empty content.
+            final_description = looked_up_description or existing_description
+            enriched.append({**fr, "full_description": final_description})
         else:
             enriched.append(fr)
     return {**work_unit, "frs": enriched}
