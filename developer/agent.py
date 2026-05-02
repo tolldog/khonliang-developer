@@ -4436,35 +4436,70 @@ def _enrich_work_unit_with_fr_descriptions(work_unit: dict, fr_store) -> dict:
     the lookup actually returns a non-empty description. PR #64
     review finding 2.
 
-    Existing fields on each fr dict are preserved. Non-dict fr items
-    (bare-string ids) pass through untouched.
+    Bare-string fr items (``"frs": ["fr_developer_..."]``) are also a
+    valid input shape per ``propose_from_work_unit``; they're coerced
+    into ``{"fr_id": s, "full_description": ...}`` dicts here so the
+    same enrichment treatment applies (``_draft_spec`` tolerates either
+    shape — see ``milestone_store._fr_id_from_item``). PR #64 review
+    pass-3 finding 1.
+
+    A non-list ``frs`` (e.g. a bare string or a dict accidentally
+    wrapped at this level) is left untouched so the downstream
+    ``isinstance(frs, list)`` validation in
+    ``propose_from_work_unit`` still rejects it cleanly. Without this
+    guard we'd transform a malformed payload into a list of characters /
+    keys and silently produce a bogus milestone. PR #64 review pass-3
+    finding 3.
+
+    Existing fields on each fr dict are preserved.
     """
     if not isinstance(work_unit, dict):
         return work_unit
-    frs = work_unit.get("frs") or []
-    if not frs:
+    frs = work_unit.get("frs")
+    if not isinstance(frs, list) or not frs:
         return work_unit
+
+    def _lookup(fr_id: str) -> str:
+        if not fr_id:
+            return ""
+        try:
+            # follow_redirect=False so the description we inline
+            # corresponds to the fr_id rendered in the bullet,
+            # not whatever FR a merge-redirect chain points at.
+            stored = fr_store.get(fr_id, follow_redirect=False)
+        except Exception:  # noqa: BLE001 — read-only enrichment, never fail propose
+            stored = None
+        if stored is None:
+            return ""
+        return str(getattr(stored, "description", "") or "").strip()
+
     enriched = []
     for fr in frs:
         if isinstance(fr, dict):
-            fr_id = (fr.get("fr_id") or fr.get("id") or "").strip()
-            looked_up_description = ""
-            if fr_id:
-                try:
-                    # follow_redirect=False so the description we inline
-                    # corresponds to the fr_id rendered in the bullet,
-                    # not whatever FR a merge-redirect chain points at.
-                    stored = fr_store.get(fr_id, follow_redirect=False)
-                except Exception:  # noqa: BLE001 — read-only enrichment, never fail propose
-                    stored = None
-                if stored is not None:
-                    looked_up_description = str(getattr(stored, "description", "") or "").strip()
+            # ``str(... or "").strip()`` matches ``_fr_id_from_item``'s
+            # coercion so a non-string id (``{"id": 123}``) doesn't
+            # crash here before downstream validation runs. PR #64
+            # review pass-3 finding 2.
+            fr_id = str(fr.get("fr_id") or fr.get("id") or "").strip()
+            looked_up_description = _lookup(fr_id)
             existing_description = str(fr.get("full_description") or "").strip()
             # Preserve cached value when lookup misses or errors; only
             # overwrite when the live lookup produced non-empty content.
             final_description = looked_up_description or existing_description
             enriched.append({**fr, "full_description": final_description})
+        elif isinstance(fr, str):
+            # Bare-string FR id: enrich into a minimal dict so the
+            # draft_spec renderer can inline the description. Keep the
+            # original string id under ``fr_id`` so ``_fr_id_from_item``
+            # picks it up identically.
+            fr_id = fr.strip()
+            enriched.append({
+                "fr_id": fr_id,
+                "full_description": _lookup(fr_id),
+            })
         else:
+            # Unknown item type — pass through untouched and let
+            # downstream validation surface the shape error.
             enriched.append(fr)
     return {**work_unit, "frs": enriched}
 

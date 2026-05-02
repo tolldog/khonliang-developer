@@ -1255,6 +1255,111 @@ async def test_propose_milestone_preserves_existing_full_description_on_lookup_m
 
 
 @pytest.mark.asyncio
+async def test_propose_milestone_enriches_bare_string_fr_items(harness):
+    """``propose_from_work_unit`` accepts bare-string fr items
+    (``"frs": ["fr_developer_..."]``); the enrichment pass must coerce
+    them into dicts and look up full_description so they get the same
+    inlined design-intent prose as the dict-shape entries. PR #64
+    pass-3 finding 1.
+    """
+    rich_description = (
+        "Bare-string-shape design intent.\n"
+        "\n"
+        "This FR was referenced by id-only, but the bullet still needs\n"
+        "the full description inlined.\n"
+    )
+    fr = harness.agent.pipeline.frs.promote(
+        target="benchmark",
+        title="bench: bare-string enrichment",
+        description=rich_description,
+        priority="high",
+    )
+    work_unit = json.dumps({
+        "name": "bare-string work unit",
+        "targets": ["benchmark"],
+        "frs": [fr.id],  # bare-string shape, not a dict
+    })
+    result = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": work_unit,
+        "title": "bare-string enrichment test",
+    })
+    draft = result["milestone"]["draft_spec"]
+    assert f"`{fr.id}`" in draft
+    for substring in [
+        "Bare-string-shape design intent.",
+        "This FR was referenced by id-only, but the bullet still needs",
+        "the full description inlined.",
+    ]:
+        assert f"    {substring}" in draft, (
+            f"draft_spec missing inlined description line {substring!r} for bare-string fr\n"
+            f"---draft---\n{draft}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_propose_milestone_does_not_crash_on_non_string_fr_id(harness):
+    """A payload like ``{"frs": [{"id": 123}]}`` must not raise an
+    AttributeError in the enrichment pass — downstream validation
+    (``_fr_id_from_item`` coerces with ``str(...)``) is the right place
+    to reject it. The enrichment helper now matches that coercion so
+    it doesn't crash before the real error path runs. PR #64 pass-3
+    finding 2.
+    """
+    work_unit = {
+        "name": "non-string id payload",
+        "targets": ["benchmark"],
+        "frs": [{"id": 12345, "description": "weird shape", "priority": "low"}],
+    }
+    # Should hit downstream validation (id coerces to "12345" string,
+    # which doesn't match any real FR — milestone_store accepts the
+    # coerced id and the milestone proposes with a bogus id, but the
+    # enrichment helper itself MUST NOT crash with AttributeError.
+    # The user-facing failure mode is downstream's problem; we just
+    # verify the enrichment doesn't blow up first.
+    result = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": json.dumps(work_unit),
+        "title": "non-string id test",
+    })
+    # Either the call succeeds with the coerced string id, or it
+    # surfaces a downstream error — either is acceptable; the
+    # forbidden behavior is an AttributeError from .strip() on int.
+    assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_propose_milestone_rejects_non_list_frs_at_downstream(harness):
+    """A payload with ``"frs": "fr_developer_123"`` (a string instead
+    of a list) used to be rejected by ``propose_from_work_unit``'s
+    ``isinstance(frs, list)`` check. The enrichment helper must not
+    silently rewrite it into a list of characters — that would
+    bypass downstream validation and produce a bogus milestone with
+    each character treated as an FR id. PR #64 pass-3 finding 3.
+    """
+    work_unit = {
+        "name": "malformed frs payload",
+        "targets": ["benchmark"],
+        "frs": "fr_developer_should_be_in_a_list",  # string, not list
+    }
+    result = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": json.dumps(work_unit),
+        "title": "non-list frs test",
+    })
+    # Downstream validation should fire — either as an explicit error
+    # field or as a non-success status. The forbidden behavior is a
+    # successfully-stored milestone whose fr_ids list is the per-char
+    # explosion of the malformed string.
+    if "milestone" in result:
+        fr_ids = result["milestone"].get("fr_ids") or []
+        assert "f" not in fr_ids, (
+            f"non-list frs string was iterated character-by-character: {fr_ids!r}"
+        )
+    else:
+        assert "error" in result or result.get("status") not in (None, "ok"), (
+            f"expected downstream validation error for non-list frs, got: {result!r}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_update_milestone_frs_rejects_wrong_arg_names(harness):
     """`add` / `remove` / `add_frs` / `remove_frs` are the obvious-but-wrong
     shapes a caller reaches for; without rejection they get dropped silently
