@@ -3077,7 +3077,22 @@ class DeveloperAgent(BaseAgent):
                     "fr": None,
                     "reason": f"unknown milestone id: {milestone_id}",
                 }
-            fr_id_set = set(milestone.fr_ids)
+            # Resolve each bundled id through the merge graph and
+            # carry BOTH the original and the resolved id in the set.
+            # Milestones store FR ids by their pre-merge form (so
+            # historical bundles stay stable even after FRs get
+            # merged); ``next_fr`` matches against ``fr.id``, which is
+            # always the post-merge / current id. Without resolution,
+            # a milestone whose source-FRs were merged into a new
+            # replacement would silently report "none ready" even when
+            # the open replacement is the obvious next step. PR #66
+            # review pass-5.
+            fr_id_set = set()
+            for stored_id in milestone.fr_ids:
+                fr_id_set.add(stored_id)
+                resolved_id = self.pipeline.frs.resolve_id(stored_id)
+                if resolved_id != stored_id:
+                    fr_id_set.add(resolved_id)
             if not fr_id_set:
                 return {
                     "fr": None,

@@ -2917,6 +2917,56 @@ async def test_next_fr_local_no_ready_reason_includes_active_scope(harness):
 
 
 @pytest.mark.asyncio
+async def test_next_fr_local_milestone_id_resolves_merged_fr_ids(harness):
+    """Milestones store FR ids in their pre-merge form so historical
+    bundles stay stable after merges. ``next_fr`` matches against
+    ``fr.id`` (the current id), so a milestone whose source FRs got
+    merged into a replacement would otherwise produce a misleading
+    "no ready FRs" — even when the open replacement is the obvious
+    next step. The handler must walk each stored id through
+    ``resolve_id`` and include BOTH the original and resolved id in
+    the scope set. PR #66 review pass-5.
+    """
+    # Two source FRs that we'll merge together; the merged-in
+    # replacement is the open FR that should surface as next.
+    a = harness.agent.pipeline.frs.promote(
+        target="developer", title="merge source A", description="x",
+        priority="high",
+    )
+    b = harness.agent.pipeline.frs.promote(
+        target="developer", title="merge source B", description="y",
+        priority="high",
+    )
+    replacement = harness.agent.pipeline.frs.merge(
+        source_ids=[a.id, b.id],
+        title="merged replacement", description="z", priority="high",
+    )
+
+    # Build a milestone whose stored fr_ids are the pre-merge ids.
+    work_unit = json.dumps({
+        "name": "merge-aware milestone",
+        "targets": ["developer"],
+        "frs": [{"fr_id": a.id, "description": "x", "priority": "high"},
+                {"fr_id": b.id, "description": "y", "priority": "high"}],
+    })
+    proposed = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": work_unit,
+        "title": "merge-resolve test",
+    })
+    ms_id = proposed["milestone"]["id"]
+
+    # Without resolution, fr_id_set = {a, b} would miss the
+    # replacement's id and return null. With resolution, the set
+    # includes the replacement and ``next_fr`` lands on it.
+    result = await harness.call("next_fr_local", {"milestone_id": ms_id})
+    assert result["fr"] is not None, (
+        f"milestone-scoped next_fr_local missed the merged replacement; "
+        f"reason={result.get('reason')!r}"
+    )
+    assert result["fr"]["id"] == replacement.id
+
+
+@pytest.mark.asyncio
 async def test_next_fr_local_distinguishes_empty_scope_from_unready(harness):
     """The empty-result reason distinguishes "no FRs match scope"
     from "FRs match scope but none are ready (in-progress, blocked,
