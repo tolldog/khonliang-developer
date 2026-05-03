@@ -137,8 +137,9 @@ must be true or each pass wastes round-trips.
    `issues/N/comments`. Skipping the second call misses
    saturation events entirely.
 3. **`gh api .../comments` does NOT paginate by default** — pass
-   `--paginate`. A deep PR with 17+ comments will silently truncate
-   to the first 30 otherwise.
+   `--paginate`. The default is the GitHub API's per-page limit
+   (30 items); a deep PR with 30+ comments silently returns only
+   the first page otherwise.
 4. **Saturation has two shapes.** (a) The literal "nothing more to
    say" issue-thread comment; (b) the same findings restated across
    passes with no genuinely new ones (post-defer-receipt
