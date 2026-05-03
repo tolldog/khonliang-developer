@@ -2838,10 +2838,18 @@ async def test_next_fr_local_filters_by_concept(harness):
     assert scoped["fr"]["id"] == bench_a["fr_id"]
     # Empty concept = all concepts; ``FRStore.next_fr`` is
     # deterministic (priority desc, then ``created_at`` ascending)
-    # so the unscoped call returns ``bench_a`` here — it was
-    # promoted first and both candidates share priority="high".
-    # Asserting the deterministic outcome rather than "either" so
-    # a future ordering regression actually fails the test.
+    # so the unscoped call returns ``bench_a`` because it has the
+    # earlier created_at. Force distinct timestamps via the store's
+    # write path (back-to-back ``promote_fr`` calls can tie on
+    # systems with coarse clock resolution; PR #66 review pass-11
+    # finding 1) so the tie-break is observable instead of being
+    # left to clock-grain luck.
+    bench_record = harness.agent.pipeline.frs.get(bench_a["fr_id"])
+    bench_record.created_at = 100.0
+    harness.agent.pipeline.frs._store(bench_record)
+    other_record = harness.agent.pipeline.frs.get(other["fr_id"])
+    other_record.created_at = 200.0
+    harness.agent.pipeline.frs._store(other_record)
     unscoped = await harness.call("next_fr_local", {})
     assert unscoped["fr"] is not None
     assert unscoped["fr"]["id"] == bench_a["fr_id"], (

@@ -268,6 +268,7 @@ class FRStore:
         status: Optional[str] = None,
         include_all: bool = False,
         project: Optional[str] = None,
+        sort: bool = True,
     ) -> list[FR]:
         """List FRs in the store.
 
@@ -281,6 +282,13 @@ class FRStore:
         strings normalize to :data:`DEFAULT_PROJECT` — matches writer
         normalization and avoids bus/CLI defaults (where ``""`` is
         common) silently bypassing the filter.
+
+        ``sort=False`` skips the priority+created_at sort. Callers
+        that don't need ordered output (counting, scope-only filters,
+        ``_filter_scope`` consumers) can opt out so the empty-result
+        path of ``next_fr_local`` doesn't pay for an extra full-list
+        sort on top of the sort ``next_fr`` already did. PR #66
+        review pass-11 finding 2.
         """
         # Normalize the project filter once, up front. `None` means
         # "all projects"; anything else routes through the shared
@@ -305,9 +313,10 @@ class FRStore:
             elif not include_all and fr.status not in ACTIVE_STATUSES:
                 continue
             frs.append(fr)
-        # Stable ordering — priority (high, medium, low) then created_at asc
-        priority_order = {"high": 0, "medium": 1, "low": 2}
-        frs.sort(key=lambda f: (priority_order.get(f.priority, 99), f.created_at))
+        if sort:
+            # Stable ordering — priority (high, medium, low) then created_at asc
+            priority_order = {"high": 0, "medium": 1, "low": 2}
+            frs.sort(key=lambda f: (priority_order.get(f.priority, 99), f.created_at))
         return frs
 
     # ------------------------------------------------------------------
@@ -843,11 +852,18 @@ class FRStore:
         # target is set we don't scan + sort FRs that can't match in
         # Python. ``list()`` already supports the same str-typed
         # filter; pass the normalized form to keep matching uniform.
-        # PR #66 review pass-9 finding 3.
+        # ``sort=False`` because no consumer of ``_filter_scope``
+        # needs ordered output: ``count_in_scope`` only counts, and
+        # ``next_fr`` does its own priority+created_at sort over the
+        # subset of candidates that pass the readiness check. Saves
+        # the second full-list sort on the empty-result path of
+        # ``next_fr_local``. PR #66 review pass-9 finding 3 +
+        # pass-11 finding 2.
         for fr in self.list(
             include_all=True,
             project=project,
             target=target_norm,
+            sort=False,
         ):
             if concept_norm and (fr.concept or "").strip() != concept_norm:
                 continue
