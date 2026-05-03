@@ -1772,6 +1772,23 @@ async def test_prepare_development_handoff_from_top_work_unit(harness):
 
 
 @pytest.mark.asyncio
+async def test_prepare_development_handoff_skill_declares_project_arg(harness):
+    """The handler reads ``project`` from args and forwards it to
+    ``propose_from_work_unit``, but the published Skill schema must
+    also declare it so MCP function-calling clients can discover the
+    option. Regression guard for PR #67 review pass-1 finding (handler
+    accepted ``project`` since pass-9 of the parent fr_developer_3763aaf3
+    PR but the schema lagged).
+    """
+    skills_by_name = {s.name: s for s in harness.agent.register_skills()}
+    handoff = skills_by_name["prepare_development_handoff"]
+    assert "project" in handoff.parameters, (
+        f"prepare_development_handoff schema doesn't declare 'project' arg "
+        f"despite the handler accepting it; declared keys: "
+        f"{list(handoff.parameters)}"
+    )
+
+
 async def test_prepare_development_handoff_attaches_to_existing_milestone(harness):
     """``milestone_id`` mode: prepare_development_handoff resolves an
     existing milestone and reuses its persisted work_unit instead of

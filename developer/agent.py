@@ -546,6 +546,12 @@ class DeveloperAgent(BaseAgent):
                    "work_unit": {"type": "string", "default": "",
                                  "description": "optional JSON work unit; omitted uses next_work_unit. "
                                                 "Mutually exclusive with milestone_id."},
+                   "project": {"type": "string", "default": "",
+                               "description": f"project slug (Phase 3); empty preserves existing on re-propose, "
+                                              f"defaults to {DEFAULT_PROJECT!r} for new milestones. "
+                                              f"Same semantics as propose_milestone_from_work_unit; "
+                                              f"ignored in milestone_id mode (the existing milestone's "
+                                              f"project is preserved)."},
                    "review_terms": {"type": "string", "default": "AutoGen,GRA"}},
                   since="0.10.0"),
             Skill("create_session_checkpoint",
