@@ -804,6 +804,82 @@ async def test_work_units_title_prefix_groups_by_phase_letter(harness):
 
 
 @pytest.mark.asyncio
+async def test_work_units_title_prefix_regex_handles_relaxed_separators(harness):
+    """``_TITLE_PHASE_CODE_RE`` accepts colon-without-space, dash, and
+    end-of-title (bare ``D7``) as the separator after the digits —
+    not just whitespace. Regression guard for PR #68 review pass-1
+    finding 1: the original regex required trailing ``\\s`` and
+    silently bucketed ``A1:bootstrap_judge`` and ``D7`` (no
+    separator) into the uncoded fallback, defeating title_prefix
+    clustering for authors who don't put a space after the colon.
+    """
+    cases = [
+        ("A1: with space",       "A"),
+        ("A2:no_space",          "A"),  # colon, no space
+        ("B1 - dash separator",  "B"),  # space-dash-space
+        ("C7",                   "C"),  # bare letter+digits, end of string
+    ]
+    for title, _phase in cases:
+        harness.agent.pipeline.frs.promote(
+            target="benchmark", title=title, description="x",
+            priority="high", concept="benchmark-agent",
+        )
+    result = await harness.call("work_units", {
+        "target": "benchmark",
+        "cluster_by": "title_prefix",
+    })
+    units = result["work_units"]
+    coded_phases = sorted(u["phase"] for u in units if "phase" in u)
+    assert coded_phases == ["A", "B", "C"], (
+        f"relaxed-separator titles didn't all parse as coded; got "
+        f"phases={coded_phases!r}, units={units!r}"
+    )
+    # No uncoded bucket should exist — every title here matched.
+    assert all("phase" in u for u in units), (
+        f"some title fell into uncoded bucket: "
+        f"{[u for u in units if 'phase' not in u]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_work_units_title_prefix_breaks_same_number_ties_by_fr_id(harness):
+    """Two FRs sharing the same phase number (e.g. both ``A1:``)
+    must order deterministically by ``fr_id``, not by insertion order
+    from ``frs.list()``. PR #68 review pass-1 finding 2: the
+    original sort key was ``(number,)`` only, so equal-number FRs
+    fell back to source order — a deterministic-contract violation.
+    """
+    harness.agent.pipeline.frs.promote(
+        target="benchmark", title="A1: first author",
+        description="A1-FIRST",
+        priority="high", concept="benchmark-agent",
+    )
+    harness.agent.pipeline.frs.promote(
+        target="benchmark", title="A1: second author",
+        description="A1-SECOND",
+        priority="high", concept="benchmark-agent",
+    )
+
+    result1 = await harness.call("work_units", {
+        "target": "benchmark", "cluster_by": "title_prefix", "max_frs": 10,
+    })
+    result2 = await harness.call("work_units", {
+        "target": "benchmark", "cluster_by": "title_prefix", "max_frs": 10,
+    })
+    a_unit_1 = next(u for u in result1["work_units"] if u.get("phase") == "A")
+    a_unit_2 = next(u for u in result2["work_units"] if u.get("phase") == "A")
+    # Same ordering on both calls (deterministic).
+    assert [fr["fr_id"] for fr in a_unit_1["frs"]] == [
+        fr["fr_id"] for fr in a_unit_2["frs"]
+    ], "title_prefix sort isn't deterministic on equal phase numbers"
+    # And specifically: ordering follows fr_id ascending.
+    fr_ids = [fr["fr_id"] for fr in a_unit_1["frs"]]
+    assert fr_ids == sorted(fr_ids), (
+        f"same-number FRs aren't sorted by fr_id; got {fr_ids!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_work_units_title_prefix_uncoded_fall_into_synthetic_bucket(harness):
     """FRs whose titles don't carry a leading phase code fall into a
     synthetic last bucket that slices alphabetically per the legacy

@@ -4465,12 +4465,16 @@ _WORK_UNIT_CLUSTER_STRATEGIES = frozenset({"alpha", "title_prefix"})
 
 # Match a leading phase code at the start of an FR title:
 # ``A1: bootstrap_judge`` → letter ``A``, number ``1``.
-# ``B12 - more text`` and ``C5: blah`` both work; the colon / space /
-# dash separator is permissive so authors don't have to settle on one
-# format. FRs without a code fall into a synthetic ``_uncoded``
-# cluster that slices alphabetically per the legacy behavior, so
-# mixed batches (some coded, some not) still render correctly.
-_TITLE_PHASE_CODE_RE = re.compile(r"^\s*([A-Z])(\d+)\s*[:\-]?\s")
+# ``B12 - more text``, ``C5:blah`` (no space after colon), and bare
+# ``D7`` at end-of-title all work; the separator after the digits is
+# permissive (colon, dash, space, or end-of-string) so authors don't
+# have to settle on one format. FRs without a code fall into a
+# synthetic ``_uncoded`` cluster that slices alphabetically per the
+# legacy behavior, so mixed batches (some coded, some not) still
+# render correctly. PR #68 review pass-1 relaxed the previous
+# trailing-``\s`` requirement that missed ``A1:bootstrap_judge``
+# and bare ``D7`` titles.
+_TITLE_PHASE_CODE_RE = re.compile(r"^\s*([A-Z])(\d+)(?:[\s:\-]|$)")
 
 
 def _phase_code(fr) -> tuple[str, int] | None:
@@ -4580,38 +4584,58 @@ def _work_units_from_local_frs(
         group = groups[(target, concept)]
         title_concept = concept if concept != "general" else "general"
         if cluster_by == "title_prefix":
-            phase_groups: dict[str, list] = {}
+            # Cache each fr's phase code once: ``_phase_code`` is a
+            # regex match per call, so calling it from a sort-key
+            # lambda re-runs the regex N log N times. Pre-compute and
+            # carry the parsed ``(letter, number)`` alongside the fr
+            # so both the bucketing and the within-phase sort key
+            # read the same cached value. PR #68 review pass-1.
+            coded_groups: dict[str, list[tuple[int, str, Any]]] = {}
+            uncoded: list = []
             for fr in group:
                 code = _phase_code(fr)
                 if code is None:
-                    phase_groups.setdefault("_uncoded", []).append(fr)
+                    uncoded.append(fr)
                 else:
-                    phase_groups.setdefault(code[0], []).append(fr)
+                    letter, number = code
+                    # Triple is ``(number, fr_id, fr)`` — number is
+                    # the primary sort key (A1 before A2 before A10),
+                    # fr_id is the deterministic tie-breaker for two
+                    # FRs sharing the same phase number (e.g. both
+                    # ``A1:`` from independent authors), and fr is
+                    # the payload we hand back to the chunker. PR
+                    # #68 review pass-1 finding 2: without the fr_id
+                    # tie-breaker, same-number FRs fell back to
+                    # ``frs.list()`` insertion order, which the
+                    # function's "deterministic work units" contract
+                    # explicitly forbids.
+                    coded_groups.setdefault(letter, []).append((number, fr.id, fr))
             # Coded phases first (letter order), then uncoded fall-through.
-            ordered_phases = sorted(p for p in phase_groups if p != "_uncoded")
-            if "_uncoded" in phase_groups:
-                ordered_phases.append("_uncoded")
+            ordered_phases = sorted(coded_groups)
             for phase in ordered_phases:
-                phase_group = phase_groups[phase]
-                if phase == "_uncoded":
-                    # Same alpha sort as legacy behavior — uncoded FRs
-                    # in a title_prefix batch keep their pre-existing
-                    # ordering rather than sneaking ahead of coded phases.
-                    phase_group = sorted(phase_group, key=lambda fr: fr.id)
-                else:
-                    # Sort within a coded phase by the numeric suffix
-                    # so A1, A2, A10 land in author-intended order.
-                    phase_group = sorted(
-                        phase_group,
-                        key=lambda fr: (_phase_code(fr) or ("", 0))[1],
-                    )
+                phase_group = [
+                    triple[2]
+                    for triple in sorted(coded_groups[phase])
+                ]
                 _emit_work_unit_chunks(
                     units,
                     phase_group,
                     target=target,
                     concept=title_concept,
                     max_size=max_size,
-                    phase=None if phase == "_uncoded" else phase,
+                    phase=phase,
+                )
+            if uncoded:
+                # Same alpha sort as legacy behavior — uncoded FRs
+                # in a title_prefix batch keep their pre-existing
+                # ordering rather than sneaking ahead of coded phases.
+                _emit_work_unit_chunks(
+                    units,
+                    sorted(uncoded, key=lambda fr: fr.id),
+                    target=target,
+                    concept=title_concept,
+                    max_size=max_size,
+                    phase=None,
                 )
         else:
             alpha_group = sorted(group, key=lambda fr: fr.id)
