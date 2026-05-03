@@ -3063,15 +3063,18 @@ class DeveloperAgent(BaseAgent):
         if milestone_id:
             milestone = self.pipeline.milestones.get(milestone_id)
             if milestone is None:
+                # Plain id (no ``!r``) so the wire format matches
+                # ``handle_get_milestone`` and the rest of the
+                # milestone-handler family. PR #66 review pass-2.
                 return {
                     "fr": None,
-                    "reason": f"unknown milestone id: {milestone_id!r}",
+                    "reason": f"unknown milestone id: {milestone_id}",
                 }
             fr_id_set = set(milestone.fr_ids)
             if not fr_id_set:
                 return {
                     "fr": None,
-                    "reason": f"milestone {milestone_id!r} has no FRs in its bundle",
+                    "reason": f"milestone {milestone_id} has no FRs in its bundle",
                 }
         fr = self.pipeline.frs.next_fr(
             target=target,

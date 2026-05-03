@@ -2832,16 +2832,22 @@ async def test_next_fr_local_filters_by_concept(harness):
         "target": "developer", "title": "unrelated", "description": "y",
         "priority": "high", "concept": "review-cycle-qol",
     })
-    # No filter → could pick either; with concept filter, only the
-    # matching concept's FR can win.
+    # With the concept filter, only the matching concept's FR can win.
     scoped = await harness.call("next_fr_local", {"concept": "benchmark-agent"})
     assert scoped["fr"] is not None
     assert scoped["fr"]["id"] == bench_a["fr_id"]
-    # Empty concept = all concepts; sanity that the new arg defaults
-    # to the existing behavior.
+    # Empty concept = all concepts; ``FRStore.next_fr`` is
+    # deterministic (priority desc, then ``created_at`` ascending)
+    # so the unscoped call returns ``bench_a`` here — it was
+    # promoted first and both candidates share priority="high".
+    # Asserting the deterministic outcome rather than "either" so
+    # a future ordering regression actually fails the test.
     unscoped = await harness.call("next_fr_local", {})
     assert unscoped["fr"] is not None
-    assert unscoped["fr"]["id"] in (bench_a["fr_id"], other["fr_id"])
+    assert unscoped["fr"]["id"] == bench_a["fr_id"], (
+        "tie-break on (high, oldest created_at) should land on "
+        f"bench_a, got {unscoped['fr']['id']!r}"
+    )
 
 
 @pytest.mark.asyncio
