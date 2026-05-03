@@ -785,6 +785,54 @@ class FRStore:
         self._store(fr)
         return fr
 
+    def _filter_scope(
+        self,
+        *,
+        target: Optional[str] = None,
+        project: Optional[str] = None,
+        concept: Optional[str] = None,
+        fr_id_set: Optional[set[str]] = None,
+    ):
+        """Yield FRs matching ``(target, project, concept, fr_id_set)``,
+        independent of readiness (status + deps). Shared between
+        :meth:`next_fr` and :meth:`count_in_scope` so the scope-filter
+        rules can't drift between "is this FR a candidate?" and
+        "does this FR exist in the scope at all?". PR #66 review
+        pass-4.
+        """
+        target_norm = target or None
+        concept_norm = (concept or "").strip() or None
+        for fr in self.list(include_all=True, project=project):
+            if target_norm and fr.target != target_norm:
+                continue
+            if concept_norm and (fr.concept or "").strip() != concept_norm:
+                continue
+            if fr_id_set is not None and fr.id not in fr_id_set:
+                continue
+            yield fr
+
+    def count_in_scope(
+        self,
+        *,
+        target: Optional[str] = None,
+        project: Optional[str] = None,
+        concept: Optional[str] = None,
+        fr_id_set: Optional[set[str]] = None,
+    ) -> int:
+        """Count how many FRs match a scope, ignoring readiness.
+
+        ``next_fr`` filters by status + dep readiness; this helper
+        applies only the same scope filters (target, project,
+        concept, fr_id_set) so callers can disambiguate "scope is
+        empty" from "scope has FRs but none are ready". Used by
+        ``handle_next_fr_local`` on the empty-result path to
+        produce a better-tailored failure reason. PR #66 review
+        pass-4.
+        """
+        return sum(1 for _ in self._filter_scope(
+            target=target, project=project, concept=concept, fr_id_set=fr_id_set,
+        ))
+
     def next_fr(
         self,
         *,
@@ -822,17 +870,14 @@ class FRStore:
         ``handle_next_fr_local`` skill resolves this from a
         ``milestone_id`` arg.
         """
-        target_norm = target or None
-        concept_norm = (concept or "").strip() or None
+        # Scope filter is shared with ``count_in_scope`` so the two
+        # methods can't drift on what "in this scope" means; the
+        # readiness checks (status + deps) layer on top here.
         candidates = []
-        for fr in self.list(include_all=True, project=project):
+        for fr in self._filter_scope(
+            target=target, project=project, concept=concept, fr_id_set=fr_id_set,
+        ):
             if fr.status not in (FR_STATUS_OPEN, FR_STATUS_PLANNED):
-                continue
-            if target_norm and fr.target != target_norm:
-                continue
-            if concept_norm and (fr.concept or "").strip() != concept_norm:
-                continue
-            if fr_id_set is not None and fr.id not in fr_id_set:
                 continue
             if not self._deps_unblocked(fr):
                 continue

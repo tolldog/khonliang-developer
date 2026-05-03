@@ -3100,12 +3100,31 @@ class DeveloperAgent(BaseAgent):
             if milestone_id:
                 scope.append(f"milestone_id={milestone_id!r}")
             scope_text = f" within {', '.join(scope)}" if scope else ""
+            # Distinguish "no FRs match the scope at all" from "scope
+            # has FRs but none are ready (in-progress, blocked, or
+            # terminal)". A scope-fragment-only filter (e.g.
+            # ``concept='no-such-concept'``) would otherwise inherit
+            # the "all blocked/terminal" tail and mislead the caller
+            # into thinking deps were the gate. Run a second-pass
+            # scope-only count on the empty-result path; the cost is
+            # bounded since this path is already the failure case.
+            # PR #66 review pass-4.
+            in_scope_count = self.pipeline.frs.count_in_scope(
+                target=target,
+                project=project,
+                concept=concept,
+                fr_id_set=fr_id_set,
+            )
+            if in_scope_count == 0:
+                tail = "(no FRs match this scope)"
+            else:
+                tail = (
+                    f"({in_scope_count} FR(s) match scope but none are ready — "
+                    f"all in-progress, blocked, or terminal)"
+                )
             return {
                 "fr": None,
-                "reason": (
-                    f"no ready FRs{scope_text} "
-                    "(all in-progress, blocked, or terminal)"
-                ),
+                "reason": f"no ready FRs{scope_text} {tail}",
             }
         return {"fr": fr.to_public_dict()}
 

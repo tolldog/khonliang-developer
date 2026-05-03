@@ -2917,6 +2917,39 @@ async def test_next_fr_local_no_ready_reason_includes_active_scope(harness):
 
 
 @pytest.mark.asyncio
+async def test_next_fr_local_distinguishes_empty_scope_from_unready(harness):
+    """The empty-result reason distinguishes "no FRs match scope"
+    from "FRs match scope but none are ready (in-progress, blocked,
+    terminal)". Without this split, a scope that excludes every FR
+    would still inherit the misleading "all blocked/terminal" tail.
+    PR #66 review pass-4 finding."""
+    # Case 1: scope excludes all FRs → "no FRs match this scope".
+    empty_scope = await harness.call("next_fr_local", {
+        "target": "benchmark",
+        "concept": "no-such-concept",
+    })
+    assert empty_scope["fr"] is None
+    assert "no FRs match this scope" in empty_scope["reason"], empty_scope["reason"]
+
+    # Case 2: scope has FRs but none are ready (all in-progress).
+    # Promote one FR, transition it to in_progress so the readiness
+    # check fails on the only candidate.
+    fr = await harness.call("promote_fr", {
+        "target": "developer", "title": "in-progress only",
+        "description": "x", "priority": "high", "concept": "exhausted-lane",
+    })
+    harness.agent.pipeline.frs.update_status(fr["fr_id"], "in_progress")
+    unready = await harness.call("next_fr_local", {
+        "concept": "exhausted-lane",
+    })
+    assert unready["fr"] is None
+    reason = unready["reason"]
+    assert "no FRs match this scope" not in reason, reason
+    assert "1 FR(s) match scope but none are ready" in reason, reason
+    assert "in-progress, blocked, or terminal" in reason, reason
+
+
+@pytest.mark.asyncio
 async def test_next_fr_local_normalizes_padded_target_arg(harness):
     """``target=' developer '`` (whitespace-padded by an upstream
     serializer) must match a stored target rather than silently
