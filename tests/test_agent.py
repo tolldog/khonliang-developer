@@ -173,6 +173,50 @@ def test_milestone_lifecycle_skills(harness):
     harness.assert_skill_exists("delete_milestone", description="delete")
 
 
+def test_milestone_creation_skills_document_response_shape(harness):
+    """Milestone-creation skills nest the new id under
+    ``result.milestone.id`` rather than at the top level — the dogfood
+    finding that promoted ``fr_developer_9cbbccfc`` was a caller
+    guessing ``result.id`` / ``result.milestone_id`` and getting
+    ``None`` for 11 milestones in a row before dumping the raw
+    response. Until ``Skill.output_contract.schema`` is plumbed
+    through the bus-lib ``handle_help`` aspect surface, the response
+    shape lives inline in each skill's ``description`` so callers
+    reading ``developer.help(skill_names=[...], aspect='help')`` see
+    the canonical key path alongside the parameters list. This guard
+    asserts the cited skills carry the documented shape so the doc
+    can't drift away from the implementation. PR for
+    ``fr_developer_9cbbccfc``.
+    """
+    skills_by_name = {s.name: s for s in harness.agent.register_skills()}
+
+    # The original dogfood example: the caller's batch script tried
+    # `result.get('milestone_id') or result.get('id') or
+    # result.get('ms_id')` and got '?' for 11 milestones until the
+    # raw shape was dumped. The doc string MUST mention
+    # `result.milestone.id` so the next caller doesn't repeat the
+    # round-trip.
+    propose = skills_by_name["propose_milestone_from_work_unit"].description
+    assert "result.milestone.id" in propose, propose
+    assert "Returns" in propose, propose
+
+    handoff = skills_by_name["prepare_development_handoff"].description
+    assert "result.milestone.id" in handoff, handoff
+    # `prepare_development_handoff` returns a richer envelope; its
+    # doc should also mention the top-level keys callers route on
+    # (status, draft_spec) so they don't have to discover those by
+    # inspecting a sample response either.
+    assert "status" in handoff
+    assert "draft_spec" in handoff
+
+    supersede = skills_by_name["supersede_milestone"].description
+    assert "result.milestone" in supersede, supersede
+    # The superseding milestone id appears at
+    # ``result.milestone.superseded_by``; the doc should call that
+    # out so callers don't have to chase it.
+    assert "superseded_by" in supersede
+
+
 def test_session_checkpoint_skills(harness):
     harness.assert_skill_exists("create_session_checkpoint", description="checkpoint")
     harness.assert_skill_exists("resume_session_checkpoint", description="launch briefing")
