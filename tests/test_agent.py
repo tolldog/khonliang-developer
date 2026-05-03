@@ -1772,6 +1772,92 @@ async def test_prepare_development_handoff_from_top_work_unit(harness):
 
 
 @pytest.mark.asyncio
+async def test_prepare_development_handoff_skill_declares_project_arg(harness):
+    """The handler reads ``project`` from args and forwards it to
+    ``propose_from_work_unit``, but the published Skill schema must
+    also declare it so MCP function-calling clients can discover the
+    option. Regression guard for PR #67 review pass-1 finding (handler
+    accepted ``project`` since pass-9 of the parent fr_developer_3763aaf3
+    PR but the schema lagged).
+    """
+    skills_by_name = {s.name: s for s in harness.agent.register_skills()}
+    handoff = skills_by_name["prepare_development_handoff"]
+    assert "project" in handoff.parameters, (
+        f"prepare_development_handoff schema doesn't declare 'project' arg "
+        f"despite the handler accepting it; declared keys: "
+        f"{list(handoff.parameters)}"
+    )
+
+
+async def test_prepare_development_handoff_attaches_to_existing_milestone(harness):
+    """``milestone_id`` mode: prepare_development_handoff resolves an
+    existing milestone and reuses its persisted work_unit instead of
+    creating a duplicate via propose_from_work_unit. Closes
+    ``fr_developer_9f179e61`` dogfood: previously, calling
+    propose_milestone_from_work_unit + prepare_development_handoff
+    with the same logical cluster produced two milestones with the
+    same FR list under different ids.
+    """
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="t", description="t", priority="high",
+    )
+    work_unit = json.dumps({
+        "name": "use-existing test cluster",
+        "targets": ["developer"],
+        "frs": [{"fr_id": fr.id, "description": "t", "priority": "high"}],
+    })
+    proposed = await harness.call("propose_milestone_from_work_unit", {
+        "work_unit": work_unit,
+        "title": "use-existing test",
+    })
+    ms_id = proposed["milestone"]["id"]
+
+    handoff = await harness.call("prepare_development_handoff", {
+        "milestone_id": ms_id,
+    })
+    assert handoff["milestone"]["id"] == ms_id, (
+        "use-existing handoff returned a different milestone id "
+        f"({handoff['milestone']['id']!r}) — duplicate-milestone bug "
+        "regressed; expected exactly the milestone passed via "
+        f"milestone_id ({ms_id!r})"
+    )
+    assert handoff["source"] == "existing_milestone", handoff
+    # The work_unit echoed back is the milestone's persisted shape.
+    assert handoff["work_unit"]["frs"][0]["fr_id"] == fr.id
+
+
+@pytest.mark.asyncio
+async def test_prepare_development_handoff_rejects_milestone_id_with_work_unit(harness):
+    """Passing both ``milestone_id`` and ``work_unit`` is ambiguous —
+    the handler refuses with a caller-actionable error rather than
+    silently picking one path. fr_developer_9f179e61."""
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="t2", description="t2", priority="high",
+    )
+    work_unit = json.dumps({
+        "name": "ambiguous", "targets": ["developer"],
+        "frs": [{"fr_id": fr.id, "description": "t2", "priority": "high"}],
+    })
+    result = await harness.call("prepare_development_handoff", {
+        "milestone_id": "ms_developer_anything",
+        "work_unit": work_unit,
+    })
+    assert "error" in result
+    assert "mutually exclusive" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_development_handoff_unknown_milestone_id_returns_error(harness):
+    """An unknown milestone_id surfaces an actionable error; the handler
+    doesn't fall through to auto-propose. fr_developer_9f179e61."""
+    result = await harness.call("prepare_development_handoff", {
+        "milestone_id": "ms_developer_does_not_exist",
+    })
+    assert "error" in result
+    assert "unknown milestone id" in result["error"]
+
+
+@pytest.mark.asyncio
 async def test_prepare_development_handoff_flags_review_terms(harness):
     work_unit = """{
       "name": "Cluster 9 (1 FR, targets: developer)",

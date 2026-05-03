@@ -523,7 +523,13 @@ class DeveloperAgent(BaseAgent):
                    "apply": {"type": "boolean", "default": False}},
                   since="0.10.0"),
             Skill("prepare_development_handoff",
-                  "Return a compact bundle → milestone → draft spec handoff for implementation. "
+                  "Return a compact bundle → milestone → draft spec handoff "
+                  "for implementation. Three modes: pass ``milestone_id`` to "
+                  "attach to an existing milestone (use-existing — does NOT "
+                  "create a duplicate); pass ``work_unit`` to propose / "
+                  "re-propose from JSON; or omit both to auto-pick the "
+                  "top-ranked next_work_unit. ``milestone_id`` and "
+                  "``work_unit`` are mutually exclusive. "
                   "Returns ``{status: 'ready'|'needs_review', source, "
                   "milestone: {id, ...}, work_unit, scope_review, draft_spec, "
                   "suggested_next_actions, [remaining_work_units]}``; the new "
@@ -533,8 +539,19 @@ class DeveloperAgent(BaseAgent):
                   {"target": {"type": "string", "default": ""},
                    "title": {"type": "string", "default": ""},
                    "summary": {"type": "string", "default": ""},
+                   "milestone_id": {"type": "string", "default": "",
+                                    "description": "use an existing milestone instead of "
+                                                   "proposing a new one (fr_developer_9f179e61). "
+                                                   "Mutually exclusive with work_unit."},
                    "work_unit": {"type": "string", "default": "",
-                                 "description": "optional JSON work unit; omitted uses next_work_unit"},
+                                 "description": "optional JSON work unit; omitted uses next_work_unit. "
+                                                "Mutually exclusive with milestone_id."},
+                   "project": {"type": "string", "default": "",
+                               "description": f"project slug (Phase 3); empty preserves existing on re-propose, "
+                                              f"defaults to {DEFAULT_PROJECT!r} for new milestones. "
+                                              f"Same semantics as propose_milestone_from_work_unit; "
+                                              f"ignored in milestone_id mode (the existing milestone's "
+                                              f"project is preserved)."},
                    "review_terms": {"type": "string", "default": "AutoGen,GRA"}},
                   since="0.10.0"),
             Skill("create_session_checkpoint",
@@ -2345,48 +2362,100 @@ class DeveloperAgent(BaseAgent):
         from developer.milestone_store import MilestoneError
 
         try:
-            work_unit = _parse_work_unit_arg(args.get("work_unit"))
+            # Three-mode dispatch on the caller's intent:
+            #
+            # - ``milestone_id`` set (and non-empty) → use-existing
+            #   mode. Resolve the milestone, reuse its persisted
+            #   ``work_unit``, skip ``propose_from_work_unit``. Closes
+            #   ``fr_developer_9f179e61`` dogfood: previously,
+            #   ``prepare_development_handoff`` always called
+            #   ``propose_from_work_unit`` so a caller already in
+            #   possession of a milestone got a duplicate
+            #   ``ms_*_<other_hash>`` row instead of a handoff against
+            #   the original.
+            # - ``work_unit`` set → caller-supplied work unit; propose
+            #   a (possibly-new) milestone from it. Pre-existing
+            #   behavior; ``propose_from_work_unit`` is itself
+            #   idempotent on (target, title, fr_ids), so re-handoff
+            #   with the same payload lands on the same id.
+            # - Neither → auto-pick via ``handle_next_work_unit``.
+            #
+            # Combining ``milestone_id`` and ``work_unit`` is ambiguous
+            # (which view of the bundle wins?), so the use-existing
+            # branch refuses if both are set; the caller must pick.
+            milestone_id_raw = str(args.get("milestone_id") or "").strip()
+            inline_work_unit_raw = str(args.get("work_unit") or "").strip()
+            if milestone_id_raw and inline_work_unit_raw:
+                return {
+                    "error": (
+                        "milestone_id and work_unit are mutually exclusive "
+                        "(use milestone_id to attach to an existing "
+                        "milestone, work_unit to create or re-propose one)"
+                    )
+                }
+
+            milestone = None
+            work_unit: dict[str, Any] = {}
             source = "provided_work_unit"
             remaining = None
-            if not work_unit:
-                next_result = await self.handle_next_work_unit(args)
-                if "error" in next_result:
-                    return next_result
-                work_unit = next_result.get("work_unit") or {}
-                source = next_result.get("source", "work_unit")
-                remaining = next_result.get("remaining")
-
-            # Same sidecar build + preserve-on-empty contract as
-            # propose_milestone_from_work_unit; see that handler for
-            # the persistence-vs-render rationale and the pass-6
-            # ``None``-when-empty preservation guard. PR #64 review
-            # pass-4 finding 1 + pass-5 finding 1 + pass-6 finding 1.
-            fr_descriptions = _build_fr_descriptions_map(
-                work_unit, self.pipeline.frs
-            )
-            fr_descriptions_arg = fr_descriptions if fr_descriptions else None
-
-            # Forward the caller's ``project`` arg through to
-            # ``propose_from_work_unit`` so a handoff for a non-default
-            # project lands the milestone under that project rather
-            # than the previously-stored or DEFAULT_PROJECT slug.
-            # Same pass-through semantics as
-            # ``handle_propose_milestone_from_work_unit``: empty / None
-            # → preserve existing or default; explicit slug overrides.
-            # PR #64 review pass-9 suppressed-low-confidence finding.
-            handoff_project_raw = str(args.get("project") or "").strip()
-            handoff_project = handoff_project_raw or None
-
-            milestone = self.pipeline.milestones.propose_from_work_unit(
-                work_unit,
-                fr_descriptions=fr_descriptions_arg,
-                target=args.get("target", ""),
-                title=args.get("title", ""),
-                summary=args.get("summary", ""),
-                source=source,
-                project=handoff_project,
-            )
             review_terms = _parse_paths(args.get("review_terms", "AutoGen,GRA"))
+
+            if milestone_id_raw:
+                # Use-existing mode: resolve the milestone, reuse its
+                # persisted work_unit verbatim. No new propose, no new
+                # id, no fr_store re-enrichment (the milestone already
+                # carries its ``fr_descriptions`` sidecar).
+                milestone = self.pipeline.milestones.get(milestone_id_raw)
+                if milestone is None:
+                    return {
+                        "error": (
+                            f"unknown milestone id: {milestone_id_raw!r} "
+                            "(use a milestone id from list_milestones, or "
+                            "drop milestone_id to propose a new one from a "
+                            "work_unit)"
+                        )
+                    }
+                work_unit = dict(milestone.work_unit or {})
+                source = "existing_milestone"
+            else:
+                work_unit = _parse_work_unit_arg(args.get("work_unit"))
+                if not work_unit:
+                    next_result = await self.handle_next_work_unit(args)
+                    if "error" in next_result:
+                        return next_result
+                    work_unit = next_result.get("work_unit") or {}
+                    source = next_result.get("source", "work_unit")
+                    remaining = next_result.get("remaining")
+
+                # Same sidecar build + preserve-on-empty contract as
+                # propose_milestone_from_work_unit; see that handler for
+                # the persistence-vs-render rationale and the pass-6
+                # ``None``-when-empty preservation guard. PR #64 review
+                # pass-4 finding 1 + pass-5 finding 1 + pass-6 finding 1.
+                fr_descriptions = _build_fr_descriptions_map(
+                    work_unit, self.pipeline.frs
+                )
+                fr_descriptions_arg = fr_descriptions if fr_descriptions else None
+
+                # Forward the caller's ``project`` arg through to
+                # ``propose_from_work_unit`` so a handoff for a
+                # non-default project lands the milestone under that
+                # project rather than the previously-stored or
+                # DEFAULT_PROJECT slug. PR #64 review pass-9
+                # suppressed-low-confidence finding.
+                handoff_project_raw = str(args.get("project") or "").strip()
+                handoff_project = handoff_project_raw or None
+
+                milestone = self.pipeline.milestones.propose_from_work_unit(
+                    work_unit,
+                    fr_descriptions=fr_descriptions_arg,
+                    target=args.get("target", ""),
+                    title=args.get("title", ""),
+                    summary=args.get("summary", ""),
+                    source=source,
+                    project=handoff_project,
+                )
+
             review = self.pipeline.milestones.review_scope(
                 milestone.id,
                 review_terms=review_terms,
