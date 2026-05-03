@@ -801,17 +801,23 @@ class FRStore:
         pass-4.
 
         Whitespace normalization is centralized here: ``target`` and
-        ``concept`` both go through ``str(value or "").strip() or None``
+        ``concept`` both go through an ``is None``-guarded coercion
+        (``None`` → ``None``; otherwise ``str(value).strip() or None``)
         so a padded value like ``" developer "`` matches a stored
-        target. Callers don't have to replicate the normalization,
-        and a future scope-using path (or a direct ``next_fr``
-        consumer) gets the same forgiving behavior. ``target`` and
-        ``concept`` are typed ``Optional[Any]`` rather than
-        ``Optional[str]`` because the ``str(...)`` coercion is
-        deliberate (an internal caller passing an int / Path / etc.
-        gets stringified, not crashed); narrowing back to
-        ``Optional[str]`` would lie about the supported input shape.
-        PR #66 review pass-6 + pass-8.
+        target while a falsy-but-meaningful value like ``0`` /
+        ``False`` filters on its string form (``"0"`` / ``"False"``)
+        rather than collapsing to "no filter". The earlier
+        ``str(value or "").strip()`` form had that collapse-on-falsy
+        bug — see PR #66 review pass-9 for the regression. Callers
+        don't have to replicate the normalization, and a future
+        scope-using path (or a direct ``next_fr`` consumer) gets the
+        same forgiving behavior. ``target`` and ``concept`` are typed
+        ``Optional[Any]`` rather than ``Optional[str]`` because the
+        ``str(...)`` coercion is deliberate (an internal caller
+        passing an int / Path / etc. gets stringified, not crashed);
+        narrowing back to ``Optional[str]`` would lie about the
+        supported input shape. PR #66 review pass-6 + pass-8 +
+        pass-9 + pass-10.
         """
         # ``"" if value is None else str(value)`` — coerces non-string
         # inputs (an internal caller passing an int / Path / etc.)
