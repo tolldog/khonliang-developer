@@ -268,6 +268,7 @@ class FRStore:
         status: Optional[str] = None,
         include_all: bool = False,
         project: Optional[str] = None,
+        sort: bool = True,
     ) -> list[FR]:
         """List FRs in the store.
 
@@ -281,6 +282,13 @@ class FRStore:
         strings normalize to :data:`DEFAULT_PROJECT` — matches writer
         normalization and avoids bus/CLI defaults (where ``""`` is
         common) silently bypassing the filter.
+
+        ``sort=False`` skips the priority+created_at sort. Callers
+        that don't need ordered output (counting, scope-only filters,
+        ``_filter_scope`` consumers) can opt out so the empty-result
+        path of ``next_fr_local`` doesn't pay for an extra full-list
+        sort on top of the sort ``next_fr`` already did. PR #66
+        review pass-11 finding 2.
         """
         # Normalize the project filter once, up front. `None` means
         # "all projects"; anything else routes through the shared
@@ -305,9 +313,10 @@ class FRStore:
             elif not include_all and fr.status not in ACTIVE_STATUSES:
                 continue
             frs.append(fr)
-        # Stable ordering — priority (high, medium, low) then created_at asc
-        priority_order = {"high": 0, "medium": 1, "low": 2}
-        frs.sort(key=lambda f: (priority_order.get(f.priority, 99), f.created_at))
+        if sort:
+            # Stable ordering — priority (high, medium, low) then created_at asc
+            priority_order = {"high": 0, "medium": 1, "low": 2}
+            frs.sort(key=lambda f: (priority_order.get(f.priority, 99), f.created_at))
         return frs
 
     # ------------------------------------------------------------------
@@ -785,11 +794,112 @@ class FRStore:
         self._store(fr)
         return fr
 
+    def _filter_scope(
+        self,
+        *,
+        target: Optional[Any] = None,
+        project: Optional[str] = None,
+        concept: Optional[Any] = None,
+        fr_id_set: Optional[set[str]] = None,
+    ):
+        """Yield FRs matching ``(target, project, concept, fr_id_set)``,
+        independent of readiness (status + deps). Shared between
+        :meth:`next_fr` and :meth:`count_in_scope` so the scope-filter
+        rules can't drift between "is this FR a candidate?" and
+        "does this FR exist in the scope at all?". PR #66 review
+        pass-4.
+
+        Whitespace normalization is centralized here: ``target`` and
+        ``concept`` both go through an ``is None``-guarded coercion
+        (``None`` → ``None``; otherwise ``str(value).strip() or None``)
+        so a padded value like ``" developer "`` matches a stored
+        target while a falsy-but-meaningful value like ``0`` /
+        ``False`` filters on its string form (``"0"`` / ``"False"``)
+        rather than collapsing to "no filter". The earlier
+        ``str(value or "").strip()`` form had that collapse-on-falsy
+        bug — see PR #66 review pass-9 for the regression. Callers
+        don't have to replicate the normalization, and a future
+        scope-using path (or a direct ``next_fr`` consumer) gets the
+        same forgiving behavior. ``target`` and ``concept`` are typed
+        ``Optional[Any]`` rather than ``Optional[str]`` because the
+        ``str(...)`` coercion is deliberate (an internal caller
+        passing an int / Path / etc. gets stringified, not crashed);
+        narrowing back to ``Optional[str]`` would lie about the
+        supported input shape. PR #66 review pass-6 + pass-8 +
+        pass-9 + pass-10.
+        """
+        # ``"" if value is None else str(value)`` — coerces non-string
+        # inputs (an internal caller passing an int / Path / etc.)
+        # via ``str(...)`` rather than crashing with AttributeError on
+        # the bare ``.strip()`` call. The ``is None``-guarded form
+        # (instead of ``value or ""``) preserves falsy-but-meaningful
+        # values like ``0`` / ``False`` — which would otherwise
+        # collapse to ``""`` and silently drop the filter, matching
+        # neither the str-coercion contract nor the test that passes
+        # ``target=123`` (whose stored target is the literal string
+        # ``"123"``, but a hypothetical caller passing ``0`` would
+        # similarly expect a filter on the string ``"0"``). PR #66
+        # review pass-7 + pass-9.
+        def _coerce(value):
+            if value is None:
+                return None
+            stripped = str(value).strip()
+            return stripped or None
+
+        target_norm = _coerce(target)
+        concept_norm = _coerce(concept)
+        # Push the target filter down to ``self.list()`` so when a
+        # target is set we don't scan + sort FRs that can't match in
+        # Python. ``list()`` already supports the same str-typed
+        # filter; pass the normalized form to keep matching uniform.
+        # ``sort=False`` because no consumer of ``_filter_scope``
+        # needs ordered output: ``count_in_scope`` only counts, and
+        # ``next_fr`` does its own priority+created_at sort over the
+        # subset of candidates that pass the readiness check. Saves
+        # the second full-list sort on the empty-result path of
+        # ``next_fr_local``. PR #66 review pass-9 finding 3 +
+        # pass-11 finding 2.
+        for fr in self.list(
+            include_all=True,
+            project=project,
+            target=target_norm,
+            sort=False,
+        ):
+            if concept_norm and (fr.concept or "").strip() != concept_norm:
+                continue
+            if fr_id_set is not None and fr.id not in fr_id_set:
+                continue
+            yield fr
+
+    def count_in_scope(
+        self,
+        *,
+        target: Optional[Any] = None,
+        project: Optional[str] = None,
+        concept: Optional[Any] = None,
+        fr_id_set: Optional[set[str]] = None,
+    ) -> int:
+        """Count how many FRs match a scope, ignoring readiness.
+
+        ``next_fr`` filters by status + dep readiness; this helper
+        applies only the same scope filters (target, project,
+        concept, fr_id_set) so callers can disambiguate "scope is
+        empty" from "scope has FRs but none are ready". Used by
+        ``handle_next_fr_local`` on the empty-result path to
+        produce a better-tailored failure reason. PR #66 review
+        pass-4.
+        """
+        return sum(1 for _ in self._filter_scope(
+            target=target, project=project, concept=concept, fr_id_set=fr_id_set,
+        ))
+
     def next_fr(
         self,
         *,
-        target: Optional[str] = None,
+        target: Optional[Any] = None,
         project: Optional[str] = None,
+        concept: Optional[Any] = None,
+        fr_id_set: Optional[set[str]] = None,
     ) -> Optional[FR]:
         """Pick the highest-priority FR that's ready to work on.
 
@@ -807,12 +917,27 @@ class FRStore:
         ``project`` optionally restricts to a single project slug;
         None returns every project (cross-project view). Filtering is
         delegated to :meth:`list`, which normalizes the value.
+
+        ``concept`` optionally restricts to FRs whose ``concept`` field
+        matches exactly (whitespace-stripped). Closes the
+        ``fr_developer_39a58719`` dogfood gap: when actively building
+        one cluster, ``next_fr`` without this filter would surface
+        unrelated cross-project FRs — so callers had to manually
+        enumerate within their concept lane.
+
+        ``fr_id_set`` optionally restricts the search to a specific
+        set of FR ids — typically a milestone's bundle. The
+        ``handle_next_fr_local`` skill resolves this from a
+        ``milestone_id`` arg.
         """
+        # Scope filter is shared with ``count_in_scope`` so the two
+        # methods can't drift on what "in this scope" means; the
+        # readiness checks (status + deps) layer on top here.
         candidates = []
-        for fr in self.list(include_all=True, project=project):
+        for fr in self._filter_scope(
+            target=target, project=project, concept=concept, fr_id_set=fr_id_set,
+        ):
             if fr.status not in (FR_STATUS_OPEN, FR_STATUS_PLANNED):
-                continue
-            if target and fr.target != target:
                 continue
             if not self._deps_unblocked(fr):
                 continue

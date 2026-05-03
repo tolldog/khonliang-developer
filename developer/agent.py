@@ -704,10 +704,22 @@ class DeveloperAgent(BaseAgent):
                    "notes": {"type": "string", "default": ""}},
                   since="0.6.0"),
             Skill("next_fr_local", "Pick the highest-priority open/planned FR "
-                  "whose deps are completed. Returns null when nothing's ready.",
+                  "whose deps are completed. Always returns an object: "
+                  "``{fr: {id, ...}}`` on hit, "
+                  "``{fr: null, reason: ...}`` when no FR qualifies (the "
+                  "``reason`` carries the active scope so the caller knows "
+                  "which filters narrowed the search).",
                   {"target": {"type": "string", "default": ""},
                    "project": {"type": "string", "default": "",
-                               "description": "project slug to scope the search (Phase 3); empty returns all projects"}},
+                               "description": "project slug to scope the search (Phase 3); empty returns all projects"},
+                   "concept": {"type": "string", "default": "",
+                               "description": "concept tag to scope the search (fr_developer_39a58719); "
+                                              "empty returns all concepts. Useful when building one "
+                                              "cluster — bypasses unrelated cross-project FRs"},
+                   "milestone_id": {"type": "string", "default": "",
+                                    "description": "restrict search to FRs in this milestone's bundle "
+                                                   "(fr_developer_39a58719). Empty disables the filter; "
+                                                   "an unknown id returns ``{fr: null, reason: ...}``"}},
                   since="0.6.0"),
             # Native git operations (fr_developer_e778b9bf). Each takes a
             # `cwd` (repo path); destructive ops require explicit flags.
@@ -3036,14 +3048,105 @@ class DeveloperAgent(BaseAgent):
 
     @handler("next_fr_local")
     async def handle_next_fr_local(self, args):
-        target = args.get("target") or None
+        # Normalize each scope arg with an ``is None``-guarded
+        # str-coerce + strip. The ``or ""`` form would collapse
+        # falsy-but-meaningful values (``0``, ``False``) into
+        # ``""`` and silently drop the filter — bug seam Copilot
+        # called out on pass-9. ``None``-only-→-empty preserves the
+        # caller's intent for any other Python value, with
+        # ``str(...)`` matching the store-tier coercion contract.
+        # PR #66 review pass-3 + pass-9.
+        def _arg(name):
+            value = args.get(name)
+            if value is None:
+                return None
+            stripped = str(value).strip()
+            return stripped or None
+
+        target = _arg("target")
         # Phase 3 pass-through: empty project → None = all projects;
         # an explicit slug partitions the search.
-        project_raw = str(args.get("project") or "").strip()
-        project = project_raw or None
-        fr = self.pipeline.frs.next_fr(target=target, project=project)
+        project = _arg("project")
+        # fr_developer_39a58719 dogfood: concept + milestone_id scope
+        # filters so callers actively building one cluster don't get
+        # unrelated cross-project FRs surfaced.
+        concept = _arg("concept")
+        milestone_id = _arg("milestone_id") or ""
+        fr_id_set: Optional[set[str]] = None
+        if milestone_id:
+            milestone = self.pipeline.milestones.get(milestone_id)
+            if milestone is None:
+                # Plain id (no ``!r``) so the wire format matches
+                # ``handle_get_milestone`` and the rest of the
+                # milestone-handler family. PR #66 review pass-2.
+                return {
+                    "fr": None,
+                    "reason": f"unknown milestone id: {milestone_id}",
+                }
+            # Resolve each bundled id through the merge graph and
+            # carry BOTH the original and the resolved id in the set.
+            # Milestones store FR ids by their pre-merge form (so
+            # historical bundles stay stable even after FRs get
+            # merged); ``next_fr`` matches against ``fr.id``, which is
+            # always the post-merge / current id. Without resolution,
+            # a milestone whose source-FRs were merged into a new
+            # replacement would silently report "none ready" even when
+            # the open replacement is the obvious next step. PR #66
+            # review pass-5.
+            fr_id_set = set()
+            for stored_id in milestone.fr_ids:
+                fr_id_set.add(stored_id)
+                resolved_id = self.pipeline.frs.resolve_id(stored_id)
+                if resolved_id != stored_id:
+                    fr_id_set.add(resolved_id)
+            if not fr_id_set:
+                return {
+                    "fr": None,
+                    "reason": f"milestone {milestone_id} has no FRs in its bundle",
+                }
+        fr = self.pipeline.frs.next_fr(
+            target=target,
+            project=project,
+            concept=concept,
+            fr_id_set=fr_id_set,
+        )
         if fr is None:
-            return {"fr": None, "reason": "no ready FRs (all in-progress, blocked, or terminal)"}
+            scope = []
+            if target:
+                scope.append(f"target={target!r}")
+            if project:
+                scope.append(f"project={project!r}")
+            if concept:
+                scope.append(f"concept={concept!r}")
+            if milestone_id:
+                scope.append(f"milestone_id={milestone_id!r}")
+            scope_text = f" within {', '.join(scope)}" if scope else ""
+            # Distinguish "no FRs match the scope at all" from "scope
+            # has FRs but none are ready (in-progress, blocked, or
+            # terminal)". A scope-fragment-only filter (e.g.
+            # ``concept='no-such-concept'``) would otherwise inherit
+            # the "all blocked/terminal" tail and mislead the caller
+            # into thinking deps were the gate. Run a second-pass
+            # scope-only count on the empty-result path; the cost is
+            # bounded since this path is already the failure case.
+            # PR #66 review pass-4.
+            in_scope_count = self.pipeline.frs.count_in_scope(
+                target=target,
+                project=project,
+                concept=concept,
+                fr_id_set=fr_id_set,
+            )
+            if in_scope_count == 0:
+                tail = "(no FRs match this scope)"
+            else:
+                tail = (
+                    f"({in_scope_count} FR(s) match scope but none are ready — "
+                    f"all in-progress, blocked, or terminal)"
+                )
+            return {
+                "fr": None,
+                "reason": f"no ready FRs{scope_text} {tail}",
+            }
         return {"fr": fr.to_public_dict()}
 
     # -- native git operations (fr_developer_e778b9bf) --
