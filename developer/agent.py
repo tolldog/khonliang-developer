@@ -704,9 +704,11 @@ class DeveloperAgent(BaseAgent):
                    "notes": {"type": "string", "default": ""}},
                   since="0.6.0"),
             Skill("next_fr_local", "Pick the highest-priority open/planned FR "
-                  "whose deps are completed. Returns null when nothing's "
-                  "ready. Returns ``{fr: {id, ...}}`` on hit, "
-                  "``{fr: null, reason: ...}`` when no FR qualifies.",
+                  "whose deps are completed. Always returns an object: "
+                  "``{fr: {id, ...}}`` on hit, "
+                  "``{fr: null, reason: ...}`` when no FR qualifies (the "
+                  "``reason`` carries the active scope so the caller knows "
+                  "which filters narrowed the search).",
                   {"target": {"type": "string", "default": ""},
                    "project": {"type": "string", "default": "",
                                "description": "project slug to scope the search (Phase 3); empty returns all projects"},
