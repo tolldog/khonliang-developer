@@ -120,6 +120,60 @@ Prefer `run_tests` over raw pytest output in long LLM sessions. Raw logs should
 be stored as artifacts or files; the prompt should receive a compact failure
 summary and a reference.
 
+## PR Review Iteration Loop
+
+Captured 2026-05-03 from a 13+9-pass cross-vendor (Claude → Copilot)
+dogfood on khonliang-bus#28 + khonliang-researcher#37. Six gotchas
+must be true or each pass wastes round-trips.
+
+1. **Filter comments by `created_at`, not `commit_id`.** GitHub
+   re-anchors prior threads to the new HEAD when the target lines
+   are unchanged, so `commit_id == HEAD` returns every still-active
+   thread (~20 on a deep PR), not the 3-5 new ones from the latest
+   review. Use `select(.created_at > "<prior-push-time>")`.
+2. **Two API calls per pass, not one.** `pulls/N/comments` returns
+   inline-diff threads only. The PR-thread (where Copilot posts a
+   "nothing more to say" saturation message) lives at
+   `issues/N/comments`. Skipping the second call misses
+   saturation events entirely.
+3. **`gh api .../comments` does NOT paginate by default** — pass
+   `--paginate`. A deep PR with 17+ comments will silently truncate
+   to the first 30 otherwise.
+4. **Saturation has two shapes.** (a) The literal "nothing more to
+   say" issue-thread comment; (b) the same findings restated across
+   passes with no genuinely new ones (post-defer-receipt
+   restatements). Both signal admin-merge — but (b) requires that
+   you've actually filed the deferral receipts, not just promised to.
+5. **Verify deferral claims with file-evidence before merge.** If
+   you write "FR for X is already filed" in a PR comment, check
+   first. Use `file_bug` (NOT `draft_fr_from_request` — that
+   hallucinates scope at the time of writing) to capture a
+   verifiable `bug_id` at deferral time, then paste the id in the
+   PR thread response. Real-world failure: a pass-9 PR comment
+   claimed "FRs already filed" — none existed; cross-check at
+   pass-10 caught it; four `bug_*` ids filed retroactively before
+   admin-merge.
+6. **Bus-event filter axis** for `bus_wait_for_event`:
+   `response.event.payload.summary.{repo, pr_number, review_state,
+   review_author, delivery_id}`. Three topics needed:
+   `github.pull_request_review.submitted`,
+   `github.pull_request_review_comment.created`,
+   `github.issue_comment.created`. Skipping the third misses
+   saturation events. `cursor=now` (`fr_bus_3db58f0b`) skips
+   backlog replay; an older bus build silently no-ops the field
+   so a fresh subscriber still replays the full history.
+
+Bus-API call shape gotchas surfaced by the same dogfood:
+- `/v1/request` ``operation`` field is the SKILL NAME itself,
+  not `"skill"` / `"call"` / `"invoke"`. The first three return
+  `unknown operation: <x>`; only the actual skill name dispatches.
+- `list_frs(q=...)` doesn't filter on the bus — it returns every
+  FR. Filter locally on the result set.
+- `draft_fr_from_request` hallucinates scope (e.g. produced six
+  identical "Touches typing_extensions.py" lines). Use `file_bug`
+  for deferral receipts; promote to FR only via a separate path
+  once the receipt is honest.
+
 ## Session Checkpoints
 
 Use checkpoints to make external LLM sessions disposable.
