@@ -813,19 +813,36 @@ class FRStore:
         ``Optional[str]`` would lie about the supported input shape.
         PR #66 review pass-6 + pass-8.
         """
-        # ``str(value or "").strip() or None`` — coerces non-string
+        # ``"" if value is None else str(value)`` — coerces non-string
         # inputs (an internal caller passing an int / Path / etc.)
-        # before strip rather than crashing with AttributeError on
-        # the bare ``.strip()`` call. The previous ``next_fr`` impl
-        # only compared values without normalization, so a non-string
-        # target wouldn't crash there either; matching that
-        # robustness here keeps the centralization regression-free.
-        # PR #66 review pass-7.
-        target_norm = str(target or "").strip() or None
-        concept_norm = str(concept or "").strip() or None
-        for fr in self.list(include_all=True, project=project):
-            if target_norm and fr.target != target_norm:
-                continue
+        # via ``str(...)`` rather than crashing with AttributeError on
+        # the bare ``.strip()`` call. The ``is None``-guarded form
+        # (instead of ``value or ""``) preserves falsy-but-meaningful
+        # values like ``0`` / ``False`` — which would otherwise
+        # collapse to ``""`` and silently drop the filter, matching
+        # neither the str-coercion contract nor the test that passes
+        # ``target=123`` (whose stored target is the literal string
+        # ``"123"``, but a hypothetical caller passing ``0`` would
+        # similarly expect a filter on the string ``"0"``). PR #66
+        # review pass-7 + pass-9.
+        def _coerce(value):
+            if value is None:
+                return None
+            stripped = str(value).strip()
+            return stripped or None
+
+        target_norm = _coerce(target)
+        concept_norm = _coerce(concept)
+        # Push the target filter down to ``self.list()`` so when a
+        # target is set we don't scan + sort FRs that can't match in
+        # Python. ``list()`` already supports the same str-typed
+        # filter; pass the normalized form to keep matching uniform.
+        # PR #66 review pass-9 finding 3.
+        for fr in self.list(
+            include_all=True,
+            project=project,
+            target=target_norm,
+        ):
             if concept_norm and (fr.concept or "").strip() != concept_norm:
                 continue
             if fr_id_set is not None and fr.id not in fr_id_set:

@@ -3018,6 +3018,36 @@ async def test_next_fr_local_normalizes_padded_target_arg(harness):
     assert result["fr"]["id"] == fr["fr_id"]
 
 
+def test_next_fr_filter_scope_preserves_falsy_but_meaningful_values(harness):
+    """``_filter_scope`` must distinguish ``None`` ("filter unset") from
+    other falsy values like ``0`` / ``False`` (filter set to that
+    literal). The earlier ``str(value or "")`` form would collapse
+    both into ``""`` and silently drop the filter — a regression
+    against the "supports non-string inputs" contract added on
+    pass-7. PR #66 review pass-9 finding 1.
+    """
+    store = harness.agent.pipeline.frs
+    # Stored target is the literal string "0" — would-be-falsy if
+    # collapsed via ``str(target or "")``.
+    fr_zero = store.promote(
+        target="0", title="literal zero target",
+        description="x", priority="high",
+    )
+    fr_other = store.promote(
+        target="other", title="other target",
+        description="y", priority="high",
+    )
+    # ``target=0`` (int) should coerce to "0" and filter to fr_zero
+    # only — NOT silently broaden to "all targets".
+    result = store.next_fr(target=0)
+    assert result is not None
+    assert result.id == fr_zero.id, (
+        f"target=0 didn't filter to literal '0' target; got "
+        f"{result.id!r} (other={fr_other.id!r}). "
+        f"``or ''`` may have collapsed 0 → ''"
+    )
+
+
 def test_next_fr_filter_scope_coerces_non_string_args_without_crashing(harness):
     """``_filter_scope`` accepts non-string ``target``/``concept`` from
     internal callers (an int, a ``Path``, etc.) and coerces via

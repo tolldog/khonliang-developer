@@ -3048,24 +3048,30 @@ class DeveloperAgent(BaseAgent):
 
     @handler("next_fr_local")
     async def handle_next_fr_local(self, args):
-        # ``str(...).strip()`` everything for parity — a caller passing
-        # ``target=" developer "`` (padded by an upstream serializer)
-        # would silently fail to match without normalization, and the
-        # "no ready FRs" reason would mislead them into thinking the
-        # store actually had nothing. Match the project / concept /
-        # milestone_id treatment below. PR #66 review pass-3.
-        target_raw = str(args.get("target") or "").strip()
-        target = target_raw or None
+        # Normalize each scope arg with an ``is None``-guarded
+        # str-coerce + strip. The ``or ""`` form would collapse
+        # falsy-but-meaningful values (``0``, ``False``) into
+        # ``""`` and silently drop the filter — bug seam Copilot
+        # called out on pass-9. ``None``-only-→-empty preserves the
+        # caller's intent for any other Python value, with
+        # ``str(...)`` matching the store-tier coercion contract.
+        # PR #66 review pass-3 + pass-9.
+        def _arg(name):
+            value = args.get(name)
+            if value is None:
+                return None
+            stripped = str(value).strip()
+            return stripped or None
+
+        target = _arg("target")
         # Phase 3 pass-through: empty project → None = all projects;
         # an explicit slug partitions the search.
-        project_raw = str(args.get("project") or "").strip()
-        project = project_raw or None
+        project = _arg("project")
         # fr_developer_39a58719 dogfood: concept + milestone_id scope
         # filters so callers actively building one cluster don't get
         # unrelated cross-project FRs surfaced.
-        concept_raw = str(args.get("concept") or "").strip()
-        concept = concept_raw or None
-        milestone_id = str(args.get("milestone_id") or "").strip()
+        concept = _arg("concept")
+        milestone_id = _arg("milestone_id") or ""
         fr_id_set: Optional[set[str]] = None
         if milestone_id:
             milestone = self.pipeline.milestones.get(milestone_id)
