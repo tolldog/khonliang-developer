@@ -788,9 +788,9 @@ class FRStore:
     def _filter_scope(
         self,
         *,
-        target: Optional[str] = None,
+        target: Optional[Any] = None,
         project: Optional[str] = None,
-        concept: Optional[str] = None,
+        concept: Optional[Any] = None,
         fr_id_set: Optional[set[str]] = None,
     ):
         """Yield FRs matching ``(target, project, concept, fr_id_set)``,
@@ -801,11 +801,17 @@ class FRStore:
         pass-4.
 
         Whitespace normalization is centralized here: ``target`` and
-        ``concept`` both go through ``str(...).strip() or None`` so a
-        padded value like ``" developer "`` matches a stored target.
-        Callers don't have to replicate the normalization, and a
-        future scope-using path (or a direct ``next_fr`` consumer)
-        gets the same forgiving behavior. PR #66 review pass-6.
+        ``concept`` both go through ``str(value or "").strip() or None``
+        so a padded value like ``" developer "`` matches a stored
+        target. Callers don't have to replicate the normalization,
+        and a future scope-using path (or a direct ``next_fr``
+        consumer) gets the same forgiving behavior. ``target`` and
+        ``concept`` are typed ``Optional[Any]`` rather than
+        ``Optional[str]`` because the ``str(...)`` coercion is
+        deliberate (an internal caller passing an int / Path / etc.
+        gets stringified, not crashed); narrowing back to
+        ``Optional[str]`` would lie about the supported input shape.
+        PR #66 review pass-6 + pass-8.
         """
         # ``str(value or "").strip() or None`` — coerces non-string
         # inputs (an internal caller passing an int / Path / etc.)
@@ -829,9 +835,9 @@ class FRStore:
     def count_in_scope(
         self,
         *,
-        target: Optional[str] = None,
+        target: Optional[Any] = None,
         project: Optional[str] = None,
-        concept: Optional[str] = None,
+        concept: Optional[Any] = None,
         fr_id_set: Optional[set[str]] = None,
     ) -> int:
         """Count how many FRs match a scope, ignoring readiness.
@@ -851,9 +857,9 @@ class FRStore:
     def next_fr(
         self,
         *,
-        target: Optional[str] = None,
+        target: Optional[Any] = None,
         project: Optional[str] = None,
-        concept: Optional[str] = None,
+        concept: Optional[Any] = None,
         fr_id_set: Optional[set[str]] = None,
     ) -> Optional[FR]:
         """Pick the highest-priority FR that's ready to work on.
