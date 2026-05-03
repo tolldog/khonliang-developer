@@ -438,10 +438,23 @@ class DeveloperAgent(BaseAgent):
                    "max_frs": {"type": "integer", "default": 5,
                                "description": "maximum FRs per returned implementation bundle"}},
                   since="0.2.0"),
-            Skill("work_units", "List developer-owned FR work units ranked by importance",
+            Skill("work_units",
+                  "List developer-owned FR work units ranked by importance. "
+                  "Returns ``{work_units: [{name, frs, ...}], source, count, "
+                  "max_frs, cluster_by}``.",
                   {"target": {"type": "string", "default": ""},
                    "max_frs": {"type": "integer", "default": 5,
-                               "description": "maximum FRs per implementation bundle"}},
+                               "description": "maximum FRs per implementation bundle"},
+                   "cluster_by": {"type": "string", "default": "alpha",
+                                  "description": "within-(target,concept) grouping strategy: "
+                                                 "``alpha`` (default; sort by fr_id and slice into max_frs "
+                                                 "chunks — pre-existing behavior), or ``title_prefix`` "
+                                                 "(``fr_developer_c6789cdd``; parse a leading phase code "
+                                                 "like ``A1:``, ``B5 -`` from each FR's title and group by "
+                                                 "the letter so deliberately-structured batches don't get "
+                                                 "sliced across phases). Uncoded FRs in title_prefix mode "
+                                                 "fall into a synthetic last bucket with the legacy alpha "
+                                                 "slicing."}},
                   since="0.2.0"),
             Skill("propose_milestone_from_work_unit",
                   "Create a durable milestone from a provided or top-ranked work unit. "
@@ -2063,16 +2076,39 @@ class DeveloperAgent(BaseAgent):
         if isinstance(max_frs, dict):
             await self._safe_report_gap("work_units", max_frs["error"])
             return max_frs
+        # fr_developer_c6789cdd: ``cluster_by`` selects the
+        # within-(target, concept) grouping strategy. ``alpha``
+        # preserves the original behavior (sort by fr_id, slice).
+        # ``title_prefix`` parses a leading code like ``A1:``, ``B5:``
+        # from the FR title and groups by the letter so deliberately-
+        # structured batches (a wishlist with phase tags) don't get
+        # sliced across phases.
+        cluster_by_raw = str(args.get("cluster_by") or "alpha").strip().lower()
+        if cluster_by_raw not in _WORK_UNIT_CLUSTER_STRATEGIES:
+            # Format matches the rest of the codebase
+            # (``priority must be one of ['high', 'low', 'medium'], got 'x'``)
+            # — pipe-joined was inconsistent and read like a regex
+            # alternation. PR #68 review pass-2.
+            return {
+                "error": (
+                    f"cluster_by must be one of "
+                    f"{sorted(_WORK_UNIT_CLUSTER_STRATEGIES)}, "
+                    f"got {cluster_by_raw!r}"
+                )
+            }
         frs = self.pipeline.frs.list(target=target)
         if not frs:
             return {"work_units": [], "source": "none", "error": "no developer-owned FRs available"}
 
-        work_units = _work_units_from_local_frs(frs, max_size=max_frs)
+        work_units = _work_units_from_local_frs(
+            frs, max_size=max_frs, cluster_by=cluster_by_raw
+        )
         return {
             "work_units": work_units,
             "source": "developer_local",
             "count": len(work_units),
             "max_frs": max_frs,
+            "cluster_by": cluster_by_raw,
         }
 
     @handler("next_work_unit")
@@ -4428,9 +4464,120 @@ def _bool_arg(args: dict, name: str, default: bool = False) -> bool:
     return bool(raw)
 
 
-def _work_units_from_local_frs(frs, *, max_size: int = 5) -> list[dict]:
-    """Build deterministic work units from developer-owned FR records."""
+_WORK_UNIT_CLUSTER_STRATEGIES = frozenset({"alpha", "title_prefix"})
+
+
+# Match a leading phase code at the start of an FR title:
+# ``A1: bootstrap_judge`` → letter ``A``, number ``1``.
+# ``B12 - more text``, ``C5:blah`` (no space after colon), and bare
+# ``D7`` at end-of-title all work; the separator after the digits is
+# permissive (colon, dash, space, or end-of-string) so authors don't
+# have to settle on one format. FRs without a code fall into a
+# synthetic ``_uncoded`` cluster that slices alphabetically per the
+# legacy behavior, so mixed batches (some coded, some not) still
+# render correctly. PR #68 review pass-1 relaxed the previous
+# trailing-``\s`` requirement that missed ``A1:bootstrap_judge``
+# and bare ``D7`` titles.
+_TITLE_PHASE_CODE_RE = re.compile(r"^\s*([A-Z])(\d+)(?:[\s:\-]|$)")
+
+
+def _phase_code(fr) -> tuple[str, int] | None:
+    """Return ``(letter, number)`` if ``fr.title`` opens with a phase
+    code like ``A1:``, ``B5 -``, etc.; otherwise ``None``.
+
+    The split between coded and uncoded FRs determines the grouping
+    bucket in ``cluster_by="title_prefix"`` mode. ``fr_developer_c6789cdd``.
+    """
+    title = (getattr(fr, "title", "") or "")
+    m = _TITLE_PHASE_CODE_RE.match(title)
+    if not m:
+        return None
+    return m.group(1).upper(), int(m.group(2))
+
+
+def _emit_work_unit_chunks(
+    units: list,
+    group: list,
+    *,
+    target: str,
+    concept: str,
+    max_size: int,
+    phase: str | None,
+) -> None:
+    """Slice ``group`` (already sorted) into ``max_size`` chunks and
+    append a work_unit dict per chunk to ``units``.
+
+    ``phase`` (when not None) is a coded-phase letter (``A``,
+    ``B``, ...) appended to the work unit name + propagated as a
+    ``phase`` field, so callers downstream (and the test surface)
+    can route on it. ``None`` keeps the legacy alpha-only naming.
+    Shared between the alpha and title_prefix code paths so chunk
+    formatting can't drift.
+    """
+    for chunk_index, chunk_start in enumerate(range(0, len(group), max_size), start=1):
+        chunk = group[chunk_start:chunk_start + max_size]
+        priorities = [fr.priority for fr in chunk]
+        max_priority = _max_priority(priorities)
+        slice_suffix = "" if len(group) <= max_size else f", slice {chunk_index}"
+        phase_suffix = f", phase: {phase}" if phase else ""
+        unit = {
+            "name": (
+                f"Developer FR work unit ({len(chunk)} FRs, target: {target}, "
+                f"concept: {concept}{phase_suffix}{slice_suffix})"
+            ),
+            "rank": 0,
+            "size": len(chunk),
+            "targets": [target],
+            "concept": concept,
+            "max_priority": max_priority,
+            "source": "developer_local",
+            "frs": [
+                {
+                    "fr_id": fr.id,
+                    "description": f"{fr.title} → {fr.target} [{fr.priority}]",
+                    "priority": fr.priority,
+                    "status": fr.status,
+                    "target": fr.target,
+                }
+                for fr in chunk
+            ],
+        }
+        if phase:
+            unit["phase"] = phase
+        units.append(unit)
+
+
+def _work_units_from_local_frs(
+    frs,
+    *,
+    max_size: int = 5,
+    cluster_by: str = "alpha",
+) -> list[dict]:
+    """Build deterministic work units from developer-owned FR records.
+
+    ``cluster_by="alpha"`` (default) groups by ``(target, concept)``,
+    sorts within each group by ``fr.id``, and slices into ``max_size``
+    chunks. Pre-existing behavior; preserved for callers that don't
+    care about phase structure or whose batch was tagged via
+    ``concept`` alone.
+
+    ``cluster_by="title_prefix"`` (``fr_developer_c6789cdd``) further
+    sub-groups within ``(target, concept)`` by a leading phase code
+    parsed from the FR title (``A1:``, ``B5 -``, etc.). FRs sharing a
+    letter become one work unit (sorted by the numeric suffix);
+    uncoded FRs fall into a synthetic ``_uncoded`` bucket that slices
+    alphabetically per the legacy behavior. Closes the dogfood
+    complaint that 64 ``fr_benchmark_*`` FRs all tagged
+    ``concept=benchmark-agent`` were sliced into 13 alphabetic chunks
+    that crossed milestone phases — A1/A2/D6/E4/G2/G3 mixed in one
+    work unit when the wishlist explicitly captured an A→Q→B/C/D→E→F
+    dependency graph in the titles.
+    """
     max_size = max(1, int(max_size))
+    if cluster_by not in _WORK_UNIT_CLUSTER_STRATEGIES:
+        # Caller-side validation in the handler should catch this; the
+        # belt-and-suspenders fallback preserves alpha behavior.
+        cluster_by = "alpha"
     groups: dict[tuple[str, str], list] = {}
     for fr in frs:
         concept = (fr.concept or "general").strip().lower()
@@ -4438,35 +4585,72 @@ def _work_units_from_local_frs(frs, *, max_size: int = 5) -> list[dict]:
 
     units = []
     for target, concept in sorted(groups):
-        group = sorted(groups[(target, concept)], key=lambda fr: fr.id)
+        group = groups[(target, concept)]
         title_concept = concept if concept != "general" else "general"
-        for chunk_index, chunk_start in enumerate(range(0, len(group), max_size), start=1):
-            chunk = group[chunk_start:chunk_start + max_size]
-            priorities = [fr.priority for fr in chunk]
-            max_priority = _max_priority(priorities)
-            suffix = "" if len(group) <= max_size else f", slice {chunk_index}"
-            units.append({
-                "name": (
-                    f"Developer FR work unit ({len(chunk)} FRs, target: {target}, "
-                    f"concept: {title_concept}{suffix})"
-                ),
-                "rank": 0,
-                "size": len(chunk),
-                "targets": [target],
-                "concept": title_concept,
-                "max_priority": max_priority,
-                "source": "developer_local",
-                "frs": [
-                    {
-                        "fr_id": fr.id,
-                        "description": f"{fr.title} → {fr.target} [{fr.priority}]",
-                        "priority": fr.priority,
-                        "status": fr.status,
-                        "target": fr.target,
-                    }
-                    for fr in chunk
-                ],
-            })
+        if cluster_by == "title_prefix":
+            # Cache each fr's phase code once: ``_phase_code`` is a
+            # regex match per call, so calling it from a sort-key
+            # lambda re-runs the regex N log N times. Pre-compute and
+            # carry the parsed ``(letter, number)`` alongside the fr
+            # so both the bucketing and the within-phase sort key
+            # read the same cached value. PR #68 review pass-1.
+            coded_groups: dict[str, list[tuple[int, str, Any]]] = {}
+            uncoded: list = []
+            for fr in group:
+                code = _phase_code(fr)
+                if code is None:
+                    uncoded.append(fr)
+                else:
+                    letter, number = code
+                    # Triple is ``(number, fr_id, fr)`` — number is
+                    # the primary sort key (A1 before A2 before A10),
+                    # fr_id is the deterministic tie-breaker for two
+                    # FRs sharing the same phase number (e.g. both
+                    # ``A1:`` from independent authors), and fr is
+                    # the payload we hand back to the chunker. PR
+                    # #68 review pass-1 finding 2: without the fr_id
+                    # tie-breaker, same-number FRs fell back to
+                    # ``frs.list()`` insertion order, which the
+                    # function's "deterministic work units" contract
+                    # explicitly forbids.
+                    coded_groups.setdefault(letter, []).append((number, fr.id, fr))
+            # Coded phases first (letter order), then uncoded fall-through.
+            ordered_phases = sorted(coded_groups)
+            for phase in ordered_phases:
+                phase_group = [
+                    triple[2]
+                    for triple in sorted(coded_groups[phase])
+                ]
+                _emit_work_unit_chunks(
+                    units,
+                    phase_group,
+                    target=target,
+                    concept=title_concept,
+                    max_size=max_size,
+                    phase=phase,
+                )
+            if uncoded:
+                # Same alpha sort as legacy behavior — uncoded FRs
+                # in a title_prefix batch keep their pre-existing
+                # ordering rather than sneaking ahead of coded phases.
+                _emit_work_unit_chunks(
+                    units,
+                    sorted(uncoded, key=lambda fr: fr.id),
+                    target=target,
+                    concept=title_concept,
+                    max_size=max_size,
+                    phase=None,
+                )
+        else:
+            alpha_group = sorted(group, key=lambda fr: fr.id)
+            _emit_work_unit_chunks(
+                units,
+                alpha_group,
+                target=target,
+                concept=title_concept,
+                max_size=max_size,
+                phase=None,
+            )
 
     priority_order = {"high": 0, "medium": 1, "low": 2}
     units.sort(key=lambda u: (

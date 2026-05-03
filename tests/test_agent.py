@@ -771,6 +771,179 @@ async def test_work_units_are_deterministic_for_equal_rank_groups(harness):
 
 
 @pytest.mark.asyncio
+async def test_work_units_title_prefix_groups_by_phase_letter(harness):
+    """``cluster_by="title_prefix"`` groups FRs by a leading phase
+    code parsed from their title — so a wishlist with deliberately-
+    structured titles (``A1:``, ``A2:``, ``B1:``, ``D6:``) doesn't
+    get alphabetically sliced across phases. Closes
+    ``fr_developer_c6789cdd`` dogfood: 64 ``benchmark-agent`` FRs
+    were chunked into 13 alphabetic slices that each mixed phases.
+    """
+    titles = ["A1: bootstrap_judge", "A2: build venv", "B1: orchestrate",
+              "D6: compare_orchestration", "A3: third A"]
+    for title in titles:
+        harness.agent.pipeline.frs.promote(
+            target="benchmark", title=title, description=title.lower(),
+            priority="high", concept="benchmark-agent",
+        )
+
+    result = await harness.call("work_units", {
+        "target": "benchmark",
+        "cluster_by": "title_prefix",
+        "max_frs": 10,
+    })
+    assert result["cluster_by"] == "title_prefix"
+    units = result["work_units"]
+    # One unit per phase letter; all three A FRs in one unit, B alone, D alone.
+    phases = [u.get("phase") for u in units]
+    assert sorted(phases) == ["A", "B", "D"], phases
+    a_unit = next(u for u in units if u.get("phase") == "A")
+    a_titles = [fr["description"].split(" → ")[0] for fr in a_unit["frs"]]
+    # Sorted by numeric suffix (A1, A2, A3) — not alphabetic on title text.
+    assert a_titles == ["A1: bootstrap_judge", "A2: build venv", "A3: third A"]
+
+
+@pytest.mark.asyncio
+async def test_work_units_title_prefix_regex_handles_relaxed_separators(harness):
+    """``_TITLE_PHASE_CODE_RE`` accepts colon-without-space, dash, and
+    end-of-title (bare ``D7``) as the separator after the digits —
+    not just whitespace. Regression guard for PR #68 review pass-1
+    finding 1: the original regex required trailing ``\\s`` and
+    silently bucketed ``A1:bootstrap_judge`` and ``D7`` (no
+    separator) into the uncoded fallback, defeating title_prefix
+    clustering for authors who don't put a space after the colon.
+    """
+    cases = [
+        ("A1: with space",       "A"),
+        ("A2:no_space",          "A"),  # colon, no space
+        ("B1 - dash separator",  "B"),  # space-dash-space
+        ("C7",                   "C"),  # bare letter+digits, end of string
+    ]
+    for title, _phase in cases:
+        harness.agent.pipeline.frs.promote(
+            target="benchmark", title=title, description="x",
+            priority="high", concept="benchmark-agent",
+        )
+    result = await harness.call("work_units", {
+        "target": "benchmark",
+        "cluster_by": "title_prefix",
+    })
+    units = result["work_units"]
+    coded_phases = sorted(u["phase"] for u in units if "phase" in u)
+    assert coded_phases == ["A", "B", "C"], (
+        f"relaxed-separator titles didn't all parse as coded; got "
+        f"phases={coded_phases!r}, units={units!r}"
+    )
+    # No uncoded bucket should exist — every title here matched.
+    assert all("phase" in u for u in units), (
+        f"some title fell into uncoded bucket: "
+        f"{[u for u in units if 'phase' not in u]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_work_units_title_prefix_breaks_same_number_ties_by_fr_id(harness):
+    """Two FRs sharing the same phase number (e.g. both ``A1:``)
+    must order deterministically by ``fr_id``, not by insertion order
+    from ``frs.list()``. PR #68 review pass-1 finding 2: the
+    original sort key was ``(number,)`` only, so equal-number FRs
+    fell back to source order — a deterministic-contract violation.
+    """
+    harness.agent.pipeline.frs.promote(
+        target="benchmark", title="A1: first author",
+        description="A1-FIRST",
+        priority="high", concept="benchmark-agent",
+    )
+    harness.agent.pipeline.frs.promote(
+        target="benchmark", title="A1: second author",
+        description="A1-SECOND",
+        priority="high", concept="benchmark-agent",
+    )
+
+    result1 = await harness.call("work_units", {
+        "target": "benchmark", "cluster_by": "title_prefix", "max_frs": 10,
+    })
+    result2 = await harness.call("work_units", {
+        "target": "benchmark", "cluster_by": "title_prefix", "max_frs": 10,
+    })
+    a_unit_1 = next(u for u in result1["work_units"] if u.get("phase") == "A")
+    a_unit_2 = next(u for u in result2["work_units"] if u.get("phase") == "A")
+    # Same ordering on both calls (deterministic).
+    assert [fr["fr_id"] for fr in a_unit_1["frs"]] == [
+        fr["fr_id"] for fr in a_unit_2["frs"]
+    ], "title_prefix sort isn't deterministic on equal phase numbers"
+    # And specifically: ordering follows fr_id ascending.
+    fr_ids = [fr["fr_id"] for fr in a_unit_1["frs"]]
+    assert fr_ids == sorted(fr_ids), (
+        f"same-number FRs aren't sorted by fr_id; got {fr_ids!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_work_units_title_prefix_uncoded_fall_into_synthetic_bucket(harness):
+    """FRs whose titles don't carry a leading phase code fall into a
+    synthetic last bucket that slices alphabetically per the legacy
+    behavior — so a mixed batch (some coded, some not) renders both
+    cleanly. PR for fr_developer_c6789cdd."""
+    harness.agent.pipeline.frs.promote(
+        target="benchmark", title="A1: coded one", description="x",
+        priority="high", concept="benchmark-agent",
+    )
+    harness.agent.pipeline.frs.promote(
+        target="benchmark", title="no-code title here", description="y",
+        priority="high", concept="benchmark-agent",
+    )
+    result = await harness.call("work_units", {
+        "target": "benchmark",
+        "cluster_by": "title_prefix",
+    })
+    units = result["work_units"]
+    phases = [u.get("phase") for u in units]
+    # Coded phase first, then None for the synthetic uncoded bucket.
+    assert "A" in phases
+    assert None in phases  # uncoded bucket has no `phase` key set
+
+
+@pytest.mark.asyncio
+async def test_work_units_alpha_default_preserves_legacy_behavior(harness):
+    """``cluster_by`` defaults to ``alpha`` and reproduces the
+    pre-existing alphabetic-fr_id slicing — the dogfood-cited bug
+    behavior, kept available for callers without phase structure
+    in their titles. PR for fr_developer_c6789cdd."""
+    for title in ("Zeta task", "Alpha task", "Mu task"):
+        harness.agent.pipeline.frs.promote(
+            target="developer", title=title, description="x",
+            priority="medium", concept="legacy",
+        )
+    result = await harness.call("work_units", {"target": "developer"})
+    assert result["cluster_by"] == "alpha"
+    units = result["work_units"]
+    # Single unit containing all three (well under max_frs=5), and no
+    # ``phase`` key (alpha mode doesn't propagate one).
+    assert len(units) == 1
+    assert "phase" not in units[0]
+    assert {fr["description"].split(" → ")[0] for fr in units[0]["frs"]} == {
+        "Zeta task", "Alpha task", "Mu task",
+    }
+
+
+@pytest.mark.asyncio
+async def test_work_units_rejects_unknown_cluster_by(harness):
+    """Unknown ``cluster_by`` values surface a caller-actionable error
+    listing the allowed strategies. PR for fr_developer_c6789cdd."""
+    harness.agent.pipeline.frs.promote(
+        target="developer", title="x", description="x",
+        priority="medium", concept="general",
+    )
+    result = await harness.call("work_units", {
+        "target": "developer",
+        "cluster_by": "by_color_of_the_moon",
+    })
+    assert "error" in result
+    assert "cluster_by must be one of" in result["error"]
+
+
+@pytest.mark.asyncio
 async def test_work_units_no_local_frs(harness):
     """work_units no longer falls back to researcher-owned FRs."""
     result = await harness.call("work_units", {"target": "developer"})
