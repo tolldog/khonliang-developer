@@ -807,8 +807,16 @@ class FRStore:
         future scope-using path (or a direct ``next_fr`` consumer)
         gets the same forgiving behavior. PR #66 review pass-6.
         """
-        target_norm = (target or "").strip() or None
-        concept_norm = (concept or "").strip() or None
+        # ``str(value or "").strip() or None`` — coerces non-string
+        # inputs (an internal caller passing an int / Path / etc.)
+        # before strip rather than crashing with AttributeError on
+        # the bare ``.strip()`` call. The previous ``next_fr`` impl
+        # only compared values without normalization, so a non-string
+        # target wouldn't crash there either; matching that
+        # robustness here keeps the centralization regression-free.
+        # PR #66 review pass-7.
+        target_norm = str(target or "").strip() or None
+        concept_norm = str(concept or "").strip() or None
         for fr in self.list(include_all=True, project=project):
             if target_norm and fr.target != target_norm:
                 continue

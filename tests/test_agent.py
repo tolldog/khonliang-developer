@@ -3018,6 +3018,30 @@ async def test_next_fr_local_normalizes_padded_target_arg(harness):
     assert result["fr"]["id"] == fr["fr_id"]
 
 
+def test_next_fr_filter_scope_coerces_non_string_args_without_crashing(harness):
+    """``_filter_scope`` accepts non-string ``target``/``concept`` from
+    internal callers (an int, a ``Path``, etc.) and coerces via
+    ``str(...)`` before stripping, matching the docstring contract.
+    Bare ``.strip()`` would raise AttributeError on non-string input
+    — a regression vs the pre-pass-6 ``next_fr`` impl which simply
+    compared values without normalization. PR #66 review pass-7.
+    """
+    store = harness.agent.pipeline.frs
+    fr = store.promote(
+        target="123", title="numeric target",
+        description="x", priority="high",
+    )
+    # Pass an int as target — docstring says ``str(value).strip()``,
+    # so this must coerce to "123" rather than crash.
+    result = store.next_fr(target=123)
+    assert result is not None, (
+        "non-string target crashed _filter_scope; coercion regressed"
+    )
+    assert result.id == fr.id
+    # ``count_in_scope`` shares the path; same expectation.
+    assert store.count_in_scope(target=123) >= 1
+
+
 def test_next_fr_filter_scope_normalizes_target_at_store_tier(harness):
     """Whitespace normalization for ``target`` lives in
     ``FRStore._filter_scope`` (PR #66 pass-6) so direct callers of
