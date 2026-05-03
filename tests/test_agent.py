@@ -3018,6 +3018,31 @@ async def test_next_fr_local_normalizes_padded_target_arg(harness):
     assert result["fr"]["id"] == fr["fr_id"]
 
 
+def test_next_fr_filter_scope_normalizes_target_at_store_tier(harness):
+    """Whitespace normalization for ``target`` lives in
+    ``FRStore._filter_scope`` (PR #66 pass-6) so direct callers of
+    ``next_fr`` / ``count_in_scope`` — not just the bus handler —
+    get the same forgiving behavior. Otherwise a future path that
+    bypasses ``handle_next_fr_local`` would silently fail on padded
+    target values, even though the helper centralizes scope rules.
+    """
+    store = harness.agent.pipeline.frs
+    fr = store.promote(
+        target="developer", title="store-tier padded target",
+        description="x", priority="high",
+    )
+    # Pad the target with leading/trailing whitespace and call
+    # ``next_fr`` directly (not via the handler). It must still match.
+    result = store.next_fr(target=" developer ")
+    assert result is not None, (
+        "FRStore.next_fr didn't strip padded target; the handler-side "
+        "strip is masking a missing centralization"
+    )
+    assert result.id == fr.id
+    # ``count_in_scope`` shares the same path; same expectation.
+    assert store.count_in_scope(target=" developer ") >= 1
+
+
 @pytest.mark.asyncio
 async def test_next_fr_local_returns_reason_for_milestone_with_no_frs(harness):
     """A milestone whose ``fr_ids`` is empty (rare — usually

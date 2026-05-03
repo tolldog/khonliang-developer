@@ -799,8 +799,15 @@ class FRStore:
         rules can't drift between "is this FR a candidate?" and
         "does this FR exist in the scope at all?". PR #66 review
         pass-4.
+
+        Whitespace normalization is centralized here: ``target`` and
+        ``concept`` both go through ``str(...).strip() or None`` so a
+        padded value like ``" developer "`` matches a stored target.
+        Callers don't have to replicate the normalization, and a
+        future scope-using path (or a direct ``next_fr`` consumer)
+        gets the same forgiving behavior. PR #66 review pass-6.
         """
-        target_norm = target or None
+        target_norm = (target or "").strip() or None
         concept_norm = (concept or "").strip() or None
         for fr in self.list(include_all=True, project=project):
             if target_norm and fr.target != target_norm:
