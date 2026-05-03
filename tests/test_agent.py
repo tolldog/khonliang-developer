@@ -2896,6 +2896,46 @@ async def test_next_fr_local_returns_reason_for_unknown_milestone(harness):
 
 
 @pytest.mark.asyncio
+async def test_next_fr_local_no_ready_reason_includes_active_scope(harness):
+    """When a scoped call hits zero ready FRs, the ``reason`` string
+    must include the active filters (target, project, concept,
+    milestone_id) so the caller knows which filters narrowed the
+    search rather than guessing whether the unblocked-deps check or
+    the scope was the gate. PR #66 review pass-3 finding 1."""
+    # No FR matches the (target, concept) combo so the search
+    # legitimately returns null — and the reason must mention both
+    # filters so the caller can see what scoped them out.
+    result = await harness.call("next_fr_local", {
+        "target": "benchmark",
+        "concept": "no-such-concept",
+    })
+    assert result["fr"] is None
+    reason = result["reason"]
+    assert "no ready FRs" in reason
+    assert "target='benchmark'" in reason, reason
+    assert "concept='no-such-concept'" in reason, reason
+
+
+@pytest.mark.asyncio
+async def test_next_fr_local_normalizes_padded_target_arg(harness):
+    """``target=' developer '`` (whitespace-padded by an upstream
+    serializer) must match a stored target rather than silently
+    failing. PR #66 review pass-3 finding 2: ``target`` was being
+    passed through without the ``str(...).strip()`` normalization
+    applied to ``project`` / ``concept`` / ``milestone_id``."""
+    fr = await harness.call("promote_fr", {
+        "target": "developer", "title": "padded-target", "description": "x",
+        "priority": "high",
+    })
+    result = await harness.call("next_fr_local", {"target": " developer "})
+    assert result["fr"] is not None, (
+        "padded target arg failed to match; whitespace normalization "
+        "regressed"
+    )
+    assert result["fr"]["id"] == fr["fr_id"]
+
+
+@pytest.mark.asyncio
 async def test_next_fr_local_returns_reason_for_milestone_with_no_frs(harness):
     """A milestone whose ``fr_ids`` is empty (rare — usually
     propose_from_work_unit wouldn't produce one — but defensively

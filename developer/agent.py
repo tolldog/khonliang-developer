@@ -3048,7 +3048,14 @@ class DeveloperAgent(BaseAgent):
 
     @handler("next_fr_local")
     async def handle_next_fr_local(self, args):
-        target = args.get("target") or None
+        # ``str(...).strip()`` everything for parity — a caller passing
+        # ``target=" developer "`` (padded by an upstream serializer)
+        # would silently fail to match without normalization, and the
+        # "no ready FRs" reason would mislead them into thinking the
+        # store actually had nothing. Match the project / concept /
+        # milestone_id treatment below. PR #66 review pass-3.
+        target_raw = str(args.get("target") or "").strip()
+        target = target_raw or None
         # Phase 3 pass-through: empty project → None = all projects;
         # an explicit slug partitions the search.
         project_raw = str(args.get("project") or "").strip()
