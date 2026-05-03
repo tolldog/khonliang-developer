@@ -2085,11 +2085,15 @@ class DeveloperAgent(BaseAgent):
         # sliced across phases.
         cluster_by_raw = str(args.get("cluster_by") or "alpha").strip().lower()
         if cluster_by_raw not in _WORK_UNIT_CLUSTER_STRATEGIES:
-            allowed = "|".join(sorted(_WORK_UNIT_CLUSTER_STRATEGIES))
+            # Format matches the rest of the codebase
+            # (``priority must be one of ['high', 'low', 'medium'], got 'x'``)
+            # — pipe-joined was inconsistent and read like a regex
+            # alternation. PR #68 review pass-2.
             return {
                 "error": (
-                    f"cluster_by must be one of {allowed} "
-                    f"(got {cluster_by_raw!r})"
+                    f"cluster_by must be one of "
+                    f"{sorted(_WORK_UNIT_CLUSTER_STRATEGIES)}, "
+                    f"got {cluster_by_raw!r}"
                 )
             }
         frs = self.pipeline.frs.list(target=target)
