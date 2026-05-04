@@ -168,11 +168,12 @@ Bus-API call shape gotchas surfaced by the same dogfood:
 - `/v1/request` ``operation`` field is the SKILL NAME itself,
   not `"skill"` / `"call"` / `"invoke"`. The first three return
   `unknown operation: <x>`; only the actual skill name dispatches.
-- `list_frs` only filters on `status`, `target`, `include_all`,
-  and `project`. There is no free-text / keyword filter; passing
-  unknown args (`q=...`, `keyword=...`) is silently dropped and
-  the full result set comes back. Filter locally on the returned
-  FR list when the four supported fields aren't enough.
+- `list_frs` only filters on `status`, `target`, and
+  `include_all`. The richer filter set (including `project`)
+  lives on `list_frs_local`. Neither variant takes a free-text
+  / keyword filter (`q=...`, `keyword=...`) — those are silently
+  dropped and the full result set comes back. Filter locally on
+  the returned FR list when the supported fields aren't enough.
 - `draft_fr_from_request` hallucinates scope (e.g. produced six
   identical "Touches typing_extensions.py" lines). Use `file_bug`
   for deferral receipts; promote to FR only via a separate path
