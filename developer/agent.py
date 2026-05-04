@@ -147,6 +147,10 @@ class DeveloperAgent(BaseAgent):
                 skill="log_dogfood",
                 when_to_use="capture a friction / UX observation cheap (<100ms local write); triage later",
             ),
+            WelcomeEntryPoint(
+                skill="file_bug",
+                when_to_use="record a deferral receipt with a verifiable bug_id when a PR review surfaces a finding that's real but out of scope — see developer_guide \"PR Review Iteration Loop\" for the cross-check rule",
+            ),
         ],
         guide_skill="developer_guide",
     )
