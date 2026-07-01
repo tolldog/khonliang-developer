@@ -204,7 +204,13 @@ class GitClient:
             if not self.cwd.exists():
                 raise GitNotFoundError(f"path does not exist: {self.cwd}")
             try:
-                self._repo = Repo(str(self.cwd))
+                # search_parent_directories: resolve the repo from a nested cwd
+                # too (a common tool/editor invocation), not just the root — so
+                # the safe.directory trust below (and every command) works from a
+                # subdirectory. A cwd in no repo still raises InvalidGitRepositoryError.
+                self._repo = Repo(
+                    str(self.cwd), search_parent_directories=True
+                )
             except InvalidGitRepositoryError as e:
                 raise GitNotFoundError(f"not a git repository: {self.cwd}") from e
             except NoSuchPathError as e:
@@ -218,15 +224,23 @@ class GitClient:
             # (dog_956a7748 / dog_73c5c2ce / dog_a72a54b9, cross-user across
             # ≥3 repos). Injecting `safe.directory` via the git config-env
             # (GIT_CONFIG_COUNT/KEY_0/VALUE_0) scopes the trust to exactly this
-            # cwd — narrower than a global `safe.directory=*` and independent of
+            # repo — narrower than a global `safe.directory=*` and independent of
             # the operator's per-machine ~/.gitconfig, which only whitelisted
             # some repos. Repo() itself reads .git at the Python level and opens
             # fine; the ownership check only bites the shelled-out commands, so
             # setting the env here on repo.git covers all of them.
+            #
+            # The value MUST be the repository ROOT (worktree top-level), not
+            # ``self.cwd``: git's ownership check matches the repo path, so a
+            # nested ``cwd`` (a common tool/editor invocation) would leave the
+            # root untrusted and still fail. ``working_tree_dir`` is the resolved
+            # top-level (read from the already-open repo, no extra git shell-out);
+            # fall back to ``self.cwd`` for the bare-repo edge where it's None.
+            repo_root = self._repo.working_tree_dir or str(self.cwd)
             self._repo.git.update_environment(
                 GIT_CONFIG_COUNT="1",
                 GIT_CONFIG_KEY_0="safe.directory",
-                GIT_CONFIG_VALUE_0=str(self.cwd),
+                GIT_CONFIG_VALUE_0=str(repo_root),
             )
         return self._repo
 
