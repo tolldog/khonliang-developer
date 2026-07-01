@@ -1268,11 +1268,18 @@ class DeveloperAgent(BaseAgent):
         # default it TRUE — the reviewer then pins the fast resident local tier
         # (fr_khonliang-reviewer_92d810fa) for a large diff instead of escalating
         # to Claude/Kimi; the authoritative cross-vendor review supplies the depth.
-        # Opt out with `fast=false` for a full-rigor local pass. Parse via
-        # `_bool_arg` (not a bare `isinstance` check) so a bus-serialized string
-        # boolean — "false"/"0"/"no"/"off" — actually opts out; a raw isinstance
-        # check would treat those as non-bool and fall back to the True default.
-        forwarded["fast"] = _bool_arg(args, "fast", default=True)
+        # Opt out with `fast=false` for a full-rigor local pass. Two boundary
+        # cases: an ABSENT flag OR the bus's empty-string "unset" sentinel must
+        # yield the documented True default (``_bool_arg`` alone maps "" → False,
+        # which would silently disable the gate for transports that serialize
+        # unset optional booleans as ""); a real string boolean
+        # ("false"/"0"/"no"/"off") must actually opt out (a bare isinstance check
+        # would miss those). Treat empty/whitespace as unset, else parse.
+        raw_fast = args.get("fast")
+        if raw_fast is None or (isinstance(raw_fast, str) and not raw_fast.strip()):
+            forwarded["fast"] = True
+        else:
+            forwarded["fast"] = _bool_arg(args, "fast", default=True)
 
         # Provide a default context line with repo + branch so the
         # reviewer has anchoring info even when the caller didn't set
