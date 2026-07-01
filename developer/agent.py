@@ -387,6 +387,8 @@ class DeveloperAgent(BaseAgent):
                                       "description": "minimum severity (nit|note|warn|concern|blocker); reviewer's default applies when unset"},
                    "context": {"type": "string", "default": "",
                                "description": "optional context string; default includes cwd + current branch"},
+                   "fast": {"type": "boolean", "default": True,
+                            "description": "pre-push quick-gate (default true): the reviewer pins its fast local tier for a large diff instead of escalating to Claude — the cross-vendor review adds depth. Set false for a full-rigor local pass."},
                    "timeout_s": {"type": "number", "default": 120.0,
                                  "description": "bus request timeout in seconds"}},
                   since="0.20.0"),
@@ -1261,6 +1263,17 @@ class DeveloperAgent(BaseAgent):
             raw = args.get(key)
             if isinstance(raw, str) and raw.strip():
                 forwarded[key] = raw.strip()
+
+        # `fast`: the pre-push gate is a quick local sanity pass by definition, so
+        # default it TRUE — the reviewer then pins the fast resident local tier
+        # (fr_khonliang-reviewer_92d810fa) for a large diff instead of escalating
+        # to Claude/Kimi; the authoritative cross-vendor review supplies the depth.
+        # Opt out with `fast=false` for a full-rigor local pass. This is a bool, not
+        # a non-empty-string tunable, so it needs its own branch — the string loop
+        # above filters on `isinstance(raw, str)` and would drop it. Non-bool inputs
+        # (absent / wrong type) fall back to the True default.
+        raw_fast = args.get("fast")
+        forwarded["fast"] = raw_fast if isinstance(raw_fast, bool) else True
 
         # Provide a default context line with repo + branch so the
         # reviewer has anchoring info even when the caller didn't set
