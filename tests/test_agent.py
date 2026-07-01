@@ -2756,6 +2756,85 @@ async def test_review_staged_diff_rejects_invalid_timeout(harness, git_repo):
     )
 
 
+def _stage_a_file(git_repo):
+    (git_repo / "a.txt").write_text("first\nsecond\n")
+    import subprocess
+    subprocess.run(["git", "add", "a.txt"], cwd=str(git_repo), check=True)
+
+
+def _assert_skip_result(result, timeout_s):
+    # The synthetic result must be exactly the shape sign_off_trailer maps to
+    # review-skipped: errored + (ollama, backend_timeout), zero findings.
+    assert "error" in result  # carries the note, but NOT the hard {"error": ...} envelope
+    assert result["disposition"] == "errored"
+    assert result["error_category"] == "backend_timeout"
+    assert result["backend"] == "ollama"
+    assert result["findings"] == []
+    assert f"{timeout_s}" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_review_staged_diff_timeout_exception_degrades_to_skip(harness, git_repo):
+    # A transport timeout (httpx *Timeout, read timeout = bus timeout + 5s) must
+    # degrade to a non-blocking review-skipped result, not a hard error that blocks
+    # the commit (fr_khonliang-developer_96f5b3df).
+    _stage_a_file(git_repo)
+
+    class _FakeReadTimeout(Exception):
+        pass
+
+    async def mock_request(**kwargs):
+        raise _FakeReadTimeout("read operation timed out")
+
+    harness.agent.request = mock_request
+    result = await harness.call("review_staged_diff", {"cwd": str(git_repo), "timeout_s": 90})
+    _assert_skip_result(result, 90)
+
+
+@pytest.mark.asyncio
+async def test_review_staged_diff_bus_timeout_envelope_degrades_to_skip(harness, git_repo):
+    # DOMINANT path: the bus enforces the caller timeout server-side and returns a
+    # {"error": "timeout ...", "trace_id": ...} envelope (no "result"). That must
+    # also degrade to review-skipped.
+    _stage_a_file(git_repo)
+
+    async def mock_request(**kwargs):
+        return {"error": "timeout after 3 attempts", "trace_id": "t-abc"}
+
+    harness.agent.request = mock_request
+    result = await harness.call("review_staged_diff", {"cwd": str(git_repo), "timeout_s": 120})
+    _assert_skip_result(result, 120)
+
+
+@pytest.mark.asyncio
+async def test_review_staged_diff_non_timeout_envelope_stays_hard_error(harness, git_repo):
+    # A NON-timeout bus error (reviewer down) must NOT be mislabeled as a timeout
+    # skip — it stays an honest hard error.
+    _stage_a_file(git_repo)
+
+    async def mock_request(**kwargs):
+        return {"error": "no healthy agent found for reviewer", "trace_id": "t"}
+
+    harness.agent.request = mock_request
+    result = await harness.call("review_staged_diff", {"cwd": str(git_repo)})
+    assert result == {"error": "no result from reviewer"}
+    assert result.get("error_category") is None
+
+
+@pytest.mark.asyncio
+async def test_review_staged_diff_non_timeout_exception_stays_hard_error(harness, git_repo):
+    # A non-timeout transport exception (connection refused) stays a hard error.
+    _stage_a_file(git_repo)
+
+    async def mock_request(**kwargs):
+        raise ConnectionError("connection refused")
+
+    harness.agent.request = mock_request
+    result = await harness.call("review_staged_diff", {"cwd": str(git_repo)})
+    assert "reviewer request failed" in result["error"]
+    assert result.get("error_category") is None
+
+
 @pytest.mark.asyncio
 async def test_review_staged_diff_reports_reviewer_failure(harness, git_repo):
     (git_repo / "a.txt").write_text("first\nb\n")

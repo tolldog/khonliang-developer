@@ -1318,12 +1318,42 @@ class DeveloperAgent(BaseAgent):
                 timeout=timeout_s,
             )
         except Exception as e:
+            # A *timeout* (the hot-tier didn't finish within the caller budget)
+            # degrades to a non-blocking review-skipped result rather than a hard
+            # error that blocks the commit — the reviewer's sign_off_trailer maps
+            # our backend_timeout result to review-skipped
+            # (fr_khonliang-developer_96f5b3df). Non-timeout failures (reviewer
+            # down, connection refused) stay honest hard errors.
+            if _is_timeout_error(e):
+                await self._safe_report_gap(
+                    "review_staged_diff",
+                    f"reviewer request timed out after {timeout_s}s; "
+                    "degraded to review-skipped",
+                )
+                return _review_skipped_result(timeout_s, forwarded.get("model", ""))
             await self._safe_report_gap(
                 "review_staged_diff", f"reviewer request failed: {e}",
             )
             return {"error": f"reviewer request failed: {e}"}
 
-        return (response and response.get("result")) or {"error": "no result from reviewer"}
+        result = response.get("result") if isinstance(response, dict) else None
+        if result:
+            return result
+
+        # The bus enforces the caller `timeout` server-side and returns a
+        # ``{"error": "timeout ...", "trace_id": ...}`` envelope (no ``result``)
+        # when the reviewer exceeds it — the DOMINANT timeout path, since the bus
+        # budget (timeout_s) fires before httpx's read timeout (timeout_s + 5).
+        # Degrade that to review-skipped too, same as the exception path above.
+        err_text = str(response.get("error", "")) if isinstance(response, dict) else ""
+        if _is_timeout_error(err_text):
+            await self._safe_report_gap(
+                "review_staged_diff",
+                f"reviewer request timed out after {timeout_s}s (bus); "
+                "degraded to review-skipped",
+            )
+            return _review_skipped_result(timeout_s, forwarded.get("model", ""))
+        return {"error": "no result from reviewer"}
 
     @handler("project_ecosystem")
     async def handle_project_ecosystem(self, args):
@@ -4588,6 +4618,54 @@ def _bool_arg(args: dict, name: str, default: bool = False) -> bool:
     if isinstance(raw, str):
         return raw.strip().lower() not in {"", "0", "false", "no", "off"}
     return bool(raw)
+
+
+def _is_timeout_error(err: object) -> bool:
+    """True when an exception OR a bus error string denotes a request timeout.
+
+    ``self.request`` talks to the bus over httpx (read timeout = bus timeout + 5s),
+    so a genuine transport timeout arrives as an ``httpx.*Timeout`` exception whose
+    class name contains "Timeout"; the DOMINANT path, though, is the bus enforcing
+    the caller ``timeout`` server-side and returning a ``{"error": "timeout ..."}``
+    envelope (no ``result``). Both are matched here by the word "timeout"/"timed
+    out". Deliberately narrow: a reviewer-down / connection-refused / malformed
+    error does NOT contain "timeout", so it stays an honest hard error rather than
+    being mislabeled as a timeout skip.
+    """
+    text = (
+        f"{type(err).__name__} {err}" if isinstance(err, BaseException) else str(err)
+    ).lower()
+    return "timeout" in text or "timed out" in text
+
+
+def _review_skipped_result(timeout_s: float, model: str) -> dict:
+    """Synthetic ``backend_timeout`` ReviewResult for a pre-push review timeout.
+
+    The reviewer owns the review-skipped SEMANTICS: its ``sign_off_trailer`` maps
+    ``(backend="ollama", error_category="backend_timeout")`` to the ``review-skipped``
+    verdict (empty trailer + note) rather than a blocking sign-off
+    (fr_khonliang-reviewer_92d810fa part 3). We just hand it the shape it maps from,
+    so a hot-tier timeout on the bus ``review_staged_diff`` path degrades to a
+    non-blocking skip the pre-push workflow can proceed past (to the cross-vendor
+    gate) instead of a hard ``{"error": ...}`` that blocks the commit.
+
+    ``backend="ollama"``: with the fast pre-push tier defaulting on
+    (fr_khonliang-developer_bd76b5cc), the pre-push path routes to the ollama fast
+    tier, so a timeout is an ollama ``backend_timeout``. Accepted limitation: a
+    ``fast=false`` + large-diff review that reaches Claude and times out would be
+    mislabeled here; not handled — the common gate is the ollama fast tier.
+    """
+    return {
+        "findings": [],
+        "disposition": "errored",
+        "error_category": "backend_timeout",
+        "backend": "ollama",
+        "model": model,
+        "error": (
+            f"reviewer review timed out after {timeout_s}s on the pre-push gate; "
+            "degraded to review-skipped (cross-vendor review still applies)"
+        ),
+    }
 
 
 _WORK_UNIT_CLUSTER_STRATEGIES = frozenset({"alpha", "title_prefix"})
