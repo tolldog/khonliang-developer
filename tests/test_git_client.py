@@ -90,6 +90,28 @@ def test_non_git_directory_raises_not_found(tmp_path):
         c.status()
 
 
+def test_get_repo_injects_safe_directory(client, repo_path):
+    """Cross-user fix (dog_956a7748): every git command through the client trusts
+    the working tree via safe.directory, so the service user (khonliang) isn't
+    refused a login-user-owned repo as 'dubious ownership'. Scoped to this cwd,
+    not a global '*'."""
+    env = client._get_repo().git.environment()
+    assert env.get("GIT_CONFIG_COUNT") == "1"
+    assert env.get("GIT_CONFIG_KEY_0") == "safe.directory"
+    assert env.get("GIT_CONFIG_VALUE_0") == str(repo_path.resolve())
+
+
+def test_diff_staged_returns_staged_changes(client, repo_path):
+    """The exact path that failed cross-user (`git diff --cached`) works and
+    returns the staged unified diff; empty string when nothing is staged."""
+    assert client.diff_staged() == ""  # nothing staged yet
+    (repo_path / "a.txt").write_text("first\nsecond\n")
+    _run("add", "a.txt", cwd=repo_path)
+    diff = client.diff_staged()
+    assert diff.startswith("diff --git")
+    assert "second" in diff
+
+
 # ---------------------------------------------------------------------------
 # status + current_branch
 # ---------------------------------------------------------------------------

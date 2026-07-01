@@ -209,6 +209,25 @@ class GitClient:
                 raise GitNotFoundError(f"not a git repository: {self.cwd}") from e
             except NoSuchPathError as e:
                 raise GitNotFoundError(f"path does not exist: {self.cwd}") from e
+            # Trust this working tree for every git command issued through the
+            # repo. The deployed agent runs as a service user (`khonliang`) while
+            # the repos it operates on are owned by the developer's login user, so
+            # git 2.35.2+ refuses the repo as "dubious ownership" — it falls into
+            # `git diff --no-index` mode, and `review_staged_diff`'s `git diff
+            # --cached` then dies with exit 129 "unknown option `cached`"
+            # (dog_956a7748 / dog_73c5c2ce / dog_a72a54b9, cross-user across
+            # ≥3 repos). Injecting `safe.directory` via the git config-env
+            # (GIT_CONFIG_COUNT/KEY_0/VALUE_0) scopes the trust to exactly this
+            # cwd — narrower than a global `safe.directory=*` and independent of
+            # the operator's per-machine ~/.gitconfig, which only whitelisted
+            # some repos. Repo() itself reads .git at the Python level and opens
+            # fine; the ownership check only bites the shelled-out commands, so
+            # setting the env here on repo.git covers all of them.
+            self._repo.git.update_environment(
+                GIT_CONFIG_COUNT="1",
+                GIT_CONFIG_KEY_0="safe.directory",
+                GIT_CONFIG_VALUE_0=str(self.cwd),
+            )
         return self._repo
 
     # ------------------------------------------------------------------
