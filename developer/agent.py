@@ -1310,6 +1310,17 @@ class DeveloperAgent(BaseAgent):
             await self._safe_report_gap("review_staged_diff", message)
             return {"error": message}
 
+        # Only degrade a timeout to the ollama review-skipped shape when we can
+        # PROVE the review routed to the ollama fast tier: `fast` is on (the
+        # reviewer's fast_tier_gate pins ollama for any pr_diff regardless of size)
+        # AND the caller didn't override `backend`. Otherwise the timeout may have
+        # come from Claude/Kimi/Codex (fast=false size-routes to claude/kimi; an
+        # explicit backend goes wherever the caller said), and labeling it
+        # `backend="ollama"` would let sign_off_trailer mis-skip a timeout that
+        # should stay blocking. In those cases the timeout stays an honest hard
+        # error — we don't fake a backend we can't vouch for.
+        can_skip_timeout = forwarded.get("fast") is True and not forwarded.get("backend")
+
         try:
             response = await self.request(
                 agent_type="reviewer",
@@ -1318,13 +1329,13 @@ class DeveloperAgent(BaseAgent):
                 timeout=timeout_s,
             )
         except Exception as e:
-            # A *timeout* (the hot-tier didn't finish within the caller budget)
-            # degrades to a non-blocking review-skipped result rather than a hard
-            # error that blocks the commit — the reviewer's sign_off_trailer maps
-            # our backend_timeout result to review-skipped
+            # A *timeout* on the provable ollama fast-tier path degrades to a
+            # non-blocking review-skipped result rather than a hard error that
+            # blocks the commit — the reviewer's sign_off_trailer maps our
+            # backend_timeout result to review-skipped
             # (fr_khonliang-developer_96f5b3df). Non-timeout failures (reviewer
             # down, connection refused) stay honest hard errors.
-            if _is_timeout_error(e):
+            if _is_timeout_error(e) and can_skip_timeout:
                 await self._safe_report_gap(
                     "review_staged_diff",
                     f"reviewer request timed out after {timeout_s}s; "
@@ -1346,7 +1357,7 @@ class DeveloperAgent(BaseAgent):
         # budget (timeout_s) fires before httpx's read timeout (timeout_s + 5).
         # Degrade that to review-skipped too, same as the exception path above.
         err_text = str(response.get("error", "")) if isinstance(response, dict) else ""
-        if _is_timeout_error(err_text):
+        if _is_timeout_error(err_text) and can_skip_timeout:
             await self._safe_report_gap(
                 "review_staged_diff",
                 f"reviewer request timed out after {timeout_s}s (bus); "
@@ -4649,11 +4660,12 @@ def _review_skipped_result(timeout_s: float, model: str) -> dict:
     non-blocking skip the pre-push workflow can proceed past (to the cross-vendor
     gate) instead of a hard ``{"error": ...}`` that blocks the commit.
 
-    ``backend="ollama"``: with the fast pre-push tier defaulting on
-    (fr_khonliang-developer_bd76b5cc), the pre-push path routes to the ollama fast
-    tier, so a timeout is an ollama ``backend_timeout``. Accepted limitation: a
-    ``fast=false`` + large-diff review that reaches Claude and times out would be
-    mislabeled here; not handled — the common gate is the ollama fast tier.
+    ``backend="ollama"`` is safe because the caller gates this: it's only invoked
+    when ``fast`` is on and no ``backend`` override was set — the reviewer's
+    fast_tier_gate then pins the ollama fast tier for any pr_diff, so the timeout is
+    provably an ollama ``backend_timeout``. A ``fast=false`` / explicit-backend
+    review (which may reach Claude/Kimi/Codex) is NOT routed here — its timeout
+    stays a hard error rather than being mislabeled as an ollama skip.
     """
     return {
         "findings": [],

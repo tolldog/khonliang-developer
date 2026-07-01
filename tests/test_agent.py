@@ -2836,6 +2836,41 @@ async def test_review_staged_diff_non_timeout_exception_stays_hard_error(harness
 
 
 @pytest.mark.asyncio
+async def test_review_staged_diff_timeout_not_skipped_when_fast_disabled(harness, git_repo):
+    # fast=false size-routes large diffs to Claude/Kimi, so we can't vouch for the
+    # backend — a timeout must NOT be mislabeled as an ollama skip; it stays a hard
+    # error (codex P2: don't let a non-ollama timeout silently proceed).
+    _stage_a_file(git_repo)
+
+    async def mock_request(**kwargs):
+        return {"error": "timeout after 3 attempts", "trace_id": "t"}
+
+    harness.agent.request = mock_request
+    result = await harness.call(
+        "review_staged_diff", {"cwd": str(git_repo), "fast": False}
+    )
+    assert result == {"error": "no result from reviewer"}
+    assert result.get("error_category") is None
+
+
+@pytest.mark.asyncio
+async def test_review_staged_diff_timeout_not_skipped_when_backend_overridden(harness, git_repo):
+    # An explicit backend override goes wherever the caller said; a timeout there
+    # must NOT be relabeled as an ollama skip — it stays a hard error.
+    _stage_a_file(git_repo)
+
+    async def mock_request(**kwargs):
+        raise TimeoutError("claude -p timed out")
+
+    harness.agent.request = mock_request
+    result = await harness.call(
+        "review_staged_diff", {"cwd": str(git_repo), "backend": "claude_cli"}
+    )
+    assert "reviewer request failed" in result["error"]
+    assert result.get("error_category") is None
+
+
+@pytest.mark.asyncio
 async def test_review_staged_diff_reports_reviewer_failure(harness, git_repo):
     (git_repo / "a.txt").write_text("first\nb\n")
     import subprocess
