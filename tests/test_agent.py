@@ -2700,6 +2700,30 @@ async def test_review_staged_diff_fast_opt_out(harness, git_repo):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("raw,expected", [
+    ("false", False), ("0", False), ("no", False), ("off", False),
+    ("true", True), ("", False),  # bus string booleans parsed like the agent's others
+])
+async def test_review_staged_diff_fast_parses_string_boolean(harness, git_repo, raw, expected):
+    # The bus serializes boolean flags as strings; `fast` must opt out on
+    # "false"/"0"/"no"/"off" (via _bool_arg), not fall back to the True default.
+    (git_repo / "a.txt").write_text("x\ny\n")
+    import subprocess
+    subprocess.run(["git", "add", "a.txt"], cwd=str(git_repo), check=True)
+
+    captured: dict = {}
+
+    async def mock_request(**kwargs):
+        captured.update(kwargs)
+        return {"result": {"findings": []}}
+
+    harness.agent.request = mock_request
+
+    await harness.call("review_staged_diff", {"cwd": str(git_repo), "fast": raw})
+    assert captured["args"]["fast"] is expected
+
+
+@pytest.mark.asyncio
 async def test_review_staged_diff_rejects_invalid_timeout(harness, git_repo):
     # Stage a file so we'd otherwise reach the reviewer-call site; the
     # handler must refuse before calling self.request() for any timeout
