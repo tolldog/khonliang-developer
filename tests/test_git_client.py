@@ -90,6 +90,44 @@ def test_non_git_directory_raises_not_found(tmp_path):
         c.status()
 
 
+def test_get_repo_injects_safe_directory(client, repo_path):
+    """Cross-user fix (dog_956a7748): every git command through the client trusts
+    the repo via safe.directory, so the service user (khonliang) isn't refused a
+    login-user-owned repo as 'dubious ownership'. Scoped to the repo, not '*'."""
+    env = client._get_repo().git.environment()
+    assert env.get("GIT_CONFIG_COUNT") == "1"
+    assert env.get("GIT_CONFIG_KEY_0") == "safe.directory"
+    assert env.get("GIT_CONFIG_VALUE_0") == str(repo_path.resolve())
+
+
+def test_safe_directory_is_repo_root_even_from_subdir(repo_path):
+    """codex P1: safe.directory must be the repo ROOT, not the caller's cwd —
+    git's ownership check matches the worktree top-level, so a nested cwd would
+    otherwise leave the root untrusted and still fail."""
+    sub = repo_path / "pkg" / "nested"
+    sub.mkdir(parents=True)
+    c = GitClient(sub)
+    env = c._get_repo().git.environment()
+    # Trust value is the top-level, not the nested cwd.
+    assert env.get("GIT_CONFIG_VALUE_0") == str(repo_path.resolve())
+    assert env.get("GIT_CONFIG_VALUE_0") != str(sub.resolve())
+    # And git commands still work from the subdir.
+    (repo_path / "a.txt").write_text("first\nchanged\n")
+    _run("add", "a.txt", cwd=repo_path)
+    assert "changed" in c.diff_staged()
+
+
+def test_diff_staged_returns_staged_changes(client, repo_path):
+    """The exact path that failed cross-user (`git diff --cached`) works and
+    returns the staged unified diff; empty string when nothing is staged."""
+    assert client.diff_staged() == ""  # nothing staged yet
+    (repo_path / "a.txt").write_text("first\nsecond\n")
+    _run("add", "a.txt", cwd=repo_path)
+    diff = client.diff_staged()
+    assert diff.startswith("diff --git")
+    assert "second" in diff
+
+
 # ---------------------------------------------------------------------------
 # status + current_branch
 # ---------------------------------------------------------------------------
