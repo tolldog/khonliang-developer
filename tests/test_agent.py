@@ -2659,6 +2659,74 @@ async def test_review_staged_diff_caller_context_wins(harness, git_repo):
 
 
 @pytest.mark.asyncio
+async def test_review_staged_diff_defaults_fast_true(harness, git_repo):
+    # The pre-push gate is a quick local pass by default: `fast` is forwarded as
+    # True so the reviewer pins its fast local tier for a large diff instead of
+    # escalating to Claude (fr_khonliang-developer_bd76b5cc).
+    (git_repo / "a.txt").write_text("x\ny\n")
+    import subprocess
+    subprocess.run(["git", "add", "a.txt"], cwd=str(git_repo), check=True)
+
+    captured: dict = {}
+
+    async def mock_request(**kwargs):
+        captured.update(kwargs)
+        return {"result": {"findings": []}}
+
+    harness.agent.request = mock_request
+
+    await harness.call("review_staged_diff", {"cwd": str(git_repo)})
+    assert captured["args"]["fast"] is True
+
+
+@pytest.mark.asyncio
+async def test_review_staged_diff_fast_opt_out(harness, git_repo):
+    # `fast=false` opts into a full-rigor local pass; the handler forwards the
+    # explicit False (a bool, so it bypasses the string-tunable loop).
+    (git_repo / "a.txt").write_text("x\ny\n")
+    import subprocess
+    subprocess.run(["git", "add", "a.txt"], cwd=str(git_repo), check=True)
+
+    captured: dict = {}
+
+    async def mock_request(**kwargs):
+        captured.update(kwargs)
+        return {"result": {"findings": []}}
+
+    harness.agent.request = mock_request
+
+    await harness.call("review_staged_diff", {"cwd": str(git_repo), "fast": False})
+    assert captured["args"]["fast"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw,expected", [
+    ("false", False), ("0", False), ("no", False), ("off", False),
+    ("true", True),
+    # Empty / whitespace is the bus's "unset" sentinel → documented True default
+    # (NOT False), so an un-set flag still gets the quick pre-push gate.
+    ("", True), ("   ", True),
+])
+async def test_review_staged_diff_fast_parses_string_boolean(harness, git_repo, raw, expected):
+    # The bus serializes boolean flags as strings; `fast` must opt out on
+    # "false"/"0"/"no"/"off", while empty/absent falls back to the True default.
+    (git_repo / "a.txt").write_text("x\ny\n")
+    import subprocess
+    subprocess.run(["git", "add", "a.txt"], cwd=str(git_repo), check=True)
+
+    captured: dict = {}
+
+    async def mock_request(**kwargs):
+        captured.update(kwargs)
+        return {"result": {"findings": []}}
+
+    harness.agent.request = mock_request
+
+    await harness.call("review_staged_diff", {"cwd": str(git_repo), "fast": raw})
+    assert captured["args"]["fast"] is expected
+
+
+@pytest.mark.asyncio
 async def test_review_staged_diff_rejects_invalid_timeout(harness, git_repo):
     # Stage a file so we'd otherwise reach the reviewer-call site; the
     # handler must refuse before calling self.request() for any timeout
