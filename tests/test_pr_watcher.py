@@ -2464,3 +2464,52 @@ def test_fleet_digest_topic_in_all_pr_topics():
     see the digest topic in the registry of known topics."""
     assert TOPIC_FLEET_DIGEST in ALL_PR_TOPICS
     assert TOPIC_FLEET_DIGEST.startswith("pr.")
+
+
+# ---------------------------------------------------------------------------
+# Store connection hygiene (bug_khonliang-developer_be840d83)
+# ---------------------------------------------------------------------------
+
+
+def test_store_closes_every_connection(tmp_path: Path, monkeypatch):
+    """Every PRWatcherStore method must close its SQLite connection.
+
+    sqlite3's connection context manager commits/rolls back but never
+    closes; the poll loop calls these methods every cycle, so a single
+    unclosed connection per call exhausted the agent's fd limit in ~2
+    days and every DB-backed skill started failing with "unable to open
+    database file" (bug_khonliang-developer_be840d83).
+    """
+    import sqlite3 as _sqlite3
+
+    class TrackingConnection(_sqlite3.Connection):
+        instances: list["TrackingConnection"] = []
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            TrackingConnection.instances.append(self)
+            self.was_closed = False
+
+        def close(self):
+            self.was_closed = True
+            super().close()
+
+    real_connect = _sqlite3.connect
+    monkeypatch.setattr(
+        "developer.pr_watcher.sqlite3.connect",
+        lambda path, *a, **kw: real_connect(
+            path, *a, factory=TrackingConnection, **kw
+        ),
+    )
+
+    store = PRWatcherStore(str(tmp_path / "pr_watcher.db"))
+    store.register_watcher("w1", ["owner/repo"], [1], 60, 100.0)
+    store.touch_last_poll("w1", 200.0)
+    store.list_watchers()
+    store.has_emitted("w1", "owner/repo", 1, "review", "d1")
+    store.mark_emitted("w1", "owner/repo", 1, "review", "d1", 300.0)
+    store.remove_watcher("w1")
+
+    assert TrackingConnection.instances, "tracking hook never engaged"
+    leaked = [c for c in TrackingConnection.instances if not c.was_closed]
+    assert not leaked, f"{len(leaked)} connection(s) left open"

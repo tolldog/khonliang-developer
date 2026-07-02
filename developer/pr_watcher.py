@@ -39,6 +39,7 @@ import logging
 import sqlite3
 import time
 import uuid
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable, Optional
@@ -263,7 +264,12 @@ class PRWatcherStore:
     stores (via pipeline config), but keeps its tables isolated from
     the KnowledgeStore / TripleStore schemas. A separate connection per
     method call matches the KnowledgeStore pattern — cheap enough for
-    per-poll writes and avoids cross-thread connection issues.
+    per-poll writes and avoids cross-thread connection issues. Each
+    connection is explicitly closed (``closing``): sqlite3's connection
+    context manager only commits/rolls back, it does NOT close, and the
+    poll loop calls these methods every cycle — an unclosed connection
+    per poll exhausted the process fd limit in ~2 days
+    (bug_khonliang-developer_be840d83).
     """
 
     def __init__(self, db_path: str):
@@ -276,7 +282,7 @@ class PRWatcherStore:
         return conn
 
     def _init_schema(self) -> None:
-        with self._conn() as conn:
+        with closing(self._conn()) as conn, conn:
             conn.executescript(_SCHEMA)
 
     # -- registry --
@@ -289,7 +295,7 @@ class PRWatcherStore:
         interval_s: int,
         started_at: float,
     ) -> None:
-        with self._conn() as conn:
+        with closing(self._conn()) as conn, conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO pr_watcher_registry
@@ -307,7 +313,7 @@ class PRWatcherStore:
             )
 
     def touch_last_poll(self, watcher_id: str, at: float) -> None:
-        with self._conn() as conn:
+        with closing(self._conn()) as conn, conn:
             conn.execute(
                 "UPDATE pr_watcher_registry SET last_poll_at = ? WHERE watcher_id = ?",
                 (float(at), watcher_id),
@@ -319,7 +325,7 @@ class PRWatcherStore:
         Called on ``stop_pr_watcher``. Keeps the table from growing
         unboundedly when callers cycle watchers.
         """
-        with self._conn() as conn:
+        with closing(self._conn()) as conn, conn:
             conn.execute(
                 "DELETE FROM pr_watcher_registry WHERE watcher_id = ?",
                 (watcher_id,),
@@ -330,7 +336,7 @@ class PRWatcherStore:
             )
 
     def list_watchers(self) -> list[dict]:
-        with self._conn() as conn:
+        with closing(self._conn()) as conn, conn:
             rows = conn.execute(
                 "SELECT * FROM pr_watcher_registry ORDER BY started_at ASC"
             ).fetchall()
@@ -356,7 +362,7 @@ class PRWatcherStore:
         transition_kind: str,
         dedupe_id: str,
     ) -> bool:
-        with self._conn() as conn:
+        with closing(self._conn()) as conn, conn:
             row = conn.execute(
                 """
                 SELECT 1 FROM pr_watcher_dedupe
@@ -383,7 +389,7 @@ class PRWatcherStore:
         the registry, but cheap insurance) or race-induced double-calls
         can't double-emit. Returns False when the row already existed.
         """
-        with self._conn() as conn:
+        with closing(self._conn()) as conn, conn:
             cur = conn.execute(
                 """
                 INSERT OR IGNORE INTO pr_watcher_dedupe
