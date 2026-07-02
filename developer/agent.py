@@ -697,8 +697,10 @@ class DeveloperAgent(BaseAgent):
                    "project": {"type": "string", "default": "",
                                "description": "project slug to filter by (Phase 3); empty returns all projects"}},
                   since="0.4.0"),
-            Skill("update_fr", "Edit an existing FR in place. Terminal FRs "
-                  "are immutable.",
+            Skill("update_fr", "Edit an existing FR's content fields in "
+                  "place. Terminal FRs are immutable. Unsupported args are "
+                  "rejected — status/branch changes go through "
+                  "update_fr_status.",
                   {"fr_id": {"type": "string", "required": True},
                    "title": {"type": "string", "default": ""},
                    "description": {"type": "string", "default": ""},
@@ -3063,9 +3065,30 @@ class DeveloperAgent(BaseAgent):
             "frs": [f.to_public_dict() for f in frs],
         }
 
+    # The full set of args handle_update_fr reads. Anything outside this
+    # set is rejected loudly — historically `status` / `branch` were
+    # silently dropped while the call returned the FR as if the edit
+    # landed, so a caller trusting the response believed an FR was
+    # in_progress when it was still open (bug_developer_51fb98c9).
+    _UPDATE_FR_ARGS = frozenset({
+        "fr_id", "title", "description", "priority", "concept",
+        "classification", "backing_papers", "notes",
+    })
+
     @handler("update_fr")
     async def handle_update_fr(self, args):
-        """Edit an FR in place.
+        """Edit an FR's content fields in place.
+
+        Mutates only: title, description, priority, concept,
+        classification, backing_papers, notes. Any other arg —
+        including ``status`` and ``branch`` — is rejected with a
+        structured error rather than silently ignored
+        (bug_developer_51fb98c9). Lifecycle transitions (``status``)
+        and branch assignment (``branch``) both belong to the
+        ``update_fr_status`` skill; ``branch`` is deliberately NOT
+        wired through here because ``FRStore.update`` doesn't carry
+        it and branch changes should travel with a status transition
+        for the audit trail.
 
         Empty-string values for title/description/priority/concept/
         classification are treated as "no change" (so callers can omit
@@ -3073,6 +3096,20 @@ class DeveloperAgent(BaseAgent):
         "don't touch," since an empty string legitimately means "clear."
         """
         from developer.fr_store import FRError
+
+        unknown = set(args) - self._UPDATE_FR_ARGS
+        if unknown:
+            editable = sorted(self._UPDATE_FR_ARGS - {"fr_id"})
+            msg = (
+                f"unsupported args for update_fr: {', '.join(sorted(unknown))}. "
+                f"update_fr edits only: {', '.join(editable)}."
+            )
+            if unknown & {"status", "branch"}:
+                msg += (
+                    " Status transitions and branch assignment go through "
+                    "update_fr_status."
+                )
+            return {"error": msg}
 
         fr_id = args.get("fr_id", "")
         if not fr_id:
