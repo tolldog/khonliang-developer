@@ -54,7 +54,7 @@ from khonliang.knowledge.store import (
     Tier,
 )
 
-from developer.project_store import DEFAULT_PROJECT, normalize_project
+from developer.project_store import DEFAULT_PROJECT, normalize_project, slug_target
 
 
 # ---------------------------------------------------------------------------
@@ -727,8 +727,16 @@ def _derive_bug_id(
         payload = (
             f"{target}:{title}:{description}:{observed_entity}:project={project}"
         ).encode("utf-8")
+    # Slug the embedded segment only (bug_developer 143e1e4e) — the digest
+    # hashes the raw target, so ids for already-clean targets are unchanged.
+    slug = slug_target(target)
+    if not slug:
+        raise BugError(
+            f"target {target!r} has no id-safe characters "
+            "(need at least one of [a-z0-9_-])"
+        )
     digest = hashlib.sha256(payload).hexdigest()[:8]
-    return f"bug_{target}_{digest}"
+    return f"bug_{slug}_{digest}"
 
 
 def _parse_status_filter(

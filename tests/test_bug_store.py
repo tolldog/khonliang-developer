@@ -1138,3 +1138,25 @@ def test_default_project_id_stable_across_phase3(store):
     b = _derive_bug_id("developer", "t", "d", "e", project=DEFAULT_PROJECT)
     c = _derive_bug_id("developer", "t", "d", "e", project="  ")  # normalizes
     assert a == b == c
+
+
+# ---------------------------------------------------------------------------
+# target slugification in derived ids (bug_developer 143e1e4e)
+# ---------------------------------------------------------------------------
+
+
+def test_file_bug_slugifies_target_in_id(store):
+    bug = store.file_bug(
+        target="developer/promote_fr fr_id construction (slugification)",
+        title="t",
+        description="d",
+    )
+    assert bug.id.startswith("bug_developer-promote_fr-fr_id-construction-slugification_")
+    assert " " not in bug.id and "/" not in bug.id
+    # Only the id is slugged — the record keeps the raw target.
+    assert bug.target == "developer/promote_fr fr_id construction (slugification)"
+
+
+def test_file_bug_rejects_target_with_no_id_safe_chars(store):
+    with pytest.raises(BugError, match="id-safe"):
+        store.file_bug(target="!!!", title="t", description="d")

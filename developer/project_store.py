@@ -111,6 +111,36 @@ def normalize_project(value: Any) -> str:
     return str(value).strip() or DEFAULT_PROJECT
 
 
+# Characters that may not appear in a target slug embedded in a derived id.
+# Kept in sync with FR_ID_PATTERN (developer/specs.py): ``fr_[\w-]+_<hex>``,
+# minus uppercase so slugs are stable regardless of caller casing.
+_TARGET_UNSAFE_RE = re.compile(r"[^a-z0-9_-]+")
+
+
+def slug_target(value: str) -> str:
+    """Id-safe slug of a target name for embedding in derived ids.
+
+    Derived ids (``fr_<target>_<hash>``, ``bug_<target>_<hash>``,
+    ``ms_<target>_<hash>``, ``capability_<target>_<hash>``) embed the
+    target verbatim, so a target like ``"my cool app"`` used to produce
+    ids containing spaces/slashes that break greps and the FR-id
+    reference regex (``FR_ID_PATTERN`` in :mod:`developer.specs`,
+    bug_developer 143e1e4e).
+
+    Rules: lowercase; each run of characters outside ``[a-z0-9_-]``
+    becomes a single ``-``; ``-`` runs collapse; leading/trailing ``-``
+    stripped. Returns ``""`` when nothing survives — callers reject
+    that loudly with their own error type (FRError / BugError /
+    MilestoneError).
+
+    Forward-only: applied when NEW ids are derived; existing stored ids
+    are never rewritten.
+    """
+    slug = _TARGET_UNSAFE_RE.sub("-", value.lower())
+    slug = re.sub(r"-{2,}", "-", slug)
+    return slug.strip("-")
+
+
 # ---------------------------------------------------------------------------
 # Domain objects
 # ---------------------------------------------------------------------------

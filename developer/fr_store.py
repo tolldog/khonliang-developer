@@ -44,7 +44,7 @@ from khonliang.knowledge.store import (
     EntryStatus,
 )
 
-from developer.project_store import DEFAULT_PROJECT, normalize_project
+from developer.project_store import DEFAULT_PROJECT, normalize_project, slug_target
 
 
 # ---------------------------------------------------------------------------
@@ -1331,16 +1331,41 @@ def _fr_from_entry(entry: KnowledgeEntry) -> FR:
     )
 
 
+def _slug(target: str) -> str:
+    """Id-safe form of *target* for embedding in derived ids.
+
+    Slugification (bug_developer 143e1e4e) lives here — the single choke
+    point every id derivation below routes through — so a target like
+    ``"my cool project"`` yields ``fr_my-cool-project_<hash>`` instead of
+    an id with spaces that breaks greps and FR_ID_PATTERN matching.
+
+    Raises :class:`FRError` when nothing survives (e.g. ``"!!!"``) —
+    better a loud rejection at promote/merge time than an id like
+    ``fr__1a2b3c4d`` that no reference regex matches.
+    """
+    slug = slug_target(target)
+    if not slug:
+        raise FRError(
+            f"target {target!r} has no id-safe characters "
+            "(need at least one of [a-z0-9_-])"
+        )
+    return slug
+
+
 def _derive_fr_id(target: str, title: str, concept: str) -> str:
     """Stable FR id from (target, title, concept).
 
     Matches researcher's format: ``fr_<target>_<8 hex of sha256>``. Same
     input produces same id, so re-promoting the same content is a no-op
     (detected upstream in promote()).
+
+    Only the embedded segment is slugged; the digest hashes the raw
+    target, so ids for already-clean targets are byte-for-byte unchanged
+    and distinct raw targets that slug identically still get distinct ids.
     """
     payload = f"{target}:{title}:{concept}".encode("utf-8")
     digest = hashlib.sha256(payload).hexdigest()[:8]
-    return f"fr_{target}_{digest}"
+    return f"fr_{_slug(target)}_{digest}"
 
 
 def _derive_merge_id(target: str, source_ids: Iterable[str]) -> str:
@@ -1352,14 +1377,14 @@ def _derive_merge_id(target: str, source_ids: Iterable[str]) -> str:
     """
     payload = "merge:" + ":".join(sorted(source_ids))
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]
-    return f"fr_{target}_{digest}"
+    return f"fr_{_slug(target)}_{digest}"
 
 
 def _derive_capability_id(target: str, capability_name: str) -> str:
     """Stable capability id per (target, capability)."""
     payload = f"cap:{target}:{capability_name}".encode("utf-8")
     digest = hashlib.sha256(payload).hexdigest()[:12]
-    return f"capability_{target}_{digest}"
+    return f"capability_{_slug(target)}_{digest}"
 
 
 def _max_priority(priorities: Iterable[str]) -> str:

@@ -29,6 +29,7 @@ from developer.project_store import (
     ProjectDuplicateError,
     ProjectStore,
     RepoRef,
+    slug_target,
 )
 
 
@@ -296,3 +297,29 @@ class TestList:
 
         listed = store.list()
         assert [p.slug for p in listed] == ["proj"]
+
+
+# ---------------------------------------------------------------------------
+# slug_target (bug_developer 143e1e4e)
+# ---------------------------------------------------------------------------
+
+
+class TestSlugTarget:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("developer", "developer"),  # clean targets pass through
+            ("under_score-dash9", "under_score-dash9"),
+            ("my cool project", "my-cool-project"),
+            ("My App!!", "my-app"),
+            ("developer/promote_fr (slugification)", "developer-promote_fr-slugification"),
+            ("a - b", "a-b"),  # adjacent unsafe + '-' runs collapse
+            ("--already--dashed--", "already-dashed"),
+        ],
+    )
+    def test_slugs(self, raw, expected):
+        assert slug_target(raw) == expected
+
+    @pytest.mark.parametrize("raw", ["!!!", "   ", "()", ""])
+    def test_nothing_survives_returns_empty(self, raw):
+        assert slug_target(raw) == ""
