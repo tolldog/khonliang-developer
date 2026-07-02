@@ -2847,26 +2847,32 @@ class DeveloperAgent(BaseAgent):
     def _draft_fr_scan_root(self, target: str) -> "Path | None":
         """Best-effort: turn an agent slug into a repo root for the scan.
 
-        Heuristic: look up the project record by slug. Returns None when
-        the target is unknown or has no usable repo path — composer will
+        Lookup order: the project-store record for the slug, then the
+        config.yaml ``projects`` mapping (same source run_tests uses).
+        Returns None when the target matches neither — composer will
         record a diagnostic and the draft ships with empty code_evidence.
-        Deliberately no fallback to this developer's own repo: scanning
-        ourselves on behalf of an unrelated target fabricates evidence
-        (bug_khonliang-developer_3cd31ca5).
+        Deliberately no fallback to this developer's own repo for
+        arbitrary targets: scanning ourselves on behalf of an unrelated
+        target fabricates evidence (bug_khonliang-developer_3cd31ca5).
         """
         from pathlib import Path
         target = (target or "").strip()
+        if not target:
+            return None
+        candidates: list[Path] = []
         try:
-            project = self.pipeline.projects.get(target) if target else None
+            project = self.pipeline.projects.get(target)
         except Exception:  # noqa: BLE001
             project = None
-        if project is None:
-            return None
-        for repo in getattr(project, "repos", []) or []:
-            path = getattr(repo, "path", "") or ""
-            if not path:
-                continue
-            cand = Path(path)
+        if project is not None:
+            for repo in getattr(project, "repos", []) or []:
+                path = getattr(repo, "path", "") or ""
+                if path:
+                    candidates.append(Path(path))
+        configured = self.pipeline.config.projects.get(target)
+        if configured is not None:
+            candidates.append(configured.repo)
+        for cand in candidates:
             if cand.exists() and cand.is_dir():
                 return cand
         return None

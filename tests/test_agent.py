@@ -1226,6 +1226,36 @@ async def test_draft_fr_from_request_unknown_target_skips_scan(harness):
 
 
 @pytest.mark.asyncio
+async def test_draft_fr_from_request_falls_back_to_configured_project(
+    temp_config_file, tmp_path
+):
+    """A target absent from the project store but present in the
+    config.yaml ``projects`` mapping still gets a code scan — only
+    truly unknown targets skip it (deployments that never opted into
+    the project registry keep their code evidence).
+    """
+    repo = tmp_path / "reviewer-repo"
+    repo.mkdir()
+    (repo / "knob.py").write_text("# foo_threshold default\n", encoding="utf-8")
+    cfg = temp_config_file({
+        "projects": {"reviewer": {"repo": str(repo), "specs_dir": "specs"}},
+    })
+    harness = AgentTestHarness(DeveloperAgent, config_path=str(cfg))
+
+    async def mock_request(**kwargs):
+        return {"result": {"brief": "", "sources": []}}
+
+    harness.agent.request = mock_request
+    result = await harness.call("draft_fr_from_request", {
+        "request": "Tune the foo_threshold knob.",
+        "target": "reviewer",
+    })
+    assert "error" not in result
+    assert any(e["path"] == "knob.py" for e in result["code_evidence"])
+    assert not any("not resolvable" in d for d in result["diagnostics"])
+
+
+@pytest.mark.asyncio
 async def test_draft_fr_from_request_rejects_bad_timeout(harness):
     """brief_timeout_s must be a positive finite number."""
     for bad in ("slow", -1, 0, float("inf")):
