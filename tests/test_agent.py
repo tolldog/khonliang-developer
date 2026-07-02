@@ -1226,6 +1226,30 @@ async def test_draft_fr_from_request_unknown_target_skips_scan(harness):
 
 
 @pytest.mark.asyncio
+async def test_draft_fr_from_request_empty_target_scans_own_repo(harness):
+    """Empty target is the supported "draft against this repo" workflow
+    and must keep scanning the developer's own root — only *unknown
+    non-empty* targets skip the scan. The venv/vendored dir filter in
+    scan_for_evidence is what makes the self-scan safe again."""
+    async def mock_request(**kwargs):
+        return {"result": {"brief": "", "sources": []}}
+
+    harness.agent.request = mock_request
+    result = await harness.call("draft_fr_from_request", {
+        "request": "Improve the pr_watcher poll loop dedupe handling.",
+    })
+    assert "error" not in result
+    assert not any("not resolvable" in d for d in result["diagnostics"])
+    # Own-repo scan actually ran and produced first-party evidence;
+    # nothing from a venv/vendored tree may appear.
+    assert result["code_evidence"]
+    assert all(
+        ".venv" not in e["path"] and "site-packages" not in e["path"]
+        for e in result["code_evidence"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_draft_fr_from_request_falls_back_to_configured_project(
     temp_config_file, tmp_path
 ):

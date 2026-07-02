@@ -2847,18 +2847,23 @@ class DeveloperAgent(BaseAgent):
     def _draft_fr_scan_root(self, target: str) -> "Path | None":
         """Best-effort: turn an agent slug into a repo root for the scan.
 
-        Lookup order: the project-store record for the slug, then the
-        config.yaml ``projects`` mapping (same source run_tests uses).
-        Returns None when the target matches neither — composer will
-        record a diagnostic and the draft ships with empty code_evidence.
-        Deliberately no fallback to this developer's own repo for
-        arbitrary targets: scanning ourselves on behalf of an unrelated
-        target fabricates evidence (bug_khonliang-developer_3cd31ca5).
+        Empty target means "draft against this repo" — the supported
+        self-referential workflow — and scans the developer's own root
+        (safe now that scan_for_evidence excludes venv/vendored dirs,
+        which was the actual false-evidence vector).
+        Non-empty targets look up: the project-store record for the
+        slug, then the config.yaml ``projects`` mapping (same source
+        run_tests uses). Returns None when the target matches neither —
+        composer will record a diagnostic and the draft ships with
+        empty code_evidence. Deliberately no fallback to this
+        developer's own repo for arbitrary *unknown* targets: scanning
+        ourselves on behalf of an unrelated target fabricates evidence
+        (bug_khonliang-developer_3cd31ca5).
         """
         from pathlib import Path
         target = (target or "").strip()
         if not target:
-            return None
+            return Path(__file__).resolve().parent.parent
         candidates: list[Path] = []
         try:
             project = self.pipeline.projects.get(target)
