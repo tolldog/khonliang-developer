@@ -1162,7 +1162,7 @@ async def test_draft_fr_from_request_rejects_empty_request(harness):
 
 
 @pytest.mark.asyncio
-async def test_draft_fr_from_request_accepts_list_repo_hints(harness):
+async def test_draft_fr_from_request_accepts_list_repo_hints(harness, tmp_path):
     """`repo_hints` should accept either a comma-separated string or
     a JSON/list. Stringifying a list to ``"['a.py', 'b.py']"`` would
     have produced bogus hint paths in the prior implementation.
@@ -1171,6 +1171,12 @@ async def test_draft_fr_from_request_accepts_list_repo_hints(harness):
 
     async def mock_request(**kwargs):
         return {"result": {"brief": "", "sources": []}}
+
+    # Register the target so the scan root resolves — an unknown
+    # target skips the scan entirely (no own-repo fallback).
+    await harness.call("project_init", {
+        "slug": "developer", "repos": str(tmp_path),
+    })
 
     # Replace the scan helper so we can capture what hints reach the
     # composer without depending on a real repo layout.
@@ -1194,6 +1200,29 @@ async def test_draft_fr_from_request_accepts_list_repo_hints(harness):
         drafting.scan_for_evidence = real_scan
 
     assert seen_hints == ["developer/agent.py", "tests/test_agent.py"]
+
+
+@pytest.mark.asyncio
+async def test_draft_fr_from_request_unknown_target_skips_scan(harness):
+    """An unknown target must not fall back to scanning the developer's
+    own repo — that fabricated code_evidence from unrelated files
+    (bug_khonliang-developer_3cd31ca5). Expect empty code_evidence and
+    a diagnostic naming the unresolvable target.
+    """
+    async def mock_request(**kwargs):
+        return {"result": {"brief": "", "sources": []}}
+
+    harness.agent.request = mock_request
+    result = await harness.call("draft_fr_from_request", {
+        "request": "Improve typing extensions handling in the pipeline.",
+        "target": "no-such-project",
+    })
+    assert "error" not in result
+    assert result["code_evidence"] == []
+    assert any(
+        "no-such-project" in d and "not resolvable" in d
+        for d in result["diagnostics"]
+    )
 
 
 @pytest.mark.asyncio

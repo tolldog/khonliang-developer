@@ -131,6 +131,26 @@ def test_scan_for_evidence_hints_first(tmp_path: Path):
     assert evidence[0].path == "sub/b.py"
 
 
+def test_scan_for_evidence_skips_vendored_and_hidden_dirs(tmp_path: Path):
+    """A token that only matches inside .venv/site-packages must yield
+    no evidence (bug_khonliang-developer_3cd31ca5: typing_extensions.py
+    cited as evidence). The same token in a real source file is found.
+    """
+    vendored = tmp_path / ".venv" / "lib" / "python" / "site-packages"
+    vendored.mkdir(parents=True)
+    (vendored / "typing_extensions.py").write_text(
+        "# spectoken lives here\n", encoding="utf-8"
+    )
+    third_party = tmp_path / "vendor" / "pkg"
+    third_party.mkdir(parents=True)
+    (third_party / "mod.py").write_text("# spectoken here too\n", encoding="utf-8")
+    assert scan_for_evidence(tmp_path, ["spectoken"], max_total=10) == []
+
+    (tmp_path / "real.py").write_text("# spectoken in source\n", encoding="utf-8")
+    evidence = scan_for_evidence(tmp_path, ["spectoken"], max_total=10)
+    assert [e.path for e in evidence] == ["real.py"]
+
+
 def test_scan_for_evidence_drops_symlink_escaping_root(tmp_path: Path):
     """A symlink in the repo that points outside ``repo_root`` must
     be silently dropped — scan must not leak content (or absolute
