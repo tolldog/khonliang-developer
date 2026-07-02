@@ -712,6 +712,76 @@ async def test_get_and_list_frs_read_developer_store(harness):
     assert listed["count"] == 1
     assert listed["frs"][0]["id"] == fr.id
 
+
+@pytest.mark.asyncio
+async def test_update_fr_rejects_status_and_branch(harness):
+    """`status` / `branch` were silently dropped while update_fr returned
+    the FR as if the edit landed — a caller trusting the response believed
+    the FR was in_progress when it was still open. Regression guard for
+    bug_developer_51fb98c9.
+    """
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Loud FR", description="d",
+    )
+
+    result = await harness.call("update_fr", {
+        "fr_id": fr.id, "status": "in_progress", "branch": "feat/x",
+    })
+    assert "error" in result
+    assert "status" in result["error"]
+    assert "branch" in result["error"]
+    assert "update_fr_status" in result["error"]
+
+    # The FR must be untouched — no status flip, no branch assignment.
+    unchanged = await harness.call("get_fr_local", {"fr_id": fr.id})
+    assert unchanged["status"] == "open"
+    assert unchanged["branch"] == ""
+
+
+@pytest.mark.asyncio
+async def test_update_fr_rejects_unknown_junk_key(harness):
+    """Any undeclared arg is rejected with the accepted set, not dropped
+    silently (bug_developer_51fb98c9 — generic unknown-key guard).
+    """
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Junk-arg FR", description="d",
+    )
+
+    result = await harness.call("update_fr", {
+        "fr_id": fr.id, "totally_bogus": "x",
+    })
+    assert "error" in result
+    assert "totally_bogus" in result["error"]
+    # The error lists what update_fr actually edits.
+    assert "title" in result["error"]
+    assert "notes" in result["error"]
+    # Junk-only rejections don't mention the status skill.
+    assert "update_fr_status" not in result["error"]
+
+    unchanged = await harness.call("get_fr_local", {"fr_id": fr.id})
+    assert unchanged["title"] == "Junk-arg FR"
+
+
+@pytest.mark.asyncio
+async def test_update_fr_supported_edit_still_works(harness):
+    """The rejection guard must not break the supported edit path."""
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Old title", description="d",
+    )
+
+    result = await harness.call("update_fr", {
+        "fr_id": fr.id, "title": "New title", "notes": "retitled",
+    })
+    assert "error" not in result
+    assert result["title"] == "New title"
+
+    fetched = await harness.call("get_fr_local", {"fr_id": fr.id})
+    assert fetched["title"] == "New title"
+    assert any(
+        n.get("notes") == "retitled" for n in fetched["notes_history"]
+    )
+
+
 @pytest.mark.asyncio
 async def test_work_units_from_local_frs(harness):
     """work_units returns ranked units from developer-owned FRs."""
