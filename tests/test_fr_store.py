@@ -1301,3 +1301,68 @@ def test_read_path_strips_padded_project(store):
     # And the filter round-trip works too.
     found = store.list(project="alpha")
     assert any(f.id == "fr_developer_padded" for f in found)
+
+
+# ---------------------------------------------------------------------------
+# target slugification in derived ids (bug_developer 143e1e4e)
+# ---------------------------------------------------------------------------
+
+
+def test_promote_slugifies_target_in_id(store):
+    import re
+
+    from developer.specs import FR_ID_PATTERN
+
+    fr = store.promote(
+        target="My Cool/Project", title="Spaced target", description="d"
+    )
+    assert fr.id.startswith("fr_my-cool-project_")
+    assert re.fullmatch(FR_ID_PATTERN, fr.id)
+    # Only the id is slugged — the record keeps the raw target.
+    assert fr.target == "My Cool/Project"
+
+
+def test_promote_rejects_target_with_no_id_safe_chars(store):
+    with pytest.raises(FRError, match="id-safe"):
+        store.promote(target="!!!", title="t", description="d")
+
+
+def test_merge_id_slugifies_target(store):
+    import re
+
+    from developer.specs import FR_ID_PATTERN
+
+    a = store.promote(
+        target="My Cool/Project", title="A", description="d", concept="c1"
+    )
+    b = store.promote(
+        target="My Cool/Project", title="B", description="d", concept="c2"
+    )
+    merged = store.merge(source_ids=[a.id, b.id], title="A+B", description="d")
+    assert merged.id.startswith("fr_my-cool-project_")
+    assert re.fullmatch(FR_ID_PATTERN, merged.id)
+
+
+def test_capability_id_slugifies_target(store):
+    from developer.fr_store import _derive_capability_id
+
+    cap_id = _derive_capability_id("My Cool/Project", "Some Capability")
+    assert cap_id.startswith("capability_my-cool-project_")
+    assert " " not in cap_id and "/" not in cap_id
+    # End-to-end: recording a capability for a spaced target works and is
+    # still discoverable by the raw target (tags/metadata keep raw values).
+    fr = store.promote(target="My Cool/Project", title="Cap", description="d")
+    store.update_status(fr.id, FR_STATUS_PLANNED)
+    caps = store.capabilities_for("My Cool/Project")
+    assert len(caps) == 1
+    assert caps[0]["fr_id"] == fr.id
+
+
+def test_clean_target_ids_unchanged(store):
+    """Already-clean targets slug to themselves — ids byte-identical to the
+    pre-slug derivation (digest hashes the raw target, prefix is the slug)."""
+    import hashlib
+
+    fr = store.promote(target="developer", title="T", description="d", concept="c")
+    digest = hashlib.sha256("developer:T:c".encode("utf-8")).hexdigest()[:8]
+    assert fr.id == f"fr_developer_{digest}"

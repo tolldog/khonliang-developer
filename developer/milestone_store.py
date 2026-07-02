@@ -21,7 +21,7 @@ from khonliang.knowledge.store import (
     Tier,
 )
 
-from developer.project_store import DEFAULT_PROJECT, normalize_project
+from developer.project_store import DEFAULT_PROJECT, normalize_project, slug_target
 
 # The FR store is passed into :meth:`MilestoneStore.delete` as an
 # argument rather than imported here so milestone_store stays free of
@@ -997,9 +997,17 @@ def _milestone_from_entry(entry: KnowledgeEntry) -> Milestone:
 
 
 def _derive_milestone_id(target: str, title: str, fr_ids: list[str]) -> str:
+    # Slug the embedded segment only (bug_developer 143e1e4e) — the digest
+    # hashes the raw target, so ids for already-clean targets are unchanged.
+    slug = slug_target(target)
+    if not slug:
+        raise MilestoneError(
+            f"target {target!r} has no id-safe characters "
+            "(need at least one of [a-z0-9_-])"
+        )
     payload = f"{target}:{title}:{','.join(sorted(fr_ids))}".encode("utf-8")
     digest = hashlib.sha256(payload).hexdigest()[:8]
-    return f"ms_{target}_{digest}"
+    return f"ms_{slug}_{digest}"
 
 
 def _fr_id_from_item(item: Any) -> str:

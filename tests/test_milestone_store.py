@@ -1343,3 +1343,23 @@ def test_milestone_list_empty_string_project_filters_for_default(pipeline):
     ids = {m.id for m in filtered}
     assert default_ms.id in ids
     assert alpha_ms.id not in ids
+
+
+# ---------------------------------------------------------------------------
+# target slugification in derived ids (bug_developer 143e1e4e)
+# ---------------------------------------------------------------------------
+
+
+def test_propose_slugifies_target_in_milestone_id(pipeline):
+    milestone = pipeline.milestones.propose_from_work_unit(
+        _work_unit(), target="My Cool/Project"
+    )
+    assert milestone.id.startswith("ms_my-cool-project_")
+    assert " " not in milestone.id and "/" not in milestone.id
+    # Only the id is slugged — the record keeps the raw target.
+    assert milestone.target == "My Cool/Project"
+
+
+def test_propose_rejects_target_with_no_id_safe_chars(pipeline):
+    with pytest.raises(MilestoneError, match="id-safe"):
+        pipeline.milestones.propose_from_work_unit(_work_unit(), target="!!!")
