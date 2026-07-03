@@ -162,6 +162,30 @@ _SNIPPET_RADIUS = 2  # lines of context above/below the match
 _MAX_SNIPPETS_PER_TOKEN = 1
 _MAX_TOTAL_SNIPPETS = 6
 
+# Directory names whose contents are never project code evidence.
+# Hidden components (``.venv``, ``.git``, ``.tox``, …) are excluded by
+# the leading-dot check in ``_is_vendored_or_hidden``.
+_EXCLUDED_DIR_COMPONENTS = frozenset({
+    "site-packages", "node_modules", "__pycache__", "build", "dist", "vendor",
+})
+
+
+def _is_vendored_or_hidden(rel_parts: tuple[str, ...]) -> bool:
+    """True when any path component is hidden or a vendored/build dir.
+
+    Without this, generic request tokens match inside e.g.
+    ``.venv/.../typing_extensions.py`` and get cited as "evidence"
+    (bug_khonliang-developer_3cd31ca5). ``.github`` is the one hidden
+    dir that is first-party by convention (CI workflows, review
+    instructions) — drafts about those workflows need its files as
+    evidence, so it alone is allowlisted.
+    """
+    return any(
+        (part.startswith(".") and part != ".github")
+        or part in _EXCLUDED_DIR_COMPONENTS
+        for part in rel_parts
+    )
+
 
 def scan_for_evidence(
     repo_root: Path,
@@ -178,6 +202,10 @@ def scan_for_evidence(
     biases the search to specific subpaths (e.g. ``["developer/agent.py"]``)
     by checking those first. Best-effort: any I/O error skips the
     file silently.
+
+    The glob walk skips hidden and vendored dirs (``.venv``,
+    ``site-packages``, ``node_modules``, …); explicit ``repo_hints``
+    are taken as-is.
 
     Symlink-safe: every candidate path is resolved and then required to
     stay under ``repo_root`` (post-resolution). A symlink that points
@@ -255,6 +283,12 @@ def scan_for_evidence(
     # rather than materializing every match into a sorted list up front.
     for pattern in globs:
         for p in repo_root.glob(pattern):
+            try:
+                rel_parts = p.relative_to(repo_root).parts
+            except ValueError:
+                continue
+            if _is_vendored_or_hidden(rel_parts):
+                continue
             resolved = _within_root(p)
             if resolved is None or not resolved.is_file():
                 continue

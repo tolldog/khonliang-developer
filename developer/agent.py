@@ -2838,21 +2838,37 @@ class DeveloperAgent(BaseAgent):
             await self._safe_report_gap("draft_fr_from_request", f"compose_draft raised: {e}")
             return {"error": f"draft composition failed: {e}"}
 
+        if scan_root is None:
+            # Name the reason next to the composer's generic
+            # "no scan_fn supplied" diagnostic.
+            draft.diagnostics.append(
+                f"target repo not resolvable for {target!r}; code scan skipped"
+            )
         return draft.to_public_dict()
 
     def _draft_fr_scan_root(self, target: str) -> "Path | None":
         """Best-effort: turn an agent slug into a repo root for the scan.
 
-        Heuristic: look up the project record by slug. If unknown, fall
-        back to the configured developer repo so something useful comes
-        back when the caller gives a vague target. Returns None if
-        nothing usable can be found — composer will record a diagnostic.
+        Empty target means "draft against this repo" — the supported
+        self-referential workflow — and scans the developer's own root
+        (safe now that scan_for_evidence excludes venv/vendored dirs,
+        which was the actual false-evidence vector).
+        Non-empty targets look up: the project-store record for the
+        slug, then the config.yaml ``projects`` mapping (same source
+        run_tests uses). Returns None when the target matches neither —
+        composer will record a diagnostic and the draft ships with
+        empty code_evidence. Deliberately no fallback to this
+        developer's own repo for arbitrary *unknown* targets: scanning
+        ourselves on behalf of an unrelated target fabricates evidence
+        (bug_khonliang-developer_3cd31ca5).
         """
         from pathlib import Path
         target = (target or "").strip()
+        if not target:
+            return Path(__file__).resolve().parent.parent
         candidates: list[Path] = []
         try:
-            project = self.pipeline.projects.get(target) if target else None
+            project = self.pipeline.projects.get(target)
         except Exception:  # noqa: BLE001
             project = None
         if project is not None:
@@ -2860,11 +2876,9 @@ class DeveloperAgent(BaseAgent):
                 path = getattr(repo, "path", "") or ""
                 if path:
                     candidates.append(Path(path))
-        # Fallback: this developer's own repo root, derived from the
-        # agent module path.
-        own_root = Path(__file__).resolve().parent.parent
-        if own_root not in candidates:
-            candidates.append(own_root)
+        configured = self.pipeline.config.projects.get(target)
+        if configured is not None:
+            candidates.append(configured.repo)
         for cand in candidates:
             if cand.exists() and cand.is_dir():
                 return cand

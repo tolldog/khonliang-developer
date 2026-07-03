@@ -1232,7 +1232,7 @@ async def test_draft_fr_from_request_rejects_empty_request(harness):
 
 
 @pytest.mark.asyncio
-async def test_draft_fr_from_request_accepts_list_repo_hints(harness):
+async def test_draft_fr_from_request_accepts_list_repo_hints(harness, tmp_path):
     """`repo_hints` should accept either a comma-separated string or
     a JSON/list. Stringifying a list to ``"['a.py', 'b.py']"`` would
     have produced bogus hint paths in the prior implementation.
@@ -1241,6 +1241,12 @@ async def test_draft_fr_from_request_accepts_list_repo_hints(harness):
 
     async def mock_request(**kwargs):
         return {"result": {"brief": "", "sources": []}}
+
+    # Register the target so the scan root resolves — an unknown
+    # target skips the scan entirely (no own-repo fallback).
+    await harness.call("project_init", {
+        "slug": "developer", "repos": str(tmp_path),
+    })
 
     # Replace the scan helper so we can capture what hints reach the
     # composer without depending on a real repo layout.
@@ -1264,6 +1270,83 @@ async def test_draft_fr_from_request_accepts_list_repo_hints(harness):
         drafting.scan_for_evidence = real_scan
 
     assert seen_hints == ["developer/agent.py", "tests/test_agent.py"]
+
+
+@pytest.mark.asyncio
+async def test_draft_fr_from_request_unknown_target_skips_scan(harness):
+    """An unknown target must not fall back to scanning the developer's
+    own repo — that fabricated code_evidence from unrelated files
+    (bug_khonliang-developer_3cd31ca5). Expect empty code_evidence and
+    a diagnostic naming the unresolvable target.
+    """
+    async def mock_request(**kwargs):
+        return {"result": {"brief": "", "sources": []}}
+
+    harness.agent.request = mock_request
+    result = await harness.call("draft_fr_from_request", {
+        "request": "Improve typing extensions handling in the pipeline.",
+        "target": "no-such-project",
+    })
+    assert "error" not in result
+    assert result["code_evidence"] == []
+    assert any(
+        "no-such-project" in d and "not resolvable" in d
+        for d in result["diagnostics"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_draft_fr_from_request_empty_target_scans_own_repo(harness):
+    """Empty target is the supported "draft against this repo" workflow
+    and must keep scanning the developer's own root — only *unknown
+    non-empty* targets skip the scan. The venv/vendored dir filter in
+    scan_for_evidence is what makes the self-scan safe again."""
+    async def mock_request(**kwargs):
+        return {"result": {"brief": "", "sources": []}}
+
+    harness.agent.request = mock_request
+    result = await harness.call("draft_fr_from_request", {
+        "request": "Improve the pr_watcher poll loop dedupe handling.",
+    })
+    assert "error" not in result
+    assert not any("not resolvable" in d for d in result["diagnostics"])
+    # Own-repo scan actually ran and produced first-party evidence;
+    # nothing from a venv/vendored tree may appear.
+    assert result["code_evidence"]
+    assert all(
+        ".venv" not in e["path"] and "site-packages" not in e["path"]
+        for e in result["code_evidence"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_draft_fr_from_request_falls_back_to_configured_project(
+    temp_config_file, tmp_path
+):
+    """A target absent from the project store but present in the
+    config.yaml ``projects`` mapping still gets a code scan — only
+    truly unknown targets skip it (deployments that never opted into
+    the project registry keep their code evidence).
+    """
+    repo = tmp_path / "reviewer-repo"
+    repo.mkdir()
+    (repo / "knob.py").write_text("# foo_threshold default\n", encoding="utf-8")
+    cfg = temp_config_file({
+        "projects": {"reviewer": {"repo": str(repo), "specs_dir": "specs"}},
+    })
+    harness = AgentTestHarness(DeveloperAgent, config_path=str(cfg))
+
+    async def mock_request(**kwargs):
+        return {"result": {"brief": "", "sources": []}}
+
+    harness.agent.request = mock_request
+    result = await harness.call("draft_fr_from_request", {
+        "request": "Tune the foo_threshold knob.",
+        "target": "reviewer",
+    })
+    assert "error" not in result
+    assert any(e["path"] == "knob.py" for e in result["code_evidence"])
+    assert not any("not resolvable" in d for d in result["diagnostics"])
 
 
 @pytest.mark.asyncio
