@@ -2525,7 +2525,7 @@ from developer.github_client import (
     GithubRateLimitError,
     classify_github_error,
 )
-from developer.pr_watcher import TOPIC_WATCH_PRUNED
+from developer.pr_watcher import PRUNE_AFTER_CONSECUTIVE_404S, TOPIC_WATCH_PRUNED
 
 
 class _FakeResponse:
@@ -2578,51 +2578,147 @@ def test_classify_github_error_taxonomy():
 
 
 @pytest.mark.asyncio
-async def test_explicit_watcher_prunes_404_pr(store):
-    """A 404 on an explicitly-watched PR drops it from the watch set:
-    one pr.watch_pruned event, no further fetches for that pair, and
-    NO endless pr.poll_error stream (the n=2243 spam of bug_287fc547)."""
+async def test_explicit_watcher_prunes_404_pr_after_streak(store):
+    """A PR that 404s for PRUNE_AFTER_CONSECUTIVE_404S consecutive
+    cycles is dropped: one pr.watch_pruned event, no further fetches,
+    and no endless poll_error stream (the n=2243 spam of bug_287fc547).
+    Earlier cycles emit a counted poll_error, not a prune."""
     gh = _FakeGithub()
     published: list[tuple[str, dict]] = []
     watcher = _make_watcher(store, gh, published, pr_numbers=[1, 2])
     gh.snapshots[("owner/repo", 1)] = _make_snapshot(pr_number=1)
     gh.errors[("owner/repo", 2)] = GithubNotFoundError("get_pr(owner/repo#2): not found (404)")
 
+    for _ in range(PRUNE_AFTER_CONSECUTIVE_404S - 1):
+        await watcher.poll_once()
+    assert not [p for t, p in published if t == TOPIC_WATCH_PRUNED]
+    counted = [p for t, p in published if t == TOPIC_POLL_ERROR]
+    assert len(counted) == PRUNE_AFTER_CONSECUTIVE_404S - 1
+    assert all("before prune" in p["reason"] for p in counted)
+
     await watcher.poll_once()
     pruned = [p for t, p in published if t == TOPIC_WATCH_PRUNED]
     assert len(pruned) == 1
     assert pruned[0]["pr_number"] == 2
     assert pruned[0]["exhausted"] is False
-    assert not [p for t, p in published if t == TOPIC_POLL_ERROR]
 
     gh.fetch_calls.clear()
     await watcher.poll_once()
     assert gh.fetch_calls == [("owner/repo", 1)]
-    # Still exactly one pruned event — no re-emission.
     assert len([p for t, p in published if t == TOPIC_WATCH_PRUNED]) == 1
 
 
 @pytest.mark.asyncio
-async def test_watcher_exhaustion_deregisters(store):
-    """When every explicitly-watched pair has 404ed the watcher removes
-    its own registry row (so rehydrate() can't resurrect it — the May
-    crash rehydrated watchers whose whole watch set was dead) and its
-    run loop exits."""
+async def test_successful_fetch_resets_404_streak(store):
+    """A pair that 404s intermittently (flaky visibility) never reaches
+    the prune threshold — success clears the streak."""
     gh = _FakeGithub()
     published: list[tuple[str, dict]] = []
     watcher = _make_watcher(store, gh, published, pr_numbers=[1, 2])
-    gh.errors[("owner/repo", 1)] = GithubNotFoundError("gone")
-    gh.errors[("owner/repo", 2)] = GithubNotFoundError("gone")
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(pr_number=1)
 
+    for _ in range(3):
+        gh.errors[("owner/repo", 2)] = GithubNotFoundError("blip")
+        await watcher.poll_once()
+        del gh.errors[("owner/repo", 2)]
+        gh.snapshots[("owner/repo", 2)] = _make_snapshot(pr_number=2)
+        await watcher.poll_once()
+        del gh.snapshots[("owner/repo", 2)]
+    assert not [p for t, p in published if t == TOPIC_WATCH_PRUNED]
+
+
+@pytest.mark.asyncio
+async def test_mass_404_treated_as_incident_not_deletion(store):
+    """When EVERY polled pair 404s in one cycle (revoked token / lost
+    visibility — codex P1 on this fix) nothing is pruned and no streak
+    advances, however many cycles it lasts; one incident-shaped
+    poll_error per cycle instead."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published, pr_numbers=[1, 2])
+    gh.errors[("owner/repo", 1)] = GithubNotFoundError("gone?")
+    gh.errors[("owner/repo", 2)] = GithubNotFoundError("gone?")
+
+    for _ in range(PRUNE_AFTER_CONSECUTIVE_404S + 2):
+        await watcher.poll_once()
+    assert not [p for t, p in published if t == TOPIC_WATCH_PRUNED]
+    errors = [p for t, p in published if t == TOPIC_POLL_ERROR]
+    assert len(errors) == PRUNE_AFTER_CONSECUTIVE_404S + 2
+    assert all("incident" in p["reason"] for p in errors)
+    assert store.list_watchers() != []
+
+    # Access restored: full watch set resumes untouched.
+    del gh.errors[("owner/repo", 1)]
+    del gh.errors[("owner/repo", 2)]
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(pr_number=1)
+    gh.snapshots[("owner/repo", 2)] = _make_snapshot(pr_number=2)
+    gh.fetch_calls.clear()
     await watcher.poll_once()
+    assert set(gh.fetch_calls) == {("owner/repo", 1), ("owner/repo", 2)}
+
+
+@pytest.mark.asyncio
+async def test_watcher_exhaustion_deregisters(store):
+    """When every explicitly-watched pair is pruned (single-pair watcher
+    riding the streak threshold) the watcher removes its own registry
+    row (rehydrate() can no longer resurrect it — the May crash
+    rehydrated watchers whose whole watch set was dead) and its run
+    loop exits."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published, pr_numbers=[63])
+    gh.errors[("owner/repo", 63)] = GithubNotFoundError("gone")
+
+    for _ in range(PRUNE_AFTER_CONSECUTIVE_404S):
+        await watcher.poll_once()
     pruned = [p for t, p in published if t == TOPIC_WATCH_PRUNED]
-    assert len(pruned) == 2
+    assert len(pruned) == 1
     assert pruned[-1]["exhausted"] is True
     assert store.list_watchers() == []
 
     # run() must exit promptly on the exhausted flag, not wait interval_s.
     stop = asyncio.Event()
     await asyncio.wait_for(watcher.run(stop), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_backoff_on_open_pr_enumeration(store):
+    """All-open mode: a rate-limited list_open_prs call must arm the
+    same backoff window as the snapshot path (codex P2 on this fix) —
+    no repo listing retries every interval_s."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    now = [1000.0]
+
+    async def publish(topic: str, payload: dict) -> None:
+        published.append((topic, dict(payload)))
+
+    async def limited_list(repo: str) -> list[int]:
+        raise GithubRateLimitError("rate limited", retry_after_s=120.0)
+
+    config = PRWatcherConfig(
+        watcher_id="prw_enum_backoff", repos=["owner/repo"],
+        pr_numbers=[], interval_s=60, started_at=0.0,
+    )
+    store.register_watcher(
+        watcher_id=config.watcher_id, repos=config.repos,
+        pr_numbers=config.pr_numbers, interval_s=config.interval_s,
+        started_at=config.started_at,
+    )
+    watcher = PRFleetWatcher(
+        config=config, store=store, publish=publish,
+        fetch_snapshot=gh.fetch_snapshot, list_open_prs=limited_list,
+        now_fn=lambda: now[0],
+    )
+
+    await watcher.poll_once()
+    errors = [p for t, p in published if t == TOPIC_POLL_ERROR]
+    assert len(errors) == 1 and "backing off" in errors[0]["reason"]
+
+    now[0] += 60.0
+    await watcher.poll_once()
+    # Window active: no second poll_error, no listing retry.
+    assert len([p for t, p in published if t == TOPIC_POLL_ERROR]) == 1
 
 
 @pytest.mark.asyncio

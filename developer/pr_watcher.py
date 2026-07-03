@@ -64,6 +64,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_RATE_LIMIT_BACKOFF_S = 900.0
 MAX_RATE_LIMIT_BACKOFF_S = 3600.0
 
+# Consecutive poll cycles a PR must 404 before it is pruned from an
+# explicit watch set. >1 because 404 also means "you can't see this
+# right now" (revoked token, visibility change) — see _notfound_streaks.
+PRUNE_AFTER_CONSECUTIVE_404S = 3
+
 # Publish signature: ``async def publish(topic: str, payload: dict) -> None``.
 # Matches BaseAgent.publish; tests substitute a list-append fake.
 PublishFn = Callable[[str, dict], Awaitable[None]]
@@ -598,6 +603,16 @@ class PRFleetWatcher:
         # removed so rehydrate() never resurrects a watcher with nothing
         # to watch.
         self._pruned_pairs: set[tuple[str, int]] = set()
+        # Consecutive-404 count per explicit pair. GitHub answers 404
+        # for revoked tokens / lost repo visibility too, not just
+        # deleted PRs — pruning on the first 404 would permanently
+        # discard valid watches during an auth incident (codex P1 on
+        # this fix). A pair is pruned only after
+        # PRUNE_AFTER_CONSECUTIVE_404S cycles in a row, and never in a
+        # cycle where EVERY polled pair 404ed (that shape is an
+        # account-level incident, not N simultaneous deletions —
+        # heuristic requires >=2 pairs polled to distinguish).
+        self._notfound_streaks: dict[tuple[str, int], int] = {}
         # Monotonic-ish deadline (same clock as ``now_fn``) before which
         # poll cycles are skipped entirely after a rate-limit response.
         self._backoff_until: float = 0.0
@@ -681,6 +696,21 @@ class PRFleetWatcher:
                 # CancelledError subclasses Exception (3.8+); never
                 # catch-and-continue past cooperative cancellation.
                 raise
+            except GithubRateLimitError as e:
+                backoff = min(
+                    e.retry_after_s or DEFAULT_RATE_LIMIT_BACKOFF_S,
+                    MAX_RATE_LIMIT_BACKOFF_S,
+                )
+                self._backoff_until = self._now() + backoff
+                # Same one-signal-per-window contract as the snapshot
+                # path: enumeration burns quota too (P2 of the codex
+                # review on this fix) — stop asking until the reset.
+                await self._emit_poll_error(
+                    repo,
+                    pr_number=0,
+                    reason=f"rate limited; backing off {int(backoff)}s: {e}",
+                )
+                break
             except Exception as e:
                 await self._emit_poll_error(repo, pr_number=0, reason=str(e))
                 continue
@@ -717,6 +747,7 @@ class PRFleetWatcher:
         # once per cycle and only when this buffer picks up entries
         # from the emit path below.
         self._cycle_transitions = {}
+        cycle_404s: list[tuple[str, int, str]] = []
         emitted = 0
         for repo, pr_number in pairs:
             try:
@@ -728,13 +759,12 @@ class PRFleetWatcher:
                 raise
             except GithubNotFoundError as e:
                 if self.config.pr_numbers:
-                    # Explicit watch set: this PR is gone (deleted, or a
-                    # typo'd number) and will 404 on every future cycle
-                    # — drop it instead of re-emitting poll_error forever
-                    # (bug_khonliang-developer_09e46e09).
-                    await self._prune_pair(repo, pr_number, reason=str(e))
-                    if self._exhausted:
-                        break
+                    # Explicit watch set: deleted PRs 404 forever, but so
+                    # do valid PRs during an auth/visibility incident —
+                    # defer the prune decision to the post-loop streak
+                    # logic (_apply_notfound_streaks) instead of dropping
+                    # the pair on first sight.
+                    cycle_404s.append((repo, pr_number, str(e)))
                 else:
                     # All-open mode: a 404 here is a PR that closed
                     # between the list call and the fetch — transient,
@@ -769,12 +799,17 @@ class PRFleetWatcher:
                 )
                 await self._emit_poll_error(repo, pr_number, reason=str(e))
                 continue
+            # A successful fetch clears any partial 404 streak — the
+            # pair is demonstrably visible again.
+            self._notfound_streaks.pop((repo, pr_number), None)
             # Cache the latest observed snapshot for ``pr_fleet_status``
             # consumers. Stored before transition detection so even a
             # cycle that produces zero new transitions still surfaces the
             # current PR state through the snapshot skill.
             self._latest_snapshots[(snapshot.repo, snapshot.pr_number)] = snapshot
             emitted += await self._emit_transitions(snapshot)
+        if cycle_404s:
+            await self._apply_notfound_streaks(cycle_404s, polled=len(pairs))
         self.store.touch_last_poll(self.config.watcher_id, self._now())
         # Emit the aggregate digest only when at least one transition
         # fired this cycle. Silent windows cost zero digest events —
@@ -1130,6 +1165,46 @@ class PRFleetWatcher:
                 "PR watcher %s: publish %s failed: %s",
                 self.config.watcher_id, TOPIC_FLEET_DIGEST, e,
             )
+
+    async def _apply_notfound_streaks(
+        self, cycle_404s: list[tuple[str, int, str]], polled: int
+    ) -> None:
+        """Decide which 404ed pairs are actually gone.
+
+        Two guards against mistaking an auth/visibility incident for
+        deletions (GitHub 404s private repos at revoked tokens too):
+        a pair is pruned only after PRUNE_AFTER_CONSECUTIVE_404S
+        consecutive cycles, and a cycle where EVERY polled pair (>= 2)
+        404ed doesn't count toward any streak — N simultaneous
+        deletions is far less likely than one dead token. Single-pair
+        watchers can't use the second guard and rely on the streak
+        threshold alone.
+        """
+        if polled >= 2 and len(cycle_404s) == polled:
+            await self._emit_poll_error(
+                cycle_404s[0][0],
+                pr_number=0,
+                reason=(
+                    f"all {polled} watched PRs returned 404 in one cycle; "
+                    "treating as auth/visibility incident, not deletions"
+                ),
+            )
+            return
+        for repo, pr_number, reason in cycle_404s:
+            streak = self._notfound_streaks.get((repo, pr_number), 0) + 1
+            self._notfound_streaks[(repo, pr_number)] = streak
+            if streak >= PRUNE_AFTER_CONSECUTIVE_404S:
+                self._notfound_streaks.pop((repo, pr_number), None)
+                await self._prune_pair(repo, pr_number, reason=reason)
+            else:
+                await self._emit_poll_error(
+                    repo,
+                    pr_number,
+                    reason=(
+                        f"404 ({streak}/{PRUNE_AFTER_CONSECUTIVE_404S} "
+                        f"consecutive before prune): {reason}"
+                    ),
+                )
 
     async def _prune_pair(self, repo: str, pr_number: int, reason: str) -> None:
         """Drop an explicitly-watched pair that 404ed; deregister when empty.
@@ -1688,7 +1763,8 @@ async def _list_open_pr_numbers(gh: GithubClient, repo: str) -> list[int]:
         # cancellation doesn't get wrapped as a GithubClientError.
         raise
     except Exception as e:
-        raise GithubClientError(f"list_open_prs({repo}): {e}") from e
+        from developer.github_client import classify_github_error
+        raise classify_github_error(e, f"list_open_prs({repo})") from e
     return [pr.number for pr in resp.parsed_data]
 
 
