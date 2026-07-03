@@ -44,10 +44,25 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
-from developer.github_client import GithubClient, GithubClientError, is_copilot_login
+from developer.github_client import (
+    GithubClient,
+    GithubClientError,
+    GithubNotFoundError,
+    GithubRateLimitError,
+    is_copilot_login,
+)
 
 logger = logging.getLogger(__name__)
 
+
+# Rate-limit backoff bounds. GitHub usually advertises a reset window
+# (githubkit surfaces it as ``retry_after``); when it doesn't, wait
+# DEFAULT_RATE_LIMIT_BACKOFF_S rather than hammering at ``interval_s``
+# — the 2026-05-17 crash burned the whole primary quota by retrying 25
+# dead PRs every 60s (bug_khonliang-developer_09e46e09). Capped so a
+# bogus server value can't park the watcher for hours.
+DEFAULT_RATE_LIMIT_BACKOFF_S = 900.0
+MAX_RATE_LIMIT_BACKOFF_S = 3600.0
 
 # Publish signature: ``async def publish(topic: str, payload: dict) -> None``.
 # Matches BaseAgent.publish; tests substitute a list-append fake.
@@ -62,6 +77,11 @@ TOPIC_MERGED = "pr.merged"
 TOPIC_MERGE_READY = "pr.merge_ready"
 TOPIC_CLOSED_WITHOUT_MERGE = "pr.closed_without_merge"
 TOPIC_POLL_ERROR = "pr.poll_error"
+# Emitted when an explicitly-watched PR 404s and is dropped from the
+# watch set (bug_khonliang-developer_09e46e09: deleted PRs were
+# re-polled forever). ``exhausted: true`` on the final event means the
+# watcher had nothing left to watch and deregistered itself.
+TOPIC_WATCH_PRUNED = "pr.watch_pruned"
 # Added by fr_developer_e2bdd869: comment-channel coverage.
 # ``pr.comment_posted`` covers ``/issues/N/comments`` (top-level PR
 # discussion — where Copilot's re-review verdicts land as bare
@@ -85,6 +105,7 @@ ALL_PR_TOPICS = (
     TOPIC_MERGE_READY,
     TOPIC_CLOSED_WITHOUT_MERGE,
     TOPIC_POLL_ERROR,
+    TOPIC_WATCH_PRUNED,
     TOPIC_COMMENT_POSTED,
     TOPIC_INLINE_FINDING,
     TOPIC_FLEET_DIGEST,
@@ -569,6 +590,20 @@ class PRFleetWatcher:
         self._list_open_prs = list_open_prs
         self._now = now_fn
         self._pr_count: int = 0
+        # Explicit-mode pairs dropped after a 404 (deleted / never-existed
+        # PR). In-memory only: a restart re-discovers each dead pair at
+        # the cost of one 404 per pair, then re-prunes — bounded and
+        # self-healing, no extra persisted state. Full exhaustion (every
+        # configured pair pruned) DOES persist: the registry row is
+        # removed so rehydrate() never resurrects a watcher with nothing
+        # to watch.
+        self._pruned_pairs: set[tuple[str, int]] = set()
+        # Monotonic-ish deadline (same clock as ``now_fn``) before which
+        # poll cycles are skipped entirely after a rate-limit response.
+        self._backoff_until: float = 0.0
+        # Set when every explicitly-watched pair has been pruned; the
+        # run loop exits and the registry row is already gone.
+        self._exhausted: bool = False
         # In-memory per-(repo, pr_number) caches of already-observed
         # comment ids, one per channel. Used to skip the ``_emit`` call
         # (and its ``INSERT OR IGNORE`` into ``pr_watcher_dedupe``) when
@@ -635,6 +670,8 @@ class PRFleetWatcher:
         if self.config.pr_numbers:
             for repo in self.config.repos:
                 for pr_number in self.config.pr_numbers:
+                    if (repo, pr_number) in self._pruned_pairs:
+                        continue
                     pairs.append((repo, pr_number))
             return pairs
         for repo in self.config.repos:
@@ -657,6 +694,14 @@ class PRFleetWatcher:
         Called from the async loop; also invoked directly by tests to
         step the watcher without sleeping.
         """
+        if self._exhausted:
+            return 0
+        if self._now() < self._backoff_until:
+            # Still inside a rate-limit window; skip the cycle without
+            # touching GitHub. One poll_error was emitted when the
+            # window was set — silence here avoids a per-tick spam
+            # stream that says the same thing.
+            return 0
         pairs = await self._resolve_pr_set()
         self._pr_count = len(pairs)
         # Prune in-memory seen caches for PRs that have dropped out of
@@ -681,6 +726,36 @@ class PRFleetWatcher:
                 # per-PR "keep the watcher alive" fallback below would
                 # swallow cooperative shutdown mid-poll.
                 raise
+            except GithubNotFoundError as e:
+                if self.config.pr_numbers:
+                    # Explicit watch set: this PR is gone (deleted, or a
+                    # typo'd number) and will 404 on every future cycle
+                    # — drop it instead of re-emitting poll_error forever
+                    # (bug_khonliang-developer_09e46e09).
+                    await self._prune_pair(repo, pr_number, reason=str(e))
+                    if self._exhausted:
+                        break
+                else:
+                    # All-open mode: a 404 here is a PR that closed
+                    # between the list call and the fetch — transient,
+                    # next resolve simply won't include it.
+                    await self._emit_poll_error(repo, pr_number, reason=str(e))
+                continue
+            except GithubRateLimitError as e:
+                backoff = min(
+                    e.retry_after_s or DEFAULT_RATE_LIMIT_BACKOFF_S,
+                    MAX_RATE_LIMIT_BACKOFF_S,
+                )
+                self._backoff_until = self._now() + backoff
+                # One signal per window, then abort the remaining pairs:
+                # every further call this cycle would burn quota to earn
+                # the same 403.
+                await self._emit_poll_error(
+                    repo,
+                    pr_number,
+                    reason=f"rate limited; backing off {int(backoff)}s: {e}",
+                )
+                break
             except GithubClientError as e:
                 await self._emit_poll_error(repo, pr_number, reason=str(e))
                 continue
@@ -738,6 +813,14 @@ class PRFleetWatcher:
                     "PR watcher %s: poll_once failed: %s",
                     self.config.watcher_id, e,
                 )
+            if self._exhausted:
+                # Every explicitly-watched PR 404ed and the registry row
+                # is gone (see _prune_pair) — nothing left to poll, ever.
+                logger.info(
+                    "PR watcher %s: watch set exhausted; loop exiting",
+                    self.config.watcher_id,
+                )
+                break
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=self.config.interval_s)
             except asyncio.TimeoutError:
@@ -1046,6 +1129,57 @@ class PRFleetWatcher:
             logger.warning(
                 "PR watcher %s: publish %s failed: %s",
                 self.config.watcher_id, TOPIC_FLEET_DIGEST, e,
+            )
+
+    async def _prune_pair(self, repo: str, pr_number: int, reason: str) -> None:
+        """Drop an explicitly-watched pair that 404ed; deregister when empty.
+
+        Emits ``pr.watch_pruned`` per drop. When the last configured
+        pair is pruned the watcher is exhausted: the registry row (and
+        its dedupe rows) are removed so a restart can't rehydrate a
+        watcher whose whole watch set is dead, and the run loop exits
+        on the ``_exhausted`` flag.
+        """
+        self._pruned_pairs.add((repo, pr_number))
+        configured = {
+            (r, n)
+            for r in self.config.repos
+            for n in self.config.pr_numbers
+        }
+        remaining = len(configured - self._pruned_pairs)
+        if remaining == 0:
+            self._exhausted = True
+            try:
+                self.store.remove_watcher(self.config.watcher_id)
+            except Exception as e:  # noqa: BLE001 - deregistration is best-effort
+                logger.warning(
+                    "PR watcher %s: failed to deregister after exhaustion: %s",
+                    self.config.watcher_id, e,
+                )
+        logger.info(
+            "PR watcher %s: pruned %s#%d (%s); %d pair(s) remain%s",
+            self.config.watcher_id, repo, pr_number, reason, remaining,
+            "; watcher exhausted, deregistering" if self._exhausted else "",
+        )
+        try:
+            await self._publish(
+                TOPIC_WATCH_PRUNED,
+                {
+                    "repo": repo,
+                    "pr_number": pr_number,
+                    "watcher_id": self.config.watcher_id,
+                    "reason": reason,
+                    "remaining": remaining,
+                    "exhausted": self._exhausted,
+                    "at": self._now(),
+                },
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "PR watcher %s: failed to publish watch_pruned: %s",
+                self.config.watcher_id, e,
             )
 
     async def _emit_poll_error(self, repo: str, pr_number: int, reason: str) -> None:

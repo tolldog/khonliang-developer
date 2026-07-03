@@ -2513,3 +2513,189 @@ def test_store_closes_every_connection(tmp_path: Path, monkeypatch):
     assert TrackingConnection.instances, "tracking hook never engaged"
     leaked = [c for c in TrackingConnection.instances if not c.was_closed]
     assert not leaked, f"{len(leaked)} connection(s) left open"
+
+
+# ---------------------------------------------------------------------------
+# 404 pruning + rate-limit backoff (bug_khonliang-developer_09e46e09,
+# bug_khonliang-developer_287fc547)
+# ---------------------------------------------------------------------------
+
+from developer.github_client import (
+    GithubNotFoundError,
+    GithubRateLimitError,
+    classify_github_error,
+)
+from developer.pr_watcher import TOPIC_WATCH_PRUNED
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, headers: dict | None = None):
+        self.status_code = status_code
+        self.headers = headers or {}
+
+
+class _FakeRequestFailed(Exception):
+    def __init__(self, status_code: int, headers: dict | None = None):
+        super().__init__(f"http {status_code}")
+        self.response = _FakeResponse(status_code, headers)
+
+
+class _FakeRateLimitExceeded(_FakeRequestFailed):
+    def __init__(self, retry_after_s: float):
+        super().__init__(403)
+        import datetime
+        self.retry_after = datetime.timedelta(seconds=retry_after_s)
+
+
+def test_classify_github_error_taxonomy():
+    """404 → NotFound; retry_after → RateLimit with seconds; 403 with
+    exhausted quota headers → RateLimit; plain 403 and unknown errors
+    stay generic."""
+    nf = classify_github_error(_FakeRequestFailed(404), "get_pr(o/r#1)")
+    assert isinstance(nf, GithubNotFoundError)
+
+    rl = classify_github_error(_FakeRateLimitExceeded(120.0), "get_pr(o/r#1)")
+    assert isinstance(rl, GithubRateLimitError)
+    assert rl.retry_after_s == 120.0
+
+    import time as _time
+    hdr = classify_github_error(
+        _FakeRequestFailed(
+            403,
+            {"x-ratelimit-remaining": "0",
+             "x-ratelimit-reset": str(_time.time() + 60)},
+        ),
+        "get_pr(o/r#1)",
+    )
+    assert isinstance(hdr, GithubRateLimitError)
+    assert hdr.retry_after_s is not None and 0 < hdr.retry_after_s <= 61
+
+    plain_403 = classify_github_error(_FakeRequestFailed(403), "get_pr(o/r#1)")
+    assert type(plain_403) is GithubClientError
+
+    generic = classify_github_error(ValueError("boom"), "get_pr(o/r#1)")
+    assert type(generic) is GithubClientError
+
+
+@pytest.mark.asyncio
+async def test_explicit_watcher_prunes_404_pr(store):
+    """A 404 on an explicitly-watched PR drops it from the watch set:
+    one pr.watch_pruned event, no further fetches for that pair, and
+    NO endless pr.poll_error stream (the n=2243 spam of bug_287fc547)."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published, pr_numbers=[1, 2])
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(pr_number=1)
+    gh.errors[("owner/repo", 2)] = GithubNotFoundError("get_pr(owner/repo#2): not found (404)")
+
+    await watcher.poll_once()
+    pruned = [p for t, p in published if t == TOPIC_WATCH_PRUNED]
+    assert len(pruned) == 1
+    assert pruned[0]["pr_number"] == 2
+    assert pruned[0]["exhausted"] is False
+    assert not [p for t, p in published if t == TOPIC_POLL_ERROR]
+
+    gh.fetch_calls.clear()
+    await watcher.poll_once()
+    assert gh.fetch_calls == [("owner/repo", 1)]
+    # Still exactly one pruned event — no re-emission.
+    assert len([p for t, p in published if t == TOPIC_WATCH_PRUNED]) == 1
+
+
+@pytest.mark.asyncio
+async def test_watcher_exhaustion_deregisters(store):
+    """When every explicitly-watched pair has 404ed the watcher removes
+    its own registry row (so rehydrate() can't resurrect it — the May
+    crash rehydrated watchers whose whole watch set was dead) and its
+    run loop exits."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published, pr_numbers=[1, 2])
+    gh.errors[("owner/repo", 1)] = GithubNotFoundError("gone")
+    gh.errors[("owner/repo", 2)] = GithubNotFoundError("gone")
+
+    await watcher.poll_once()
+    pruned = [p for t, p in published if t == TOPIC_WATCH_PRUNED]
+    assert len(pruned) == 2
+    assert pruned[-1]["exhausted"] is True
+    assert store.list_watchers() == []
+
+    # run() must exit promptly on the exhausted flag, not wait interval_s.
+    stop = asyncio.Event()
+    await asyncio.wait_for(watcher.run(stop), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_all_open_mode_404_does_not_prune(store):
+    """In watch-all-open mode a 404 is transient (PR closed between the
+    list call and the fetch) — poll_error, no prune, no deregistration."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published, pr_numbers=[])
+    gh.open_prs["owner/repo"] = [5]
+    gh.errors[("owner/repo", 5)] = GithubNotFoundError("gone mid-cycle")
+
+    await watcher.poll_once()
+    assert [t for t, _ in published] == [TOPIC_POLL_ERROR]
+    assert store.list_watchers() != []
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_backoff_skips_cycles(store):
+    """A rate-limited fetch aborts the cycle, emits ONE poll_error, and
+    suppresses all GitHub calls until the advertised window passes —
+    instead of retrying every interval_s (the quota burn that crashed
+    the agent on 2026-05-17)."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    now = [1000.0]
+
+    async def publish(topic: str, payload: dict) -> None:
+        published.append((topic, dict(payload)))
+
+    config = PRWatcherConfig(
+        watcher_id="prw_backoff",
+        repos=["owner/repo"],
+        pr_numbers=[1, 2],
+        interval_s=60,
+        started_at=0.0,
+    )
+    store.register_watcher(
+        watcher_id=config.watcher_id, repos=config.repos,
+        pr_numbers=config.pr_numbers, interval_s=config.interval_s,
+        started_at=config.started_at,
+    )
+    watcher = PRFleetWatcher(
+        config=config, store=store, publish=publish,
+        fetch_snapshot=gh.fetch_snapshot, list_open_prs=gh.list_open_prs,
+        now_fn=lambda: now[0],
+    )
+    gh.errors[("owner/repo", 1)] = GithubRateLimitError(
+        "rate limited", retry_after_s=300.0,
+    )
+    gh.snapshots[("owner/repo", 2)] = _make_snapshot(pr_number=2)
+
+    await watcher.poll_once()
+    # Cycle aborted after the rate-limit hit: PR#2 never fetched.
+    assert gh.fetch_calls == [("owner/repo", 1)]
+    errors = [p for t, p in published if t == TOPIC_POLL_ERROR]
+    assert len(errors) == 1 and "backing off" in errors[0]["reason"]
+
+    # Within the window: zero GitHub traffic, zero new events.
+    gh.fetch_calls.clear()
+    now[0] += 60.0
+    await watcher.poll_once()
+    assert gh.fetch_calls == []
+    assert len([p for t, p in published if t == TOPIC_POLL_ERROR]) == 1
+
+    # Window elapsed: polling resumes.
+    now[0] += 300.0
+    gh.errors.pop(("owner/repo", 1))
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(pr_number=1)
+    await watcher.poll_once()
+    assert set(gh.fetch_calls) == {("owner/repo", 1), ("owner/repo", 2)}
+
+
+def test_watch_pruned_topic_registered():
+    assert TOPIC_WATCH_PRUNED in ALL_PR_TOPICS
+    assert TOPIC_WATCH_PRUNED.startswith("pr.")
