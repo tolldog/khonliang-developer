@@ -2851,3 +2851,41 @@ async def test_enumeration_rate_limit_aborts_cycle_without_partial_state(store):
     assert len(watcher.latest_snapshots()) == 2
     errors = [p for t, p in published if t == TOPIC_POLL_ERROR]
     assert len(errors) == 1 and "backing off" in errors[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_incident_cycle_resets_partial_streaks(store):
+    """An all-404 incident cycle clears earlier per-pair streaks: a
+    still-valid PR at streak 2 must not be pruned by one isolated 404
+    right after access is restored (codex round-3 P1)."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    watcher = _make_watcher(store, gh, published, pr_numbers=[1, 2])
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(pr_number=1)
+    gh.errors[("owner/repo", 2)] = GithubNotFoundError("blip")
+
+    for _ in range(PRUNE_AFTER_CONSECUTIVE_404S - 1):
+        await watcher.poll_once()
+
+    # Incident cycle: everything 404s.
+    gh.errors[("owner/repo", 1)] = GithubNotFoundError("token revoked")
+    await watcher.poll_once()
+    del gh.errors[("owner/repo", 1)]
+
+    # One more isolated 404 for #2 — streak restarted at 1, no prune.
+    await watcher.poll_once()
+    assert not [p for t, p in published if t == TOPIC_WATCH_PRUNED]
+
+
+def test_classify_secondary_rate_limit_retry_after_header():
+    """403 + Retry-After with NONZERO remaining quota is a secondary
+    rate limit, not a generic client error (codex round-3 P1)."""
+    err = classify_github_error(
+        _FakeRequestFailed(
+            403,
+            {"retry-after": "42", "x-ratelimit-remaining": "4999"},
+        ),
+        "get_pr(o/r#1)",
+    )
+    assert isinstance(err, GithubRateLimitError)
+    assert err.retry_after_s == 42.0

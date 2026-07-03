@@ -1189,6 +1189,11 @@ class PRFleetWatcher:
         threshold alone.
         """
         if polled >= 2 and len(cycle_404s) == polled:
+            # The incident undermines confidence in EARLIER 404s too —
+            # a pair at streak 2 must not get pruned by one isolated
+            # 404 right after access is restored. Wrong-prune is the
+            # worse failure mode, so reset all streaks.
+            self._notfound_streaks.clear()
             await self._emit_poll_error(
                 cycle_404s[0][0],
                 pr_number=0,

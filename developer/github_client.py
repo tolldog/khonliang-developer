@@ -188,14 +188,24 @@ def classify_github_error(e: Exception, context: str) -> GithubClientError:
     if status in (403, 429):
         headers = getattr(response, "headers", None) or {}
         remaining = headers.get("x-ratelimit-remaining")
-        if status == 429 or remaining == "0":
-            reset = headers.get("x-ratelimit-reset")
+        retry_after_hdr = headers.get("retry-after")
+        # Secondary/abuse limits commonly arrive as 403 + Retry-After
+        # with NONZERO remaining primary quota — they are rate limits
+        # all the same.
+        if status == 429 or remaining == "0" or retry_after_hdr is not None:
             retry_s: Optional[float] = None
-            if reset:
+            if retry_after_hdr is not None:
                 try:
-                    retry_s = max(0.0, float(reset) - time.time())
+                    retry_s = max(0.0, float(retry_after_hdr))
                 except (TypeError, ValueError):
                     retry_s = None
+            if retry_s is None:
+                reset = headers.get("x-ratelimit-reset")
+                if reset:
+                    try:
+                        retry_s = max(0.0, float(reset) - time.time())
+                    except (TypeError, ValueError):
+                        retry_s = None
             return GithubRateLimitError(
                 f"{context}: rate limited ({status}): {e}", retry_after_s=retry_s
             )
