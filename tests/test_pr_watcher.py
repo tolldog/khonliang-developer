@@ -2779,3 +2779,49 @@ async def test_enumeration_rate_limit_aborts_cycle_without_partial_state(store):
     assert len(watcher.latest_snapshots()) == 2
     errors = [p for t, p in published if t == TOPIC_POLL_ERROR]
     assert len(errors) == 1 and "backing off" in errors[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_expired_rate_limit_window_does_not_suppress(store):
+    """retry_after_s == 0.0 means the window already passed during
+    classification — polling must resume next cycle, not sleep the
+    900s default (codex round-5 P2: `or` treated 0.0 as absent)."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    now = [1000.0]
+    watcher = _make_clocked_watcher(store, gh, published, now, pr_numbers=[1])
+    gh.errors[("owner/repo", 1)] = GithubRateLimitError(
+        "rate limited", retry_after_s=0.0,
+    )
+
+    await watcher.poll_once()
+
+    del gh.errors[("owner/repo", 1)]
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(pr_number=1)
+    gh.fetch_calls.clear()
+    now[0] += 60.0
+    await watcher.poll_once()
+    assert gh.fetch_calls == [("owner/repo", 1)]
+
+
+@pytest.mark.asyncio
+async def test_backed_off_pair_stays_in_fleet_state(store):
+    """A 404-backed-off explicit pair is still WATCHED: its cached
+    snapshot survives in latest_snapshots and pr_count doesn't dip for
+    the backoff window (codex round-5 P2)."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    now = [1000.0]
+    watcher = _make_clocked_watcher(store, gh, published, now, pr_numbers=[1, 2])
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(pr_number=1)
+    gh.snapshots[("owner/repo", 2)] = _make_snapshot(pr_number=2)
+    await watcher.poll_once()
+    assert len(watcher.latest_snapshots()) == 2
+
+    # #2 goes 404: backed off, but still watched.
+    gh.errors[("owner/repo", 2)] = GithubNotFoundError("blip")
+    await watcher.poll_once()
+    now[0] += 60.0
+    await watcher.poll_once()  # within #2's window: fetch skipped
+    assert len(watcher.latest_snapshots()) == 2
+    assert watcher.pr_count == 2

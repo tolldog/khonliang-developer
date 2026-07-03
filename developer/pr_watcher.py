@@ -691,8 +691,14 @@ class PRFleetWatcher:
                 # catch-and-continue past cooperative cancellation.
                 raise
             except GithubRateLimitError as e:
+                # retry_after_s == 0.0 is a legitimately-expired window
+                # (reset passed during classification) — only None means
+                # "GitHub didn't say"; `or` would turn 0.0 into a 15-min
+                # outage.
                 backoff = min(
-                    e.retry_after_s or DEFAULT_RATE_LIMIT_BACKOFF_S,
+                    DEFAULT_RATE_LIMIT_BACKOFF_S
+                    if e.retry_after_s is None
+                    else e.retry_after_s,
                     MAX_RATE_LIMIT_BACKOFF_S,
                 )
                 self._backoff_until = self._now() + backoff
@@ -733,14 +739,27 @@ class PRFleetWatcher:
             # still spend snapshot quota inside the window. Abort the
             # whole cycle instead; state stays as it was.
             return 0
-        self._pr_count = len(pairs)
+        # Watched set for cache retention and fleet visibility. In
+        # explicit mode this is the full configured set — a 404-backed-
+        # off pair is still WATCHED (its cached snapshot must survive in
+        # pr_fleet_status and pr_count must not dip), it just isn't
+        # FETCHED this cycle. In all-open mode the resolved list is the
+        # set: closed/merged PRs drop out and their caches with them.
+        if self.config.pr_numbers:
+            active_keys = {
+                (repo, pr_number)
+                for repo in self.config.repos
+                for pr_number in self.config.pr_numbers
+            }
+        else:
+            active_keys = {(repo, pr_number) for repo, pr_number in pairs}
+        self._pr_count = len(active_keys)
         # Prune in-memory seen caches for PRs that have dropped out of
-        # the active set (closed / merged PRs in "watch all open PRs"
+        # the watched set (closed / merged PRs in "watch all open PRs"
         # mode no longer show up in ``_resolve_pr_set``). Without this
         # the caches grow monotonically over the watcher's lifetime.
         # Cross-restart dedupe remains the SQLite table's job; this
         # only reclaims process memory.
-        active_keys = {(repo, pr_number) for repo, pr_number in pairs}
         self._prune_seen_caches(active_keys)
         # Reset the per-cycle digest buffer. Anything still hanging off
         # a previous cycle is stale; ``pr.fleet_digest`` fires at most
@@ -770,8 +789,14 @@ class PRFleetWatcher:
                     await self._emit_poll_error(repo, pr_number, reason=str(e))
                 continue
             except GithubRateLimitError as e:
+                # retry_after_s == 0.0 is a legitimately-expired window
+                # (reset passed during classification) — only None means
+                # "GitHub didn't say"; `or` would turn 0.0 into a 15-min
+                # outage.
                 backoff = min(
-                    e.retry_after_s or DEFAULT_RATE_LIMIT_BACKOFF_S,
+                    DEFAULT_RATE_LIMIT_BACKOFF_S
+                    if e.retry_after_s is None
+                    else e.retry_after_s,
                     MAX_RATE_LIMIT_BACKOFF_S,
                 )
                 self._backoff_until = self._now() + backoff
