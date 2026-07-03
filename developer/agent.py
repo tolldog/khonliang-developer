@@ -587,7 +587,14 @@ class DeveloperAgent(BaseAgent):
                    "tests": {"type": "string", "default": "",
                              "description": "optional JSON test digest"},
                    "evidence_query": {"type": "string", "default": ""},
-                   "next_actions": {"type": "string", "default": ""}},
+                   "next_actions": {"type": "string", "default": ""},
+                   "summary": {"type": "string", "default": "",
+                               "description": "free-text session summary, persisted verbatim "
+                                              "into the checkpoint and surfaced in the resume "
+                                              "briefing"},
+                   "open_items": {"type": "string", "default": "",
+                                  "description": "comma-separated (or list) of unfinished "
+                                                 "threads for the next session to pick up"}},
                   since="0.12.0"),
             Skill("resume_session_checkpoint",
                   "Build a launch briefing from a checkpoint and detect stale git/PR state",
@@ -2596,11 +2603,33 @@ class DeveloperAgent(BaseAgent):
             response["remaining_work_units"] = remaining
         return response
 
+    # The full set of args handle_create_session_checkpoint reads.
+    # Anything outside this set is rejected loudly — historically
+    # `summary` / `open_items` were silently dropped while the call
+    # returned ok, so a caller trusting the response believed its
+    # checkpoint text was persisted when it wasn't (bug_developer_6bfce7c0,
+    # same family as bug_developer_51fb98c9).
+    _CREATE_SESSION_CHECKPOINT_ARGS = frozenset({
+        "cwd", "fr_id", "work_unit", "repo", "pr_number", "tests",
+        "evidence_query", "next_actions", "summary", "open_items",
+        "context_tokens", "context_limit", "idle_minutes",
+    })
+
     @handler("create_session_checkpoint")
     async def handle_create_session_checkpoint(self, args):
         """Create a compact checkpoint for cache-aware session exit/resume."""
         from developer.git_client import GitClient, GitClientError
         from developer.session_checkpoint import build_session_checkpoint
+
+        unknown = set(args) - self._CREATE_SESSION_CHECKPOINT_ARGS
+        if unknown:
+            return {
+                "error": (
+                    f"unsupported args for create_session_checkpoint: "
+                    f"{', '.join(sorted(unknown))}. accepted args: "
+                    f"{', '.join(sorted(self._CREATE_SESSION_CHECKPOINT_ARGS))}."
+                )
+            }
 
         cwd = args.get("cwd", "")
         if not cwd:
@@ -2655,6 +2684,8 @@ class DeveloperAgent(BaseAgent):
                 "developer_db": str(self.pipeline.config.db_path),
             },
             next_actions=_parse_paths(args.get("next_actions", "")),
+            summary=str(args.get("summary") or "").strip(),
+            open_items=_parse_paths(args.get("open_items", "")),
             context_tokens=_int_arg(args, "context_tokens", 0),
             context_limit=_int_arg(args, "context_limit", 0),
             idle_minutes=_float_arg(args, "idle_minutes", 0.0),
