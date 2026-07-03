@@ -175,10 +175,14 @@ def _is_vendored_or_hidden(rel_parts: tuple[str, ...]) -> bool:
 
     Without this, generic request tokens match inside e.g.
     ``.venv/.../typing_extensions.py`` and get cited as "evidence"
-    (bug_khonliang-developer_3cd31ca5).
+    (bug_khonliang-developer_3cd31ca5). ``.github`` is the one hidden
+    dir that is first-party by convention (CI workflows, review
+    instructions) — drafts about those workflows need its files as
+    evidence, so it alone is allowlisted.
     """
     return any(
-        part.startswith(".") or part in _EXCLUDED_DIR_COMPONENTS
+        (part.startswith(".") and part != ".github")
+        or part in _EXCLUDED_DIR_COMPONENTS
         for part in rel_parts
     )
 
