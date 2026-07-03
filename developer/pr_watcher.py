@@ -611,6 +611,11 @@ class PRFleetWatcher:
         # Monotonic-ish deadline (same clock as ``now_fn``) before which
         # poll cycles are skipped entirely after a rate-limit response.
         self._backoff_until: float = 0.0
+        # Set by _resolve_pr_set when enumeration rate-limits mid-way:
+        # the pair list it returned is PARTIAL and the cycle must be
+        # abandoned even when the advertised window is zero seconds
+        # (now < _backoff_until is false the moment it is armed).
+        self._cycle_aborted: bool = False
         # In-memory per-(repo, pr_number) caches of already-observed
         # comment ids, one per channel. Used to skip the ``_emit`` call
         # (and its ``INSERT OR IGNORE`` into ``pr_watcher_dedupe``) when
@@ -702,6 +707,7 @@ class PRFleetWatcher:
                     MAX_RATE_LIMIT_BACKOFF_S,
                 )
                 self._backoff_until = self._now() + backoff
+                self._cycle_aborted = True
                 # Same one-signal-per-window contract as the snapshot
                 # path: enumeration burns quota too (P2 of the codex
                 # review on this fix) — stop asking until the reset.
@@ -730,14 +736,17 @@ class PRFleetWatcher:
             # window was set — silence here avoids a per-tick spam
             # stream that says the same thing.
             return 0
+        self._cycle_aborted = False
         pairs = await self._resolve_pr_set()
-        if self._now() < self._backoff_until:
+        if self._cycle_aborted or self._now() < self._backoff_until:
             # Enumeration armed the backoff mid-resolve (rate-limited
             # list_open_prs). The pair list is PARTIAL — repos after the
             # limited one were never enumerated — so treating it as the
             # active set would prune caches for untouched repos and
             # still spend snapshot quota inside the window. Abort the
-            # whole cycle instead; state stays as it was.
+            # whole cycle instead; state stays as it was. The explicit
+            # flag covers zero-second windows, where the clock check is
+            # already false by the time we get here.
             return 0
         # Watched set for cache retention and fleet visibility. In
         # explicit mode this is the full configured set — a 404-backed-

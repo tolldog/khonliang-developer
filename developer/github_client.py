@@ -190,9 +190,18 @@ def classify_github_error(e: Exception, context: str) -> GithubClientError:
         remaining = headers.get("x-ratelimit-remaining")
         retry_after_hdr = headers.get("retry-after")
         # Secondary/abuse limits commonly arrive as 403 + Retry-After
-        # with NONZERO remaining primary quota — they are rate limits
-        # all the same.
-        if status == 429 or remaining == "0" or retry_after_hdr is not None:
+        # with NONZERO remaining primary quota — and sometimes as a
+        # plain 403 whose only tell is the documented message text.
+        message = str(e).lower()
+        looks_secondary = (
+            "secondary rate limit" in message or "abuse" in message
+        )
+        if (
+            status == 429
+            or remaining == "0"
+            or retry_after_hdr is not None
+            or looks_secondary
+        ):
             retry_s: Optional[float] = None
             if retry_after_hdr is not None:
                 try:

@@ -2825,3 +2825,55 @@ async def test_backed_off_pair_stays_in_fleet_state(store):
     await watcher.poll_once()  # within #2's window: fetch skipped
     assert len(watcher.latest_snapshots()) == 2
     assert watcher.pr_count == 2
+
+
+@pytest.mark.asyncio
+async def test_zero_window_enumeration_limit_still_aborts_cycle(store):
+    """Enumeration rate limit with retry_after_s == 0.0 must still
+    abandon the partial pair list — the clock check is already false
+    when the window is zero (codex round-6 P2)."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    now = [1000.0]
+
+    async def publish(topic: str, payload: dict) -> None:
+        published.append((topic, dict(payload)))
+
+    async def list_open(repo: str) -> list[int]:
+        if repo == "owner/beta":
+            raise GithubRateLimitError("rate limited", retry_after_s=0.0)
+        return [1]
+
+    config = PRWatcherConfig(
+        watcher_id="prw_zero", repos=["owner/alpha", "owner/beta"],
+        pr_numbers=[], interval_s=60, started_at=0.0,
+    )
+    store.register_watcher(
+        watcher_id=config.watcher_id, repos=config.repos,
+        pr_numbers=config.pr_numbers, interval_s=config.interval_s,
+        started_at=config.started_at,
+    )
+    watcher = PRFleetWatcher(
+        config=config, store=store, publish=publish,
+        fetch_snapshot=gh.fetch_snapshot, list_open_prs=list_open,
+        now_fn=lambda: now[0],
+    )
+    await watcher.poll_once()
+    # Partial alpha-only pair list abandoned: no snapshot fetches.
+    assert gh.fetch_calls == []
+
+
+def test_classify_secondary_limit_by_message_only():
+    """A plain 403 with remaining quota and no retry headers but the
+    documented secondary-limit message is a rate limit (codex round-6
+    P2)."""
+    class _SecondaryFailed(_FakeRequestFailed):
+        def __str__(self):
+            return "You have exceeded a secondary rate limit"
+
+    err = classify_github_error(
+        _SecondaryFailed(403, {"x-ratelimit-remaining": "4999"}),
+        "get_pr(o/r#1)",
+    )
+    assert isinstance(err, GithubRateLimitError)
+    assert err.retry_after_s is None
