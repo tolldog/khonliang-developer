@@ -2322,8 +2322,36 @@ async def test_create_session_checkpoint_handler(harness, git_repo):
 
 
 @pytest.mark.asyncio
+async def test_create_session_checkpoint_persists_summary_and_open_items(harness, git_repo):
+    result = await harness.call("create_session_checkpoint", {
+        "cwd": str(git_repo),
+        "summary": "landed the checkpoint arg fix",
+        "open_items": "wire resume briefing,write tests",
+    })
+
+    checkpoint = result["checkpoint"]
+    assert checkpoint["summary"] == "landed the checkpoint arg fix"
+    assert checkpoint["open_items"] == ["wire resume briefing", "write tests"]
+
+
+@pytest.mark.asyncio
+async def test_create_session_checkpoint_rejects_unknown_arg(harness, git_repo):
+    result = await harness.call("create_session_checkpoint", {
+        "cwd": str(git_repo),
+        "notes": "should have been summary",
+    })
+
+    assert "error" in result
+    assert "notes" in result["error"]
+
+
+@pytest.mark.asyncio
 async def test_resume_session_checkpoint_handler_detects_git_drift(harness, git_repo):
-    initial = await harness.call("create_session_checkpoint", {"cwd": str(git_repo)})
+    initial = await harness.call("create_session_checkpoint", {
+        "cwd": str(git_repo),
+        "summary": "initial checkpoint",
+        "open_items": "follow up on X",
+    })
     checkpoint = initial["checkpoint"]
     (git_repo / "later.txt").write_text("later\n")
 
@@ -2337,6 +2365,10 @@ async def test_resume_session_checkpoint_handler_detects_git_drift(harness, git_
     assert resume["stale"] is True
     assert "changed file set differs from checkpoint" in resume["stale_reasons"]
     assert "resume checkpoint:" in resume["briefing"]
+    assert resume["summary"] == "initial checkpoint"
+    assert resume["open_items"] == ["follow up on X"]
+    assert "summary: initial checkpoint" in resume["briefing"]
+    assert "open items: follow up on X" in resume["briefing"]
 
 
 @pytest.mark.asyncio

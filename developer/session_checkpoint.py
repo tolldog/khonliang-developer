@@ -34,6 +34,8 @@ def build_session_checkpoint(
     evidence: list[dict[str, Any]] | None = None,
     agent_state: dict[str, Any] | None = None,
     next_actions: list[str] | None = None,
+    summary: str = "",
+    open_items: list[str] | None = None,
     context_tokens: int = 0,
     context_limit: int = 0,
     idle_minutes: float = 0.0,
@@ -54,6 +56,8 @@ def build_session_checkpoint(
         "schema": SCHEMA_VERSION,
         "checkpoint_id": _checkpoint_id(fr, created_at),
         "created_at": created_at,
+        "summary": str(summary or ""),
+        "open_items": list(open_items or []),
         "fr": _fr_summary(fr),
         "work_unit": _work_unit_summary(work_unit),
         "repo": {
@@ -112,6 +116,8 @@ def build_resume_briefing(
     repo = checkpoint.get("repo") or {}
     pr = checkpoint.get("pull_request") or {}
     tests = checkpoint.get("tests") or {}
+    summary = str(checkpoint.get("summary") or "")
+    open_items = list(checkpoint.get("open_items") or [])
     actions = list(checkpoint.get("next_actions") or [])
     if stale_reasons:
         actions.insert(0, "refresh checkpoint before relying on stale state")
@@ -123,6 +129,10 @@ def build_resume_briefing(
         f"branch: {current_git_status.branch} @ {current_head_sha[:12]}",
         f"dirty: {current_git_status.is_dirty}",
     ]
+    if summary:
+        lines.append(f"summary: {summary}")
+    if open_items:
+        lines.append("open items: " + "; ".join(open_items))
     if pr:
         lines.append(
             "pr: "
@@ -146,6 +156,8 @@ def build_resume_briefing(
         "checked_at": checked_at,
         "stale": bool(stale_reasons),
         "stale_reasons": stale_reasons,
+        "summary": summary,
+        "open_items": open_items,
         "fr": fr,
         "repo": {
             "path": repo.get("path", ""),
