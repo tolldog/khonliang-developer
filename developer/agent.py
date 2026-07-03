@@ -5219,7 +5219,11 @@ def main():
     )
 
     if args.command in ("install", "uninstall"):
-        BaseAgent.from_cli([
+        # Dispatch through the subclass: from_cli is a classmethod, so
+        # calling it on BaseAgent would construct a BaseAgent and install
+        # with BaseAgent's module_name/agent_type instead of this agent's
+        # (bug_developer_agent_main_install_uses_base_class_4bb0a5cf).
+        DeveloperAgent.from_cli([
             args.command,
             "--id", args.id,
             "--bus", args.bus,
