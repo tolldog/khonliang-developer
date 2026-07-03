@@ -2795,3 +2795,59 @@ async def test_rate_limit_backoff_skips_cycles(store):
 def test_watch_pruned_topic_registered():
     assert TOPIC_WATCH_PRUNED in ALL_PR_TOPICS
     assert TOPIC_WATCH_PRUNED.startswith("pr.")
+
+
+@pytest.mark.asyncio
+async def test_enumeration_rate_limit_aborts_cycle_without_partial_state(store):
+    """Multi-repo all-open mode: a rate limit on a LATER repo's listing
+    must abort the whole cycle — the partial pair list must not prune
+    caches for un-enumerated repos nor spend snapshot quota inside the
+    freshly-armed window (codex round-2 P2 on this fix)."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    now = [1000.0]
+
+    async def publish(topic: str, payload: dict) -> None:
+        published.append((topic, dict(payload)))
+
+    calls: list[str] = []
+
+    async def list_open(repo: str) -> list[int]:
+        calls.append(repo)
+        if repo == "owner/beta":
+            raise GithubRateLimitError("rate limited", retry_after_s=120.0)
+        return [1]
+
+    config = PRWatcherConfig(
+        watcher_id="prw_partial", repos=["owner/alpha", "owner/beta"],
+        pr_numbers=[], interval_s=60, started_at=0.0,
+    )
+    store.register_watcher(
+        watcher_id=config.watcher_id, repos=config.repos,
+        pr_numbers=config.pr_numbers, interval_s=config.interval_s,
+        started_at=config.started_at,
+    )
+    watcher = PRFleetWatcher(
+        config=config, store=store, publish=publish,
+        fetch_snapshot=gh.fetch_snapshot, list_open_prs=list_open,
+        now_fn=lambda: now[0],
+    )
+    # Seed a cached snapshot for alpha#1 from a healthy cycle.
+    gh.snapshots[("owner/alpha", 1)] = _make_snapshot(repo="owner/alpha", pr_number=1)
+    gh.snapshots[("owner/beta", 1)] = _make_snapshot(repo="owner/beta", pr_number=1)
+    orig_beta_list = None  # first cycle: beta healthy
+    async def list_open_healthy(repo: str) -> list[int]:
+        return [1]
+    watcher._list_open_prs = list_open_healthy
+    await watcher.poll_once()
+    assert len(watcher.latest_snapshots()) == 2
+
+    # Second cycle: beta's listing rate-limits.
+    watcher._list_open_prs = list_open
+    gh.fetch_calls.clear()
+    await watcher.poll_once()
+    # Whole cycle aborted: zero snapshot fetches, caches intact.
+    assert gh.fetch_calls == []
+    assert len(watcher.latest_snapshots()) == 2
+    errors = [p for t, p in published if t == TOPIC_POLL_ERROR]
+    assert len(errors) == 1 and "backing off" in errors[0]["reason"]

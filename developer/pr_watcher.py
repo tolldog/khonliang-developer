@@ -733,6 +733,14 @@ class PRFleetWatcher:
             # stream that says the same thing.
             return 0
         pairs = await self._resolve_pr_set()
+        if self._now() < self._backoff_until:
+            # Enumeration armed the backoff mid-resolve (rate-limited
+            # list_open_prs). The pair list is PARTIAL — repos after the
+            # limited one were never enumerated — so treating it as the
+            # active set would prune caches for untouched repos and
+            # still spend snapshot quota inside the window. Abort the
+            # whole cycle instead; state stays as it was.
+            return 0
         self._pr_count = len(pairs)
         # Prune in-memory seen caches for PRs that have dropped out of
         # the active set (closed / merged PRs in "watch all open PRs"
