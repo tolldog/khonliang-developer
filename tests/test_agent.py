@@ -3611,3 +3611,43 @@ async def test_list_milestones_string_false_include_archived_not_truthy(harness)
             f"include_archived={falsey!r} leaked an abandoned milestone"
         )
         assert active["milestone"]["id"] in ids
+
+
+# -- CLI install dispatch --
+
+def test_main_install_dispatches_through_subclass(monkeypatch):
+    """Regression for bug_developer_agent_main_install_uses_base_class_4bb0a5cf.
+
+    main() used to route install/uninstall through BaseAgent.from_cli —
+    a classmethod, so the agent it constructed was a BaseAgent and the
+    install spec carried BaseAgent's module_name ("agent") and
+    agent_type instead of DeveloperAgent's. Assert the object whose
+    _do_install runs is the subclass with the right identity fields.
+    """
+    import sys
+
+    from khonliang_bus import BaseAgent
+
+    from developer import agent as agent_module
+
+    captured = {}
+
+    def fake_do_install(self):
+        captured["agent"] = self
+
+    monkeypatch.setattr(BaseAgent, "_do_install", fake_do_install)
+    monkeypatch.setattr(sys, "argv", [
+        "khonliang-developer-agent", "install",
+        "--id", "developer-test",
+        "--bus", "http://localhost:9",
+    ])
+
+    with pytest.raises(SystemExit) as excinfo:
+        agent_module.main()
+
+    assert excinfo.value.code == 0
+    installed = captured["agent"]
+    assert isinstance(installed, agent_module.DeveloperAgent)
+    assert installed.module_name == "developer.agent"
+    assert installed.agent_type == "developer"
+    assert installed.agent_id == "developer-test"
