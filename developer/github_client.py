@@ -23,9 +23,10 @@ import asyncio
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +142,85 @@ class GithubMergeConflictError(GithubClientError):
     """
 
 
+class GithubNotFoundError(GithubClientError):
+    """GitHub returned 404 for the target resource.
+
+    Distinct from the generic client error so long-running consumers
+    (the PR watcher) can tell "this PR is gone, stop asking" from
+    transient transport failures (bug_khonliang-developer_09e46e09:
+    startup rehydration re-polled deleted PRs forever).
+    """
+
+
+class GithubRateLimitError(GithubClientError):
+    """GitHub rejected the request as rate-limited.
+
+    Carries ``retry_after_s`` (seconds, possibly ``None`` when GitHub
+    didn't say) so pollers can back off for the advertised window
+    instead of hammering at their configured interval — the behavior
+    that let a 403 burst crash the agent on 2026-05-17
+    (bug_khonliang-developer_09e46e09).
+    """
+
+    def __init__(self, message: str, retry_after_s: Optional[float] = None):
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
+
+
+def classify_github_error(e: Exception, context: str) -> GithubClientError:
+    """Map a raw githubkit/transport exception onto the client taxonomy.
+
+    Rate-limit detection first (githubkit's RateLimitExceeded carries
+    ``retry_after`` and subclasses RequestFailed, so it must win over
+    the plain status checks), then 404, then 403/429 with rate-limit
+    headers; anything else stays a generic :class:`GithubClientError`.
+    """
+    retry_after = getattr(e, "retry_after", None)
+    if retry_after is not None:
+        return GithubRateLimitError(
+            f"{context}: rate limited: {e}",
+            retry_after_s=retry_after.total_seconds(),
+        )
+    response = getattr(e, "response", None)
+    status = getattr(response, "status_code", None)
+    if status == 404:
+        return GithubNotFoundError(f"{context}: not found (404): {e}")
+    if status in (403, 429):
+        headers = getattr(response, "headers", None) or {}
+        remaining = headers.get("x-ratelimit-remaining")
+        retry_after_hdr = headers.get("retry-after")
+        # Secondary/abuse limits commonly arrive as 403 + Retry-After
+        # with NONZERO remaining primary quota — and sometimes as a
+        # plain 403 whose only tell is the documented message text.
+        message = str(e).lower()
+        looks_secondary = (
+            "secondary rate limit" in message or "abuse" in message
+        )
+        if (
+            status == 429
+            or remaining == "0"
+            or retry_after_hdr is not None
+            or looks_secondary
+        ):
+            retry_s: Optional[float] = None
+            if retry_after_hdr is not None:
+                try:
+                    retry_s = max(0.0, float(retry_after_hdr))
+                except (TypeError, ValueError):
+                    retry_s = None
+            if retry_s is None:
+                reset = headers.get("x-ratelimit-reset")
+                if reset:
+                    try:
+                        retry_s = max(0.0, float(reset) - time.time())
+                    except (TypeError, ValueError):
+                        retry_s = None
+            return GithubRateLimitError(
+                f"{context}: rate limited ({status}): {e}", retry_after_s=retry_s
+            )
+    return GithubClientError(f"{context}: {e}")
+
+
 class GithubClient:
     """Async thin wrapper over githubkit.
 
@@ -189,7 +269,7 @@ class GithubClient:
             # convert cooperative cancellation into GithubClientError.
             raise
         except Exception as e:
-            raise GithubClientError(f"list_pr_reviews({repo}#{pr_number}): {e}") from e
+            raise classify_github_error(e, f"list_pr_reviews({repo}#{pr_number})") from e
 
         result: list[GithubReview] = []
         for r in resp.parsed_data:
@@ -261,8 +341,8 @@ class GithubClient:
             # into a GithubClientError.
             raise
         except Exception as e:
-            raise GithubClientError(
-                f"list_pr_review_comments({repo}#{pr_number}): {e}"
+            raise classify_github_error(
+                e, f"list_pr_review_comments({repo}#{pr_number})"
             ) from e
         return comments
 
@@ -315,7 +395,7 @@ class GithubClient:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            raise GithubClientError(f"list_pr_issue_comments({repo}#{pr_number}): {e}") from e
+            raise classify_github_error(e, f"list_pr_issue_comments({repo}#{pr_number})") from e
         return comments
 
     async def get_pr(self, repo: str, pr_number: int) -> dict:
@@ -341,7 +421,7 @@ class GithubClient:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            raise GithubClientError(f"get_pr({repo}#{pr_number}): {e}") from e
+            raise classify_github_error(e, f"get_pr({repo}#{pr_number})") from e
         pr = resp.parsed_data
         merged_at_raw = getattr(pr, "merged_at", None)
         # githubkit may return merged_at as a ``datetime`` instance; Python's

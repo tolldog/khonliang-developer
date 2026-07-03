@@ -44,10 +44,36 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
-from developer.github_client import GithubClient, GithubClientError, is_copilot_login
+from developer.github_client import (
+    GithubClient,
+    GithubClientError,
+    GithubNotFoundError,
+    GithubRateLimitError,
+    is_copilot_login,
+)
 
 logger = logging.getLogger(__name__)
 
+
+# Rate-limit backoff bounds. GitHub usually advertises a reset window
+# (githubkit surfaces it as ``retry_after``); when it doesn't, wait
+# DEFAULT_RATE_LIMIT_BACKOFF_S rather than hammering at ``interval_s``
+# — the 2026-05-17 crash burned the whole primary quota by retrying 25
+# dead PRs every 60s (bug_khonliang-developer_09e46e09). Capped so a
+# bogus server value can't park the watcher for hours.
+DEFAULT_RATE_LIMIT_BACKOFF_S = 900.0
+MAX_RATE_LIMIT_BACKOFF_S = 3600.0
+
+# Ceiling for per-pair 404 backoff. A 404 cannot distinguish "PR
+# deleted" from "visibility temporarily lost" (revoked token, repo
+# went private), so 404ing pairs are never pruned — they are polled at
+# exponentially-doubling intervals up to this cap (~daily). A genuinely
+# dead PR then costs ~1 request/day; a PR whose visibility returns is
+# picked back up within the cap and resumes full-speed on first
+# success. (Design fork recorded on PR #80: prune-after-streak was
+# implemented first, but every guard left a narrower wrong-prune
+# residual — backoff dissolves the ambiguity instead of patching it.)
+PAIR_BACKOFF_CAP_S = 86400.0
 
 # Publish signature: ``async def publish(topic: str, payload: dict) -> None``.
 # Matches BaseAgent.publish; tests substitute a list-append fake.
@@ -569,6 +595,27 @@ class PRFleetWatcher:
         self._list_open_prs = list_open_prs
         self._now = now_fn
         self._pr_count: int = 0
+        # Explicit-mode pairs dropped after a 404 (deleted / never-existed
+        # PR). In-memory only: a restart re-discovers each dead pair at
+        # the cost of one 404 per pair, then re-prunes — bounded and
+        # self-healing, no extra persisted state. Full exhaustion (every
+        # configured pair pruned) DOES persist: the registry row is
+        # removed so rehydrate() never resurrects a watcher with nothing
+        # to watch.
+        # Per-pair 404 backoff: (consecutive_404s, next_poll_at).
+        # In-memory only — a restart re-polls each backed-off pair once
+        # and rebuilds the state from the fresh 404 (bounded, self-
+        # healing; deliberately no persisted prune state, see
+        # PAIR_BACKOFF_CAP_S).
+        self._pair_backoff: dict[tuple[str, int], tuple[int, float]] = {}
+        # Monotonic-ish deadline (same clock as ``now_fn``) before which
+        # poll cycles are skipped entirely after a rate-limit response.
+        self._backoff_until: float = 0.0
+        # Set by _resolve_pr_set when enumeration rate-limits mid-way:
+        # the pair list it returned is PARTIAL and the cycle must be
+        # abandoned even when the advertised window is zero seconds
+        # (now < _backoff_until is false the moment it is armed).
+        self._cycle_aborted: bool = False
         # In-memory per-(repo, pr_number) caches of already-observed
         # comment ids, one per channel. Used to skip the ``_emit`` call
         # (and its ``INSERT OR IGNORE`` into ``pr_watcher_dedupe``) when
@@ -633,8 +680,12 @@ class PRFleetWatcher:
         """
         pairs: list[tuple[str, int]] = []
         if self.config.pr_numbers:
+            now = self._now()
             for repo in self.config.repos:
                 for pr_number in self.config.pr_numbers:
+                    backoff = self._pair_backoff.get((repo, pr_number))
+                    if backoff is not None and now < backoff[1]:
+                        continue
                     pairs.append((repo, pr_number))
             return pairs
         for repo in self.config.repos:
@@ -644,6 +695,28 @@ class PRFleetWatcher:
                 # CancelledError subclasses Exception (3.8+); never
                 # catch-and-continue past cooperative cancellation.
                 raise
+            except GithubRateLimitError as e:
+                # retry_after_s == 0.0 is a legitimately-expired window
+                # (reset passed during classification) — only None means
+                # "GitHub didn't say"; `or` would turn 0.0 into a 15-min
+                # outage.
+                backoff = min(
+                    DEFAULT_RATE_LIMIT_BACKOFF_S
+                    if e.retry_after_s is None
+                    else e.retry_after_s,
+                    MAX_RATE_LIMIT_BACKOFF_S,
+                )
+                self._backoff_until = self._now() + backoff
+                self._cycle_aborted = True
+                # Same one-signal-per-window contract as the snapshot
+                # path: enumeration burns quota too (P2 of the codex
+                # review on this fix) — stop asking until the reset.
+                await self._emit_poll_error(
+                    repo,
+                    pr_number=0,
+                    reason=f"rate limited; backing off {int(backoff)}s: {e}",
+                )
+                break
             except Exception as e:
                 await self._emit_poll_error(repo, pr_number=0, reason=str(e))
                 continue
@@ -657,15 +730,45 @@ class PRFleetWatcher:
         Called from the async loop; also invoked directly by tests to
         step the watcher without sleeping.
         """
+        if self._now() < self._backoff_until:
+            # Still inside a rate-limit window; skip the cycle without
+            # touching GitHub. One poll_error was emitted when the
+            # window was set — silence here avoids a per-tick spam
+            # stream that says the same thing.
+            return 0
+        self._cycle_aborted = False
         pairs = await self._resolve_pr_set()
-        self._pr_count = len(pairs)
+        if self._cycle_aborted or self._now() < self._backoff_until:
+            # Enumeration armed the backoff mid-resolve (rate-limited
+            # list_open_prs). The pair list is PARTIAL — repos after the
+            # limited one were never enumerated — so treating it as the
+            # active set would prune caches for untouched repos and
+            # still spend snapshot quota inside the window. Abort the
+            # whole cycle instead; state stays as it was. The explicit
+            # flag covers zero-second windows, where the clock check is
+            # already false by the time we get here.
+            return 0
+        # Watched set for cache retention and fleet visibility. In
+        # explicit mode this is the full configured set — a 404-backed-
+        # off pair is still WATCHED (its cached snapshot must survive in
+        # pr_fleet_status and pr_count must not dip), it just isn't
+        # FETCHED this cycle. In all-open mode the resolved list is the
+        # set: closed/merged PRs drop out and their caches with them.
+        if self.config.pr_numbers:
+            active_keys = {
+                (repo, pr_number)
+                for repo in self.config.repos
+                for pr_number in self.config.pr_numbers
+            }
+        else:
+            active_keys = {(repo, pr_number) for repo, pr_number in pairs}
+        self._pr_count = len(active_keys)
         # Prune in-memory seen caches for PRs that have dropped out of
-        # the active set (closed / merged PRs in "watch all open PRs"
+        # the watched set (closed / merged PRs in "watch all open PRs"
         # mode no longer show up in ``_resolve_pr_set``). Without this
         # the caches grow monotonically over the watcher's lifetime.
         # Cross-restart dedupe remains the SQLite table's job; this
         # only reclaims process memory.
-        active_keys = {(repo, pr_number) for repo, pr_number in pairs}
         self._prune_seen_caches(active_keys)
         # Reset the per-cycle digest buffer. Anything still hanging off
         # a previous cycle is stale; ``pr.fleet_digest`` fires at most
@@ -681,6 +784,40 @@ class PRFleetWatcher:
                 # per-PR "keep the watcher alive" fallback below would
                 # swallow cooperative shutdown mid-poll.
                 raise
+            except GithubNotFoundError as e:
+                if self.config.pr_numbers:
+                    # Explicit watch set: back the pair off (deleted PRs
+                    # 404 forever, but so do valid PRs during a
+                    # visibility incident — backoff serves both without
+                    # ever discarding a watch).
+                    await self._back_off_pair(repo, pr_number, reason=str(e))
+                else:
+                    # All-open mode: a 404 here is a PR that closed
+                    # between the list call and the fetch — transient,
+                    # next resolve simply won't include it.
+                    await self._emit_poll_error(repo, pr_number, reason=str(e))
+                continue
+            except GithubRateLimitError as e:
+                # retry_after_s == 0.0 is a legitimately-expired window
+                # (reset passed during classification) — only None means
+                # "GitHub didn't say"; `or` would turn 0.0 into a 15-min
+                # outage.
+                backoff = min(
+                    DEFAULT_RATE_LIMIT_BACKOFF_S
+                    if e.retry_after_s is None
+                    else e.retry_after_s,
+                    MAX_RATE_LIMIT_BACKOFF_S,
+                )
+                self._backoff_until = self._now() + backoff
+                # One signal per window, then abort the remaining pairs:
+                # every further call this cycle would burn quota to earn
+                # the same 403.
+                await self._emit_poll_error(
+                    repo,
+                    pr_number,
+                    reason=f"rate limited; backing off {int(backoff)}s: {e}",
+                )
+                break
             except GithubClientError as e:
                 await self._emit_poll_error(repo, pr_number, reason=str(e))
                 continue
@@ -694,6 +831,9 @@ class PRFleetWatcher:
                 )
                 await self._emit_poll_error(repo, pr_number, reason=str(e))
                 continue
+            # A successful fetch clears the pair's 404 backoff — it is
+            # demonstrably visible again and resumes full-speed polling.
+            self._pair_backoff.pop((repo, pr_number), None)
             # Cache the latest observed snapshot for ``pr_fleet_status``
             # consumers. Stored before transition detection so even a
             # cycle that produces zero new transitions still surfaces the
@@ -1047,6 +1187,35 @@ class PRFleetWatcher:
                 "PR watcher %s: publish %s failed: %s",
                 self.config.watcher_id, TOPIC_FLEET_DIGEST, e,
             )
+
+    async def _back_off_pair(self, repo: str, pr_number: int, reason: str) -> None:
+        """Double the poll interval for a 404ing pair, capped ~daily.
+
+        The pair is never removed from the watch set: a 404 cannot
+        distinguish deletion from temporarily-lost visibility, and a
+        wrong permanent prune silently loses a watch. At the cap a
+        genuinely dead PR costs one request per day; a pair that
+        becomes visible again resumes full speed on first success
+        (``poll_once`` clears the entry).
+        """
+        failures, _ = self._pair_backoff.get((repo, pr_number), (0, 0.0))
+        failures += 1
+        delay = min(
+            self.config.interval_s * (2.0 ** failures), PAIR_BACKOFF_CAP_S
+        )
+        self._pair_backoff[(repo, pr_number)] = (failures, self._now() + delay)
+        logger.info(
+            "PR watcher %s: %s#%d 404ed (%d consecutive); next attempt in %ds",
+            self.config.watcher_id, repo, pr_number, failures, int(delay),
+        )
+        await self._emit_poll_error(
+            repo,
+            pr_number,
+            reason=(
+                f"404 ({failures} consecutive); backing off {int(delay)}s: "
+                f"{reason}"
+            ),
+        )
 
     async def _emit_poll_error(self, repo: str, pr_number: int, reason: str) -> None:
         """Low-severity error signal — never deduped (reset per poll).
@@ -1554,7 +1723,8 @@ async def _list_open_pr_numbers(gh: GithubClient, repo: str) -> list[int]:
         # cancellation doesn't get wrapped as a GithubClientError.
         raise
     except Exception as e:
-        raise GithubClientError(f"list_open_prs({repo}): {e}") from e
+        from developer.github_client import classify_github_error
+        raise classify_github_error(e, f"list_open_prs({repo})") from e
     return [pr.number for pr in resp.parsed_data]
 
 
