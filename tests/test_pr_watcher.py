@@ -2003,6 +2003,84 @@ async def test_all_open_mode_fires_merged_for_pr_that_leaves_open_set(store):
     ]
 
 
+async def test_rate_limit_on_later_repo_does_not_lose_earlier_repos_disappeared_pr(store):
+    """Codex review on PR #84, second round on the disappeared-PR
+    mechanism: a rate limit while enumerating a LATER repo aborts the
+    whole cycle (poll_once discards ``pairs`` entirely), but if an
+    EARLIER repo's ``_recently_open`` entry had already been committed
+    before the abort, that repo's disappeared PR would have "used up"
+    its one retained look for nothing — the fetch never happens because
+    the cycle is discarded — and never be retried, permanently missing
+    its terminal transition. ``_recently_open`` updates must only commit
+    once the whole resolve completes without an abort.
+    """
+    from developer.github_client import GithubRateLimitError
+
+    published: list[tuple[str, dict]] = []
+    open_prs: dict[str, list[int]] = {"repoA": [1], "repoB": [2]}
+    rate_limit_repob = [False]
+    snapshots: dict[tuple[str, int], PRSnapshot] = {
+        ("repoA", 1): _make_snapshot(repo="repoA", pr_number=1, head_sha="a1"),
+        ("repoB", 2): _make_snapshot(repo="repoB", pr_number=2, head_sha="b2"),
+    }
+
+    async def publish(topic: str, payload: dict) -> None:
+        published.append((topic, dict(payload)))
+
+    async def fetch_snapshot(repo: str, pr_number: int) -> PRSnapshot:
+        return snapshots[(repo, pr_number)]
+
+    async def list_open_prs(repo: str) -> list[int]:
+        if repo == "repoB" and rate_limit_repob[0]:
+            raise GithubRateLimitError("rate limited", retry_after_s=300.0)
+        return list(open_prs.get(repo, []))
+
+    config = PRWatcherConfig(
+        watcher_id="prw_multi_repo_abort",
+        repos=["repoA", "repoB"], pr_numbers=[], interval_s=60, started_at=0.0,
+    )
+    store.register_watcher(
+        watcher_id=config.watcher_id, repos=config.repos,
+        pr_numbers=config.pr_numbers, interval_s=config.interval_s,
+        started_at=config.started_at,
+    )
+    now = [0.0]
+    watcher = PRFleetWatcher(
+        config=config, store=store, publish=publish,
+        fetch_snapshot=fetch_snapshot, list_open_prs=list_open_prs,
+        now_fn=lambda: now[0],
+    )
+
+    # Cycle 1: both repos open, both PRs seen. Establishes baseline.
+    await watcher.poll_once()
+    assert watcher._recently_open == {"repoA": {1}, "repoB": {2}}
+
+    # Cycle 2: repoA's PR #1 disappears (merged) AND repoB rate-limits.
+    # repoA is processed first (dict iteration order), computing its
+    # disappeared set and (pre-fix) committing it to _recently_open
+    # before repoB's rate limit aborts the whole cycle.
+    open_prs["repoA"] = []
+    rate_limit_repob[0] = True
+    now[0] += 1000.0  # clear any prior backoff window
+    emitted = await watcher.poll_once()
+    assert emitted == 0  # cycle aborted, nothing fetched
+    # The fix: repoA's entry must NOT have been overwritten to {} — the
+    # disappeared PR #1 is still owed its one retained look.
+    assert watcher._recently_open["repoA"] == {1}
+
+    # Cycle 3: repoB recovers, repoA still shows no open PRs. PR #1
+    # should now be detected as disappeared and get its terminal fetch.
+    rate_limit_repob[0] = False
+    now[0] += 1000.0
+    snapshots[("repoA", 1)] = _make_snapshot(
+        repo="repoA", pr_number=1, head_sha="a1",
+        state="closed", merged=True, merged_at="2026-04-21T12:00:00Z",
+    )
+    emitted = await watcher.poll_once()
+    assert emitted > 0
+    assert TOPIC_MERGED in _topics(published)
+
+
 # ---------------------------------------------------------------------------
 # Cooperative cancellation propagation (PR #39 Copilot R4).
 #

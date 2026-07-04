@@ -712,6 +712,17 @@ class PRFleetWatcher:
                         continue
                     pairs.append((repo, pr_number))
             return pairs
+        # Deferred: only merged into ``self._recently_open`` if the loop
+        # runs to completion without a rate-limit abort (see below). A
+        # rate limit on a LATER repo discards this whole cycle's pairs
+        # (poll_once's _cycle_aborted check) — if an EARLIER repo's
+        # entry had already been committed straight to
+        # ``self._recently_open`` before the abort, that repo's
+        # disappeared PR would have "used up" its one extra look for
+        # nothing (the fetch never happens) and never be retried, so
+        # its terminal transition would be permanently missed (Codex
+        # review on PR #84, second round on this mechanism).
+        pending_recently_open: dict[str, set[int]] = {}
         for repo in self.config.repos:
             try:
                 open_numbers = await self._list_open_prs(repo)
@@ -748,16 +759,15 @@ class PRFleetWatcher:
             # PRs open last cycle but not this one: merged or closed in
             # between. Poll each exactly once more so its terminal
             # snapshot (and pr.merged / pr.closed_without_merge) is
-            # actually observed, then let it drop — `_recently_open` is
-            # overwritten with the current open_set below regardless of
-            # outcome, so a disappeared PR is never retained past this
-            # one extra cycle.
+            # actually observed, then let it drop.
             disappeared = self._recently_open.get(repo, set()) - open_set
             for n in open_numbers:
                 pairs.append((repo, n))
             for n in disappeared:
                 pairs.append((repo, n))
-            self._recently_open[repo] = open_set
+            pending_recently_open[repo] = open_set
+        if not self._cycle_aborted:
+            self._recently_open.update(pending_recently_open)
         return pairs
 
     async def poll_once(self) -> int:
