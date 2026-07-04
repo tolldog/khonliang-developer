@@ -1047,20 +1047,23 @@ class PRFleetWatcher:
                 })
             seen_inline.add(id_str)
 
-        # 3. Merged. dedupe_id = merged_at timestamp when present, else a
-        # stable literal fallback (Copilot review on PR #84: requiring
-        # merged_at to be truthy meant a snapshot shape reporting
-        # merged=True with an empty merged_at — which _pr_was_merged()
-        # already treats as sufficient — would never fire pr.merged or
-        # the on_merged hook at all). A PR can only merge once, so
-        # "merged" is dedupe-safe even without a timestamp.
+        # 3. Merged. dedupe_id is the stable literal "merged", NOT
+        # merged_at (Copilot + Codex, second review round on PR #84):
+        # keying dedupe on merged_at let the transition fire twice if a
+        # poll ever observed merged=True before merged_at was
+        # populated — the first poll would dedupe on the earlier
+        # fallback literal, a later poll on the real timestamp, and the
+        # mismatch would re-trigger on_merged and double-apply its
+        # FR-status mutation. A PR can only merge once, so a single
+        # fixed key is correct regardless of what merged_at looks like;
+        # merged_at is still carried in the payload, informationally.
         if snapshot.merged:
             if await self._emit(
                 TOPIC_MERGED,
                 repo=snapshot.repo,
                 pr_number=snapshot.pr_number,
                 transition_kind="merged",
-                dedupe_id=snapshot.merged_at or "merged",
+                dedupe_id="merged",
                 payload={
                     "repo": snapshot.repo,
                     "pr_number": snapshot.pr_number,
@@ -1084,10 +1087,10 @@ class PRFleetWatcher:
                         )
                     except asyncio.CancelledError:
                         raise
-                    except Exception as e:
+                    except Exception:
                         logger.warning(
-                            "on_merged hook failed for %s#%d: %s",
-                            snapshot.repo, snapshot.pr_number, e,
+                            "on_merged hook failed for %s#%d",
+                            snapshot.repo, snapshot.pr_number, exc_info=True,
                         )
             # A merged PR is also terminal; don't emit merge_ready after
             # the fact and don't emit closed_without_merge.

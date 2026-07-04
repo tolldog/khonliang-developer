@@ -377,6 +377,39 @@ async def test_merged_fires_even_when_merged_at_is_empty(store):
     assert calls == [("owner/repo", 1, "fix: thing")]
 
 
+async def test_merged_does_not_refire_when_merged_at_appears_later(store):
+    """Codex + Copilot, second review round on PR #84: a merged_at-keyed
+    dedupe would fire pr.merged/on_merged twice if one poll observes
+    merged=True with an empty merged_at and a later poll observes the
+    real timestamp — a real risk once on_merged mutates FR state. The
+    dedupe key must be a single stable literal regardless.
+    """
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    calls: list[tuple[str, int, str]] = []
+
+    async def on_merged(repo: str, pr_number: int, title: str) -> None:
+        calls.append((repo, pr_number, title))
+
+    watcher = _make_watcher(store, gh, published, on_merged=on_merged)
+
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(
+        head_sha="final", title="fix: thing", state="closed",
+        merged=True, merged_at="",
+    )
+    await watcher.poll_once()
+
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(
+        head_sha="final", title="fix: thing", state="closed",
+        merged=True, merged_at="2026-04-21T12:00:00Z",
+    )
+    await watcher.poll_once()
+
+    merged_events = [p for t, p in _granular(published) if t == TOPIC_MERGED]
+    assert len(merged_events) == 1
+    assert len(calls) == 1
+
+
 async def test_merged_transition_driven_by_real_github_client_shape(store):
     """End-to-end: drive ``pr.merged`` through ``_snapshot_from_github``
     with a real :class:`GithubClient` wrapping a fake githubkit surface.
