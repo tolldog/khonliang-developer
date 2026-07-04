@@ -653,16 +653,26 @@ class PRFleetWatcher:
         # "Watch all open PRs" mode only: the open PR numbers observed
         # on the PREVIOUS cycle, per repo. Used by ``_resolve_pr_set``
         # to detect PRs that just left the open set (merged or closed)
-        # and give each exactly one more poll before dropping it, so
-        # its terminal snapshot — and therefore ``pr.merged`` /
-        # ``pr.closed_without_merge`` — actually gets fetched and fires
-        # (Codex review on PR #84: without this, a PR that merges
-        # between polls vanishes from ``list_open_prs`` before its
-        # merge is ever observed, so the new FR auto-sync hook never
-        # runs for the "watch everything open" default mode). One-shot
-        # by construction: dropped from this set every cycle regardless
-        # of outcome, so retention never grows unbounded.
+        # — without this, a PR that merges between polls vanishes from
+        # ``list_open_prs`` before its merge is ever observed, so
+        # ``pr.merged`` (and this PR's FR auto-sync hook) never fires
+        # for the "watch everything open" default mode (Codex review on
+        # PR #84).
         self._recently_open: dict[str, set[int]] = {}
+        # PRs that left the open set and are owed a terminal fetch,
+        # per repo. Entries persist across cycles — added the moment a
+        # PR disappears, removed only once a fetch for that pair
+        # actually SUCCEEDS (see the fetch loop in ``poll_once``), not
+        # merely attempted. An earlier design dropped a disappeared PR
+        # after exactly one poll regardless of outcome; Codex found two
+        # separate ways that lost the retry (an enumeration-phase abort
+        # on a later repo, then a fetch-phase failure on the very pair
+        # being retried) — "retry until it actually lands" removes the
+        # whole class rather than patching each new failure point.
+        # ``_pair_backoff`` (shared with explicit ``pr_numbers`` mode)
+        # bounds a persistently-404ing entry so this can't hammer a
+        # truly-deleted PR forever.
+        self._pending_terminal: dict[str, set[int]] = {}
         # Per-cycle transition buffer for :data:`TOPIC_FLEET_DIGEST`.
         # Reset at the top of each :meth:`poll_once`. Keys are the same
         # ``(repo, pr_number)`` tuples as the caches above; values are
@@ -718,11 +728,14 @@ class PRFleetWatcher:
         # (poll_once's _cycle_aborted check) — if an EARLIER repo's
         # entry had already been committed straight to
         # ``self._recently_open`` before the abort, that repo's
-        # disappeared PR would have "used up" its one extra look for
-        # nothing (the fetch never happens) and never be retried, so
-        # its terminal transition would be permanently missed (Codex
-        # review on PR #84, second round on this mechanism).
+        # disappeared PR would have been marked "already looked at"
+        # for nothing (the fetch never happens this cycle).
+        # ``_pending_terminal`` additions below are NOT deferred the
+        # same way — they're purely additive (``|=``) and only ever
+        # cleared by a confirmed successful fetch elsewhere, so an
+        # aborted cycle can't lose anything by adding to it early.
         pending_recently_open: dict[str, set[int]] = {}
+        now = self._now()
         for repo in self.config.repos:
             try:
                 open_numbers = await self._list_open_prs(repo)
@@ -756,14 +769,23 @@ class PRFleetWatcher:
                 await self._emit_poll_error(repo, pr_number=0, reason=str(e))
                 continue
             open_set = set(open_numbers)
-            # PRs open last cycle but not this one: merged or closed in
-            # between. Poll each exactly once more so its terminal
-            # snapshot (and pr.merged / pr.closed_without_merge) is
-            # actually observed, then let it drop.
-            disappeared = self._recently_open.get(repo, set()) - open_set
             for n in open_numbers:
                 pairs.append((repo, n))
-            for n in disappeared:
+            # PRs open last cycle but not this one: merged or closed in
+            # between. Owed a terminal fetch — accumulate into the
+            # persistent pending set (a PR whose fetch keeps failing
+            # stays here across cycles rather than getting one look
+            # and being forgotten) and include every still-pending
+            # entry this cycle, respecting the same backoff explicit
+            # ``pr_numbers`` mode uses so a truly-deleted PR can't be
+            # hammered forever.
+            disappeared = self._recently_open.get(repo, set()) - open_set
+            pending = self._pending_terminal.setdefault(repo, set())
+            pending |= disappeared
+            for n in pending:
+                backoff = self._pair_backoff.get((repo, n))
+                if backoff is not None and now < backoff[1]:
+                    continue
                 pairs.append((repo, n))
             pending_recently_open[repo] = open_set
         if not self._cycle_aborted:
@@ -799,7 +821,9 @@ class PRFleetWatcher:
         # off pair is still WATCHED (its cached snapshot must survive in
         # pr_fleet_status and pr_count must not dip), it just isn't
         # FETCHED this cycle. In all-open mode the resolved list is the
-        # set: closed/merged PRs drop out and their caches with them.
+        # set, PLUS every still-pending-terminal PR even if backed off
+        # this cycle — same reasoning: a pending PR waiting out a
+        # backoff window is still watched, just not fetched yet.
         if self.config.pr_numbers:
             active_keys = {
                 (repo, pr_number)
@@ -808,6 +832,11 @@ class PRFleetWatcher:
             }
         else:
             active_keys = {(repo, pr_number) for repo, pr_number in pairs}
+            active_keys |= {
+                (repo, n)
+                for repo, ns in self._pending_terminal.items()
+                for n in ns
+            }
         self._pr_count = len(active_keys)
         # Prune in-memory seen caches for PRs that have dropped out of
         # the watched set (closed / merged PRs in "watch all open PRs"
@@ -831,16 +860,18 @@ class PRFleetWatcher:
                 # swallow cooperative shutdown mid-poll.
                 raise
             except GithubNotFoundError as e:
-                if self.config.pr_numbers:
-                    # Explicit watch set: back the pair off (deleted PRs
-                    # 404 forever, but so do valid PRs during a
-                    # visibility incident — backoff serves both without
-                    # ever discarding a watch).
+                if self.config.pr_numbers or pr_number in self._pending_terminal.get(repo, ()):
+                    # Explicit watch set, OR an all-open-mode PR we're
+                    # retrying a terminal fetch for (fr_developer_c7d5f22b):
+                    # back the pair off. Deleted PRs 404 forever; a
+                    # visibility incident 404s transiently — backoff
+                    # serves both without ever discarding a watch, and
+                    # without hammering a truly-gone PR on every cycle.
                     await self._back_off_pair(repo, pr_number, reason=str(e))
                 else:
-                    # All-open mode: a 404 here is a PR that closed
-                    # between the list call and the fetch — transient,
-                    # next resolve simply won't include it.
+                    # All-open mode, currently-open PR: a 404 here is one
+                    # that closed between the list call and the fetch —
+                    # transient, next resolve simply won't include it.
                     await self._emit_poll_error(repo, pr_number, reason=str(e))
                 continue
             except GithubRateLimitError as e:
@@ -880,6 +911,11 @@ class PRFleetWatcher:
             # A successful fetch clears the pair's 404 backoff — it is
             # demonstrably visible again and resumes full-speed polling.
             self._pair_backoff.pop((repo, pr_number), None)
+            # And clears it from the pending-terminal retry set (a no-op
+            # for a currently-open PR, which was never in it) — we've
+            # now actually observed this pair's current state, so
+            # whatever transition applies has had its chance to fire.
+            self._pending_terminal.get(repo, set()).discard(pr_number)
             # Cache the latest observed snapshot for ``pr_fleet_status``
             # consumers. Stored before transition detection so even a
             # cycle that produces zero new transitions still surfaces the

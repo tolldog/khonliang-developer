@@ -2081,6 +2081,79 @@ async def test_rate_limit_on_later_repo_does_not_lose_earlier_repos_disappeared_
     assert TOPIC_MERGED in _topics(published)
 
 
+async def test_all_open_mode_retries_disappeared_pr_across_transient_fetch_failures(store):
+    """Codex review on PR #84, third round: even after the enumeration-
+    abort fix, a disappeared PR's ONE retained look could itself fail
+    (transient GithubClientError, or a rate limit hitting a different
+    pair earlier in the same cycle) — the old design still dropped it
+    permanently after that single attempt. Now a disappeared PR stays
+    in ``_pending_terminal`` and gets retried every cycle until a fetch
+    for it actually succeeds, however many cycles that takes.
+    """
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    now = [0.0]
+    watcher = _make_clocked_watcher(store, gh, published, now, pr_numbers=[])
+
+    gh.open_prs["owner/repo"] = [9]
+    gh.snapshots[("owner/repo", 9)] = _make_snapshot(pr_number=9, head_sha="abc")
+    await watcher.poll_once()
+    assert watcher._pending_terminal.get("owner/repo", set()) == set()
+
+    # Cycle 2: PR #9 disappears, but its retry fetch fails transiently
+    # (not a rate limit — a generic GithubClientError, same class as a
+    # flaky network blip).
+    gh.open_prs["owner/repo"] = []
+    gh.errors[("owner/repo", 9)] = GithubClientError("transient blip")
+    emitted = await watcher.poll_once()
+    assert emitted == 0
+    assert watcher._pending_terminal["owner/repo"] == {9}
+
+    # Cycles 3 and 4: still failing. Must still be retried, not dropped.
+    await watcher.poll_once()
+    assert watcher._pending_terminal["owner/repo"] == {9}
+    await watcher.poll_once()
+    assert watcher._pending_terminal["owner/repo"] == {9}
+
+    # Cycle 5: the fetch finally succeeds with the terminal snapshot.
+    del gh.errors[("owner/repo", 9)]
+    gh.snapshots[("owner/repo", 9)] = _make_snapshot(
+        pr_number=9, head_sha="abc",
+        state="closed", merged=True, merged_at="2026-04-21T12:00:00Z",
+    )
+    emitted = await watcher.poll_once()
+    assert emitted > 0
+    assert TOPIC_MERGED in _topics(published)
+    assert watcher._pending_terminal["owner/repo"] == set()
+
+
+async def test_all_open_mode_backs_off_persistently_404ing_pending_pr(store):
+    """A disappeared PR that 404s (truly deleted, not transient) must be
+    backed off like an explicit-mode 404 pair — not hammered every
+    cycle forever.
+    """
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    now = [0.0]
+    watcher = _make_clocked_watcher(store, gh, published, now, pr_numbers=[])
+    gh.open_prs["owner/repo"] = [9]
+    gh.snapshots[("owner/repo", 9)] = _make_snapshot(pr_number=9, head_sha="abc")
+    await watcher.poll_once()
+
+    gh.open_prs["owner/repo"] = []
+    gh.errors[("owner/repo", 9)] = GithubNotFoundError("gone")
+    now[0] += 1000.0
+    await watcher.poll_once()
+    assert ("owner/repo", 9) in watcher._pair_backoff
+    assert watcher._pending_terminal["owner/repo"] == {9}
+
+    # Immediately re-polling (no time advance) must NOT re-fetch — the
+    # pair is inside its backoff window, matching explicit-mode 404s.
+    gh.fetch_calls.clear()
+    await watcher.poll_once()
+    assert ("owner/repo", 9) not in gh.fetch_calls
+
+
 # ---------------------------------------------------------------------------
 # Cooperative cancellation propagation (PR #39 Copilot R4).
 #
