@@ -903,6 +903,14 @@ def test_extract_fr_ids_no_match_returns_empty():
     assert extract_fr_ids("") == []
 
 
+def test_extract_fr_ids_matches_leading_underscore_target():
+    """Codex review on PR #84: slug_target() strips leading/trailing '-'
+    but not '_', so a target like '_foo' produces fr__foo_<hash> — the
+    id-derivation shape the store already allows.
+    """
+    assert extract_fr_ids("fix: thing (fr__foo_deadbeef)") == ["fr__foo_deadbeef"]
+
+
 def test_all_pr_topics_start_with_pr_namespace():
     """Subscribers use ``bus_wait_for_event(filter='pr.*')`` so the
     namespace invariant matters — keep it easy to verify."""
@@ -1816,8 +1824,14 @@ async def test_self_login_filter_is_case_insensitive(tmp_path):
 async def test_seen_caches_prune_when_pr_drops_out_of_active_set(store):
     """Simulate a fleet watcher with ``list_open_prs``-driven resolution.
     Poll 1 has PRs {1, 2, 3}; poll 2 has {1, 2} (PR 3 merged/closed).
-    After poll 2, both ``_seen_*`` caches should only contain keys for
-    PRs 1 and 2."""
+
+    A PR that just disappeared from the open set gets exactly one more
+    poll before its cache entries are pruned (Codex review on PR #84:
+    the previous immediate-prune behavior meant a PR's terminal —
+    merged/closed — snapshot was never fetched at all, so pr.merged
+    could never fire in this mode). So PR 3's cache entries survive
+    poll 2 (its one extra look) and are gone by poll 3.
+    """
     gh = _FakeGithub()
     published: list[tuple[str, dict]] = []
     # Build the watcher inline rather than via ``_make_watcher`` because
@@ -1889,9 +1903,19 @@ async def test_seen_caches_prune_when_pr_drops_out_of_active_set(store):
     }
 
     # Poll 2: PR 3 merged/closed — fleet resolver returns only {1, 2}.
-    # Prune must drop key (owner/repo, 3) from both caches without
-    # touching keys for still-active PRs.
+    # PR 3 just disappeared, so it gets one more look this cycle —
+    # its cache entries are NOT pruned yet.
     gh.open_prs["owner/repo"] = [1, 2]
+    await watcher.poll_once()
+    assert set(watcher._seen_issue_comment_ids.keys()) == {
+        ("owner/repo", 1), ("owner/repo", 2), ("owner/repo", 3),
+    }
+    assert set(watcher._seen_inline_finding_ids.keys()) == {
+        ("owner/repo", 1), ("owner/repo", 2), ("owner/repo", 3),
+    }
+
+    # Poll 3: fleet resolver still returns {1, 2} — PR 3 already had its
+    # one extra look last cycle, so it's finally pruned now.
     await watcher.poll_once()
     assert set(watcher._seen_issue_comment_ids.keys()) == {
         ("owner/repo", 1), ("owner/repo", 2),
@@ -1900,11 +1924,83 @@ async def test_seen_caches_prune_when_pr_drops_out_of_active_set(store):
         ("owner/repo", 1), ("owner/repo", 2),
     }
 
-    # Poll 3: fleet empties entirely → both caches go back to empty.
+    # Poll 4: fleet empties entirely — 1 and 2 get their one extra look.
     gh.open_prs["owner/repo"] = []
+    await watcher.poll_once()
+    assert set(watcher._seen_issue_comment_ids.keys()) == {
+        ("owner/repo", 1), ("owner/repo", 2),
+    }
+
+    # Poll 5: nothing left to give an extra look to — caches go empty.
     await watcher.poll_once()
     assert watcher._seen_issue_comment_ids == {}
     assert watcher._seen_inline_finding_ids == {}
+
+
+async def test_all_open_mode_fires_merged_for_pr_that_leaves_open_set(store):
+    """Codex review on PR #84: in "watch all open PRs" mode,
+    ``_resolve_pr_set`` previously enumerated only currently-open PRs —
+    a PR that merged between two polls vanished from that set before
+    its terminal (merged) snapshot was ever fetched, so pr.merged (and
+    therefore the new FR auto-sync on_merged hook) never fired for the
+    single most common usage pattern. Retaining a just-disappeared PR
+    for exactly one more poll fixes this.
+    """
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    calls: list[tuple[str, int, str]] = []
+
+    async def on_merged(repo: str, pr_number: int, title: str) -> None:
+        calls.append((repo, pr_number, title))
+
+    async def publish(topic: str, payload: dict) -> None:
+        published.append((topic, dict(payload)))
+
+    config = PRWatcherConfig(
+        watcher_id="prw_all_open_merge",
+        repos=["owner/repo"],
+        pr_numbers=[],
+        interval_s=60,
+        started_at=0.0,
+    )
+    store.register_watcher(
+        watcher_id=config.watcher_id,
+        repos=config.repos,
+        pr_numbers=config.pr_numbers,
+        interval_s=config.interval_s,
+        started_at=config.started_at,
+    )
+    watcher = PRFleetWatcher(
+        config=config,
+        store=store,
+        publish=publish,
+        fetch_snapshot=gh.fetch_snapshot,
+        list_open_prs=gh.list_open_prs,
+        now_fn=lambda: 0.0,
+        on_merged=on_merged,
+    )
+
+    # Poll 1: PR #9 is open.
+    gh.open_prs["owner/repo"] = [9]
+    gh.snapshots[("owner/repo", 9)] = _make_snapshot(
+        pr_number=9, head_sha="abc", title="fix: thing (fr_developer_deadbeef)",
+    )
+    await watcher.poll_once()
+    assert calls == []
+
+    # Poll 2: PR #9 merged — it no longer shows up in list_open_prs, but
+    # its (now merged) snapshot is still fetchable directly.
+    gh.open_prs["owner/repo"] = []
+    gh.snapshots[("owner/repo", 9)] = _make_snapshot(
+        pr_number=9, head_sha="abc", title="fix: thing (fr_developer_deadbeef)",
+        state="closed", merged=True, merged_at="2026-04-21T12:00:00Z",
+    )
+    emitted = await watcher.poll_once()
+    assert emitted > 0
+    assert TOPIC_MERGED in _topics(published)
+    assert calls == [
+        ("owner/repo", 9, "fix: thing (fr_developer_deadbeef)"),
+    ]
 
 
 # ---------------------------------------------------------------------------

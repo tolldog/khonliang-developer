@@ -650,6 +650,19 @@ class PRFleetWatcher:
         # ``fr_developer_fafb36f1``. Pruned together with the seen-id
         # caches so closed/merged PRs don't linger in memory.
         self._latest_snapshots: dict[tuple[str, int], PRSnapshot] = {}
+        # "Watch all open PRs" mode only: the open PR numbers observed
+        # on the PREVIOUS cycle, per repo. Used by ``_resolve_pr_set``
+        # to detect PRs that just left the open set (merged or closed)
+        # and give each exactly one more poll before dropping it, so
+        # its terminal snapshot — and therefore ``pr.merged`` /
+        # ``pr.closed_without_merge`` — actually gets fetched and fires
+        # (Codex review on PR #84: without this, a PR that merges
+        # between polls vanishes from ``list_open_prs`` before its
+        # merge is ever observed, so the new FR auto-sync hook never
+        # runs for the "watch everything open" default mode). One-shot
+        # by construction: dropped from this set every cycle regardless
+        # of outcome, so retention never grows unbounded.
+        self._recently_open: dict[str, set[int]] = {}
         # Per-cycle transition buffer for :data:`TOPIC_FLEET_DIGEST`.
         # Reset at the top of each :meth:`poll_once`. Keys are the same
         # ``(repo, pr_number)`` tuples as the caches above; values are
@@ -731,8 +744,20 @@ class PRFleetWatcher:
             except Exception as e:
                 await self._emit_poll_error(repo, pr_number=0, reason=str(e))
                 continue
+            open_set = set(open_numbers)
+            # PRs open last cycle but not this one: merged or closed in
+            # between. Poll each exactly once more so its terminal
+            # snapshot (and pr.merged / pr.closed_without_merge) is
+            # actually observed, then let it drop — `_recently_open` is
+            # overwritten with the current open_set below regardless of
+            # outcome, so a disappeared PR is never retained past this
+            # one extra cycle.
+            disappeared = self._recently_open.get(repo, set()) - open_set
             for n in open_numbers:
                 pairs.append((repo, n))
+            for n in disappeared:
+                pairs.append((repo, n))
+            self._recently_open[repo] = open_set
         return pairs
 
     async def poll_once(self) -> int:
@@ -1788,9 +1813,12 @@ def parse_repos_arg(value: Any) -> list[str]:
 
 # fr_developer_c7d5f22b: matches FR ids like fr_developer_b297ef26 or
 # fr_khonliang-bus-lib_70c50040 — `fr_<target>_<8hex>`, target being
-# whatever slug the FR store was promoted under (may itself contain
-# hyphens/underscores).
-_FR_ID_RE = re.compile(r"\bfr_[a-z0-9][a-z0-9_-]*_[0-9a-f]{8}\b")
+# whatever slug the FR store was promoted under. slug_target() in
+# project_store.py only strips leading/trailing "-", not "_", so a
+# target like "_foo" slugs to "_foo" and produces fr__foo_<hash> — the
+# leading char class here includes "_" too (Codex review on PR #84) so
+# that shape still matches.
+_FR_ID_RE = re.compile(r"\bfr_[a-z0-9_][a-z0-9_-]*_[0-9a-f]{8}\b")
 
 
 def extract_fr_ids(text: str) -> list[str]:
