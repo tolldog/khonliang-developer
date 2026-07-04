@@ -783,6 +783,105 @@ async def test_update_fr_supported_edit_still_works(harness):
 
 
 @pytest.mark.asyncio
+async def test_get_fr_local_rejects_id_typo(harness):
+    """`id=` instead of `fr_id=` used to be silently dropped, returning
+    `{error: 'not found', fr_id: ''}` for an FR that demonstrably existed
+    — actively misleading. Regression guard for fr_developer_b297ef26.
+    """
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Findable FR", description="d",
+    )
+
+    result = await harness.call("get_fr_local", {"id": fr.id})
+    assert "error" in result
+    assert "id" in result["error"]
+    assert "fr_id" in result["error"]
+    assert result["error"] != "not found"
+
+
+@pytest.mark.asyncio
+async def test_get_fr_local_follow_redirect_string_false_is_falsy(harness):
+    """`bool("false")` is True in Python — a naive cast would treat the
+    CLI/bus string "false" as truthy. Regression guard flagged in PR #83
+    review: this file already uses `_bool_arg` elsewhere for exactly
+    this pitfall (e.g. list_frs_local's `include_all`).
+    """
+    old = harness.agent.pipeline.frs.promote(
+        target="developer", title="Old FR", description="d",
+    )
+    other = harness.agent.pipeline.frs.promote(
+        target="developer", title="Other FR", description="d",
+    )
+    new = harness.agent.pipeline.frs.merge(
+        source_ids=[old.id, other.id], title="New FR", description="d",
+    )
+
+    followed = await harness.call("get_fr_local", {
+        "fr_id": old.id, "follow_redirect": "false",
+    })
+    assert followed["id"] == old.id
+    assert followed["status"] == "merged"
+
+    redirected = await harness.call("get_fr_local", {
+        "fr_id": old.id, "follow_redirect": "true",
+    })
+    assert redirected["id"] == new.id
+
+
+@pytest.mark.asyncio
+async def test_get_fr_local_rejects_unknown_junk_key(harness):
+    result = await harness.call("get_fr_local", {
+        "fr_id": "fr_developer_doesnotmatter", "totally_bogus": "x",
+    })
+    assert "error" in result
+    assert "totally_bogus" in result["error"]
+    assert "follow_redirect" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_triage_dogfood_rejects_bug_id_fr_id_link_args(harness):
+    """`bug_id=`/`fr_id=` (intended to link a promotion to an existing
+    artifact) used to be silently dropped, creating duplicate bug/FR
+    records instead of erroring. Regression guard for
+    fr_developer_b297ef26.
+    """
+    dog = harness.agent.pipeline.dogfood.log_dogfood(
+        observation="something worth triaging", target="developer",
+    )
+
+    result = await harness.call("triage_dogfood", {
+        "dog_id": dog.id, "action": "promote_to_fr",
+        "fr_id": "fr_developer_alreadyfiled",
+    })
+    assert "error" in result
+    assert "fr_id" in result["error"]
+    assert "not supported yet" in result["error"]
+
+    # Refusing loudly must not have created a duplicate FR as a side effect.
+    unchanged = harness.agent.pipeline.dogfood.get_dogfood(dog.id)
+    assert unchanged.status == "observed"
+    assert unchanged.promoted_to == []
+
+
+@pytest.mark.asyncio
+async def test_triage_dogfood_rejects_unknown_junk_key(harness):
+    dog = harness.agent.pipeline.dogfood.log_dogfood(
+        observation="junk key check", target="developer",
+    )
+
+    result = await harness.call("triage_dogfood", {
+        "dog_id": dog.id, "action": "dismiss", "totally_bogus": "x",
+    })
+    assert "error" in result
+    assert "totally_bogus" in result["error"]
+    assert "target_id" in result["error"]
+
+    # Rejection must not have applied the dismiss as a side effect.
+    unchanged = harness.agent.pipeline.dogfood.get_dogfood(dog.id)
+    assert unchanged.status == "observed"
+
+
+@pytest.mark.asyncio
 async def test_work_units_from_local_frs(harness):
     """work_units returns ranked units from developer-owned FRs."""
     harness.agent.pipeline.frs.promote(
