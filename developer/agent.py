@@ -3088,7 +3088,7 @@ class DeveloperAgent(BaseAgent):
                 msg += " did you mean fr_id?"
             return {"error": msg}
 
-        follow_redirect = bool(args.get("follow_redirect", True))
+        follow_redirect = _bool_arg(args, "follow_redirect", default=True)
         try:
             fr = self.pipeline.frs.get(
                 fr_id=args.get("fr_id", ""),

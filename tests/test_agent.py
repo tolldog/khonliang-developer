@@ -800,6 +800,35 @@ async def test_get_fr_local_rejects_id_typo(harness):
 
 
 @pytest.mark.asyncio
+async def test_get_fr_local_follow_redirect_string_false_is_falsy(harness):
+    """`bool("false")` is True in Python — a naive cast would treat the
+    CLI/bus string "false" as truthy. Regression guard flagged in PR #83
+    review: this file already uses `_bool_arg` elsewhere for exactly
+    this pitfall (e.g. list_frs_local's `include_all`).
+    """
+    old = harness.agent.pipeline.frs.promote(
+        target="developer", title="Old FR", description="d",
+    )
+    other = harness.agent.pipeline.frs.promote(
+        target="developer", title="Other FR", description="d",
+    )
+    new = harness.agent.pipeline.frs.merge(
+        source_ids=[old.id, other.id], title="New FR", description="d",
+    )
+
+    followed = await harness.call("get_fr_local", {
+        "fr_id": old.id, "follow_redirect": "false",
+    })
+    assert followed["id"] == old.id
+    assert followed["status"] == "merged"
+
+    redirected = await harness.call("get_fr_local", {
+        "fr_id": old.id, "follow_redirect": "true",
+    })
+    assert redirected["id"] == new.id
+
+
+@pytest.mark.asyncio
 async def test_get_fr_local_rejects_unknown_junk_key(harness):
     result = await harness.call("get_fr_local", {
         "fr_id": "fr_developer_doesnotmatter", "totally_bogus": "x",
