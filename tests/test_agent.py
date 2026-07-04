@@ -3689,9 +3689,16 @@ def test_main_install_dispatches_through_subclass(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_sync_fr_status_on_merge_advances_matching_fr(harness):
+    """'completed', not 'merged' — Copilot review on PR #84: FR_STATUS_MERGED
+    is the FR-to-FR merge/redirect terminal state (capability tracking
+    treats it as 'abandoned'); a shipped PR means the work exists, i.e.
+    'completed'. FR starts 'open' (never explicitly marked in_progress),
+    exercising the in_progress hop in _advance_fr_to_completed.
+    """
     fr = harness.agent.pipeline.frs.promote(
         target="developer", title="Auto-synced FR", description="d",
     )
+    assert fr.status == "open"
 
     await harness.agent._sync_fr_status_on_merge(
         "tolldog/khonliang-developer", 82,
@@ -3699,11 +3706,33 @@ async def test_sync_fr_status_on_merge_advances_matching_fr(harness):
     )
 
     updated = harness.agent.pipeline.frs.get(fr.id)
-    assert updated.status == "merged"
+    assert updated.status == "completed"
     assert any(
         "tolldog/khonliang-developer#82" in n.get("notes", "")
         for n in updated.notes_history
     )
+
+
+@pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_completes_in_progress_fr_without_hop(harness):
+    """An FR already 'in_progress' completes directly — no redundant
+    intermediate transition recorded.
+    """
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Already in progress", description="d",
+    )
+    harness.agent.pipeline.frs.update_status(fr.id, "in_progress")
+
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 82, f"fix: ship it ({fr.id})",
+    )
+
+    updated = harness.agent.pipeline.frs.get(fr.id)
+    assert updated.status == "completed"
+    # promote (open) + in_progress + completed = 3 entries; no redundant hop.
+    assert [n["status"] for n in updated.notes_history] == [
+        "open", "in_progress", "completed",
+    ]
 
 
 @pytest.mark.asyncio

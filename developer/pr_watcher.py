@@ -1047,14 +1047,20 @@ class PRFleetWatcher:
                 })
             seen_inline.add(id_str)
 
-        # 3. Merged. dedupe_id = merged_at timestamp (stable once set).
-        if snapshot.merged and snapshot.merged_at:
+        # 3. Merged. dedupe_id = merged_at timestamp when present, else a
+        # stable literal fallback (Copilot review on PR #84: requiring
+        # merged_at to be truthy meant a snapshot shape reporting
+        # merged=True with an empty merged_at — which _pr_was_merged()
+        # already treats as sufficient — would never fire pr.merged or
+        # the on_merged hook at all). A PR can only merge once, so
+        # "merged" is dedupe-safe even without a timestamp.
+        if snapshot.merged:
             if await self._emit(
                 TOPIC_MERGED,
                 repo=snapshot.repo,
                 pr_number=snapshot.pr_number,
                 transition_kind="merged",
-                dedupe_id=snapshot.merged_at,
+                dedupe_id=snapshot.merged_at or "merged",
                 payload={
                     "repo": snapshot.repo,
                     "pr_number": snapshot.pr_number,

@@ -201,7 +201,7 @@ class DeveloperAgent(BaseAgent):
     async def _sync_fr_status_on_merge(
         self, repo: str, pr_number: int, title: str,
     ) -> None:
-        """Auto-advance any FR named in a merged PR's title to 'merged'.
+        """Auto-advance any FR named in a merged PR's title to 'completed'.
 
         fr_developer_c7d5f22b: the FR store previously had no way to
         learn a PR merged, so callers repeatedly picked up FRs that
@@ -211,20 +211,43 @@ class DeveloperAgent(BaseAgent):
         transition (FR already terminal, unknown id, typo'd id) is
         reported as a gap rather than raised, since this runs off the
         background poll loop, not a caller-facing handler.
+
+        Uses 'completed', not 'merged' (Copilot review on PR #84):
+        FR_STATUS_MERGED is the FR-to-FR merge/redirect terminal state
+        — FRStore._record_capability maps it to an "abandoned"
+        capability and dependents never unblock (only 'completed'
+        does). A PR shipping means the work exists, so 'completed' is
+        the correct terminal state.
         """
         from developer.pr_watcher import extract_fr_ids
         from developer.fr_store import FRError
 
+        notes = f"auto-synced: {repo}#{pr_number} merged"
         for fr_id in extract_fr_ids(title):
             try:
-                self.pipeline.frs.update_status(
-                    fr_id, "merged",
-                    notes=f"auto-synced: {repo}#{pr_number} merged",
-                )
+                self._advance_fr_to_completed(fr_id, notes)
             except FRError as e:
                 await self._safe_report_gap(
                     "pr_watcher.on_merged", f"{fr_id} ({repo}#{pr_number}): {e}",
                 )
+
+    def _advance_fr_to_completed(self, fr_id: str, notes: str) -> None:
+        """Move ``fr_id`` to 'completed', hopping through 'in_progress'
+        first if needed.
+
+        'completed' is only reachable from 'in_progress' (see
+        ALLOWED_TRANSITIONS in fr_store.py) — an FR merged straight
+        from 'open'/'planned' (never explicitly marked in_progress)
+        needs the intermediate hop. Already-terminal FRs raise on both
+        attempts, propagating to the caller unchanged.
+        """
+        from developer.fr_store import FR_STATUS_COMPLETED, FR_STATUS_IN_PROGRESS, FRError
+
+        try:
+            self.pipeline.frs.update_status(fr_id, FR_STATUS_COMPLETED, notes=notes)
+        except FRError:
+            self.pipeline.frs.update_status(fr_id, FR_STATUS_IN_PROGRESS, notes=notes)
+            self.pipeline.frs.update_status(fr_id, FR_STATUS_COMPLETED, notes=notes)
 
     async def start(self):
         """Rehydrate persisted PR watchers, then run the normal agent loop.

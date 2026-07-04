@@ -348,6 +348,35 @@ async def test_on_merged_hook_failure_does_not_break_poll(store):
     assert TOPIC_MERGED in _topics(published)
 
 
+async def test_merged_fires_even_when_merged_at_is_empty(store):
+    """Copilot review on PR #84: requiring merged_at to be truthy meant a
+    snapshot reporting merged=True with an empty merged_at (a shape
+    _pr_was_merged() already treats as sufficient) would never fire
+    pr.merged at all — and therefore never fire on_merged either. A PR
+    can only merge once, so dedupe falls back to a stable literal.
+    """
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    calls: list[tuple[str, int, str]] = []
+
+    async def on_merged(repo: str, pr_number: int, title: str) -> None:
+        calls.append((repo, pr_number, title))
+
+    watcher = _make_watcher(store, gh, published, on_merged=on_merged)
+
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(
+        head_sha="final", title="fix: thing", state="closed",
+        merged=True, merged_at="",
+    )
+    await watcher.poll_once()
+    await watcher.poll_once()
+
+    merged_events = [p for t, p in _granular(published) if t == TOPIC_MERGED]
+    assert len(merged_events) == 1
+    assert merged_events[0]["merged_at"] == ""
+    assert calls == [("owner/repo", 1, "fix: thing")]
+
+
 async def test_merged_transition_driven_by_real_github_client_shape(store):
     """End-to-end: drive ``pr.merged`` through ``_snapshot_from_github``
     with a real :class:`GithubClient` wrapping a fake githubkit surface.
