@@ -183,6 +183,7 @@ def test_load_example_config_file():
     assert config.bus.enabled is False
     assert config.researcher_mcp.transport == "stdio"
     assert "developer" in config.projects
+    assert "reviewer" in config.projects
 
 
 def test_load_rejects_non_mapping_yaml(tmp_path):

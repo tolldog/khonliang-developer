@@ -26,6 +26,9 @@ projects:
   researcher-lib:
     repo: /path/to/khonliang-researcher-lib
     specs_dir: specs
+  reviewer:
+    repo: /path/to/khonliang-reviewer
+    specs_dir: specs
 
 # ---------------------------------------------------------------------------
 # Runtime integration blocks
