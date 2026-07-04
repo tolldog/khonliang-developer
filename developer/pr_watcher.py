@@ -551,9 +551,12 @@ class PRSnapshot:
 # without monkey-patching the module-level async calls.
 FetchSnapshotFn = Callable[[str, int], Awaitable[PRSnapshot]]
 ListOpenPRsFn = Callable[[str], Awaitable[list[int]]]
-# Fired once per (repo, pr_number) merge, after the dedupe-gated
-# TOPIC_MERGED publish. (repo, pr_number, title) -> None. Optional —
-# None disables FR-status auto-sync entirely (fr_developer_c7d5f22b).
+# Fired once per (repo, pr_number) merge — gated on the dedupe record
+# being newly written, same as the TOPIC_MERGED publish, but NOT on
+# that publish having actually succeeded (`_emit` logs-and-continues on
+# a publish failure; the dedupe row is still written first). (repo,
+# pr_number, title) -> None. Optional — None disables FR-status
+# auto-sync entirely (fr_developer_c7d5f22b).
 OnMergedFn = Callable[[str, int, str], Awaitable[None]]
 
 
@@ -1075,11 +1078,12 @@ class PRFleetWatcher:
                 _record_digest({"kind": "merged"})
                 # fr_developer_c7d5f22b: FR-store status drifts behind
                 # merged PRs because nothing watches for the merge event.
-                # Fire the injected hook exactly once per merge (gated on
-                # `_emit` returning True, same dedupe as the publish
-                # above) so a restart doesn't re-run it. Best-effort: a
-                # hook failure must not break transition detection for
-                # the rest of the fleet.
+                # Fire the injected hook exactly once per merge — gated
+                # on `_emit` returning True, i.e. the dedupe row was
+                # newly written (same as the publish above), NOT on the
+                # publish having succeeded — so a restart doesn't re-run
+                # it. Best-effort: a hook failure must not break
+                # transition detection for the rest of the fleet.
                 if self._on_merged is not None:
                     try:
                         await self._on_merged(
