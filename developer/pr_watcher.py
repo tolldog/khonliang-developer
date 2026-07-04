@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import sqlite3
 import time
 import uuid
@@ -485,6 +486,7 @@ class PRSnapshot:
     repo: str
     pr_number: int
     head_sha: str
+    title: str = ""
     state: str = "open"           # open | closed
     merged: bool = False
     merged_at: str = ""
@@ -549,6 +551,10 @@ class PRSnapshot:
 # without monkey-patching the module-level async calls.
 FetchSnapshotFn = Callable[[str, int], Awaitable[PRSnapshot]]
 ListOpenPRsFn = Callable[[str], Awaitable[list[int]]]
+# Fired once per (repo, pr_number) merge, after the dedupe-gated
+# TOPIC_MERGED publish. (repo, pr_number, title) -> None. Optional —
+# None disables FR-status auto-sync entirely (fr_developer_c7d5f22b).
+OnMergedFn = Callable[[str, int, str], Awaitable[None]]
 
 
 @dataclass
@@ -587,6 +593,7 @@ class PRFleetWatcher:
         fetch_snapshot: FetchSnapshotFn,
         list_open_prs: ListOpenPRsFn,
         now_fn: Callable[[], float] = time.time,
+        on_merged: Optional[OnMergedFn] = None,
     ):
         self.config = config
         self.store = store
@@ -594,6 +601,7 @@ class PRFleetWatcher:
         self._fetch_snapshot = fetch_snapshot
         self._list_open_prs = list_open_prs
         self._now = now_fn
+        self._on_merged = on_merged
         self._pr_count: int = 0
         # Explicit-mode pairs dropped after a 404 (deleted / never-existed
         # PR). In-memory only: a restart re-discovers each dead pair at
@@ -1051,10 +1059,30 @@ class PRFleetWatcher:
                     "repo": snapshot.repo,
                     "pr_number": snapshot.pr_number,
                     "merged_at": snapshot.merged_at,
+                    "title": snapshot.title,
                 },
             ):
                 emitted += 1
                 _record_digest({"kind": "merged"})
+                # fr_developer_c7d5f22b: FR-store status drifts behind
+                # merged PRs because nothing watches for the merge event.
+                # Fire the injected hook exactly once per merge (gated on
+                # `_emit` returning True, same dedupe as the publish
+                # above) so a restart doesn't re-run it. Best-effort: a
+                # hook failure must not break transition detection for
+                # the rest of the fleet.
+                if self._on_merged is not None:
+                    try:
+                        await self._on_merged(
+                            snapshot.repo, snapshot.pr_number, snapshot.title,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.warning(
+                            "on_merged hook failed for %s#%d: %s",
+                            snapshot.repo, snapshot.pr_number, e,
+                        )
             # A merged PR is also terminal; don't emit merge_ready after
             # the fact and don't emit closed_without_merge.
             return emitted
@@ -1273,9 +1301,11 @@ class PRWatcherRegistry:
         store: PRWatcherStore,
         publish: PublishFn,
         factory: Optional[Callable[[PRWatcherConfig], PRFleetWatcher]] = None,
+        on_merged: Optional[OnMergedFn] = None,
     ):
         self.store = store
         self._publish = publish
+        self._on_merged = on_merged
         self._factory = factory or self._default_factory
         self._watchers: dict[str, _LiveWatcher] = {}
         # Guard against concurrent start/stop calls mutating the dict
@@ -1549,6 +1579,7 @@ class PRWatcherRegistry:
             publish=self._publish,
             fetch_snapshot=fetch_snapshot,
             list_open_prs=list_open_prs,
+            on_merged=self._on_merged,
         )
 
 
@@ -1646,6 +1677,7 @@ async def _snapshot_from_github(
         repo=repo,
         pr_number=pr_number,
         head_sha=str(pr.get("head_sha") or ""),
+        title=str(pr.get("title") or ""),
         state=str(pr.get("state") or "open"),
         merged=merged,
         merged_at=merged_at,
@@ -1739,6 +1771,29 @@ def parse_repos_arg(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(v).strip() for v in value if str(v).strip()]
     return [v.strip() for v in str(value).split(",") if v.strip()]
+
+
+# fr_developer_c7d5f22b: matches FR ids like fr_developer_b297ef26 or
+# fr_khonliang-bus-lib_70c50040 — `fr_<target>_<8hex>`, target being
+# whatever slug the FR store was promoted under (may itself contain
+# hyphens/underscores).
+_FR_ID_RE = re.compile(r"\bfr_[a-z0-9][a-z0-9_-]*_[0-9a-f]{8}\b")
+
+
+def extract_fr_ids(text: str) -> list[str]:
+    """Pull ``fr_<target>_<8hex>`` ids out of free text, de-duplicated,
+    first-occurrence order preserved.
+
+    Used to auto-sync FR status from merged-PR titles
+    (fr_developer_c7d5f22b). Title-only for this first cut — PR bodies
+    and commit messages (where "Closes fr_x" more commonly lives) are a
+    known gap; extend here if dogfooding shows title-only misses too
+    much real traffic.
+    """
+    seen: dict[str, None] = {}
+    for match in _FR_ID_RE.finditer(text.lower()):
+        seen.setdefault(match.group(0), None)
+    return list(seen)
 
 
 def parse_pr_numbers_arg(value: Any) -> list[int]:

@@ -194,8 +194,37 @@ class DeveloperAgent(BaseAgent):
             store = PRWatcherStore(str(self.pipeline.config.db_path))
             self._pr_watcher_registry = PRWatcherRegistry(
                 store=store, publish=self.publish,
+                on_merged=self._sync_fr_status_on_merge,
             )
         return self._pr_watcher_registry
+
+    async def _sync_fr_status_on_merge(
+        self, repo: str, pr_number: int, title: str,
+    ) -> None:
+        """Auto-advance any FR named in a merged PR's title to 'merged'.
+
+        fr_developer_c7d5f22b: the FR store previously had no way to
+        learn a PR merged, so callers repeatedly picked up FRs that
+        were already-shipped ("open" in the store, merged on GitHub).
+        Fired by :class:`PRWatcherRegistry` exactly once per merge
+        (dedupe lives in the watcher). Best-effort — an illegal
+        transition (FR already terminal, unknown id, typo'd id) is
+        reported as a gap rather than raised, since this runs off the
+        background poll loop, not a caller-facing handler.
+        """
+        from developer.pr_watcher import extract_fr_ids
+        from developer.fr_store import FRError
+
+        for fr_id in extract_fr_ids(title):
+            try:
+                self.pipeline.frs.update_status(
+                    fr_id, "merged",
+                    notes=f"auto-synced: {repo}#{pr_number} merged",
+                )
+            except FRError as e:
+                await self._safe_report_gap(
+                    "pr_watcher.on_merged", f"{fr_id} ({repo}#{pr_number}): {e}",
+                )
 
     async def start(self):
         """Rehydrate persisted PR watchers, then run the normal agent loop.

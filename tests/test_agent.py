@@ -3683,3 +3683,52 @@ def test_main_install_dispatches_through_subclass(monkeypatch):
     assert installed.module_name == "developer.agent"
     assert installed.agent_type == "developer"
     assert installed.agent_id == "developer-test"
+
+
+# -- FR-status auto-sync on PR merge (fr_developer_c7d5f22b) --
+
+@pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_advances_matching_fr(harness):
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Auto-synced FR", description="d",
+    )
+
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 82,
+        f"fix(config): register reviewer ({fr.id})",
+    )
+
+    updated = harness.agent.pipeline.frs.get(fr.id)
+    assert updated.status == "merged"
+    assert any(
+        "tolldog/khonliang-developer#82" in n.get("notes", "")
+        for n in updated.notes_history
+    )
+
+
+@pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_ignores_title_without_fr_id(harness):
+    """No fr_<target>_<hex> in the title — no-op, no crash."""
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 99, "chore: bump deps",
+    )
+
+
+@pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_reports_gap_on_illegal_transition(harness):
+    """A terminal FR (already merged/archived) named in a second PR's
+    title must not raise out of the background poll loop — the illegal
+    transition is reported as a gap instead.
+    """
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Already terminal", description="d",
+    )
+    harness.agent.pipeline.frs.update_status(fr.id, "archived")
+
+    # Must not raise even though open->archived->merged is illegal.
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 100, f"fix: whatever ({fr.id})",
+    )
+
+    unchanged = harness.agent.pipeline.frs.get(fr.id)
+    assert unchanged.status == "archived"
