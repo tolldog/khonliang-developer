@@ -3068,9 +3068,25 @@ class DeveloperAgent(BaseAgent):
             "status": fr.status,
         }
 
+    # Anything outside this set is rejected loudly. A caller passing
+    # `id=` instead of `fr_id=` used to get a silent `{fr_id: ''}` echo
+    # that looked like a legitimate not-found response for an FR that
+    # demonstrably existed (fr_developer_b297ef26).
+    _GET_FR_LOCAL_ARGS = frozenset({"fr_id", "follow_redirect"})
+
     @handler("get_fr_local")
     async def handle_get_fr_local(self, args):
         from developer.fr_store import FRError
+
+        unknown = set(args) - self._GET_FR_LOCAL_ARGS
+        if unknown:
+            msg = (
+                f"unsupported args for get_fr_local: {', '.join(sorted(unknown))}. "
+                f"accepted: {', '.join(sorted(self._GET_FR_LOCAL_ARGS))}."
+            )
+            if "id" in unknown:
+                msg += " did you mean fr_id?"
+            return {"error": msg}
 
         follow_redirect = bool(args.get("follow_redirect", True))
         try:
@@ -4217,6 +4233,15 @@ class DeveloperAgent(BaseAgent):
             "linked_frs": list(bug.linked_frs),
         }
 
+    # Anything outside this set is rejected loudly. `bug_id=`/`fr_id=`
+    # (intended to link a promotion to an already-filed artifact) used
+    # to be silently dropped, creating duplicate bug/FR records instead
+    # of erroring (fr_developer_b297ef26). Linking to an existing
+    # artifact isn't implemented yet — rejecting these names now (rather
+    # than continuing to drop them) at least fails loud instead of
+    # quietly duplicating.
+    _TRIAGE_DOGFOOD_ARGS = frozenset({"dog_id", "action", "target_id", "notes"})
+
     @handler("triage_dogfood")
     async def handle_triage_dogfood(self, args):
         """Triage a dogfood observation.
@@ -4233,6 +4258,20 @@ class DeveloperAgent(BaseAgent):
             DogfoodError,
         )
         from developer.fr_store import FRError
+
+        unknown = set(args) - self._TRIAGE_DOGFOOD_ARGS
+        if unknown:
+            msg = (
+                f"unsupported args for triage_dogfood: {', '.join(sorted(unknown))}. "
+                f"accepted: {', '.join(sorted(self._TRIAGE_DOGFOOD_ARGS))}."
+            )
+            if unknown & {"bug_id", "fr_id"}:
+                msg += (
+                    " linking a promotion to an already-filed bug/FR is not "
+                    "supported yet — promote_to_bug/promote_to_fr always "
+                    "create a fresh record."
+                )
+            return {"error": msg}
 
         dog_id = args.get("dog_id", "")
         action = args.get("action", "")
