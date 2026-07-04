@@ -3754,10 +3754,23 @@ async def test_sync_fr_status_on_merge_reports_gap_on_illegal_transition(harness
     )
     harness.agent.pipeline.frs.update_status(fr.id, "archived")
 
-    # Must not raise even though open->archived->merged is illegal.
+    gaps: list[str] = []
+
+    async def fake_report_gap(operation, reason):
+        gaps.append(reason)
+
+    harness.agent._safe_report_gap = fake_report_gap
+
+    # Must not raise even though archived->completed is illegal.
     await harness.agent._sync_fr_status_on_merge(
         "tolldog/khonliang-developer", 100, f"fix: whatever ({fr.id})",
     )
 
     unchanged = harness.agent.pipeline.frs.get(fr.id)
     assert unchanged.status == "archived"
+    # Copilot review on PR #84: the gap message must name the real
+    # target status ("-> completed"), not an artifact of a blanket
+    # catch-and-retry-via-in_progress implementation.
+    assert len(gaps) == 1
+    assert "archived" in gaps[0] and "completed" in gaps[0]
+    assert "in_progress" not in gaps[0]

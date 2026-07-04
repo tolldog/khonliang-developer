@@ -238,16 +238,31 @@ class DeveloperAgent(BaseAgent):
         'completed' is only reachable from 'in_progress' (see
         ALLOWED_TRANSITIONS in fr_store.py) — an FR merged straight
         from 'open'/'planned' (never explicitly marked in_progress)
-        needs the intermediate hop. Already-terminal FRs raise on both
-        attempts, propagating to the caller unchanged.
+        needs the intermediate hop. Branches on the FR's current status
+        rather than catch-and-retry (Copilot review on PR #84): a
+        blanket ``except FRError`` around the first attempt would also
+        swallow "unknown fr id" / already-terminal errors and retry
+        with 'in_progress', reporting a confusing "archived ->
+        in_progress" failure for what's really an "archived ->
+        completed" refusal. Only open/planned get the hop; every other
+        status (in_progress, already-completed, or any terminal state)
+        attempts 'completed' directly, so a refusal names the real
+        target status.
         """
-        from developer.fr_store import FR_STATUS_COMPLETED, FR_STATUS_IN_PROGRESS, FRError
+        from developer.fr_store import (
+            FR_STATUS_COMPLETED,
+            FR_STATUS_IN_PROGRESS,
+            FR_STATUS_OPEN,
+            FR_STATUS_PLANNED,
+            FRError,
+        )
 
-        try:
-            self.pipeline.frs.update_status(fr_id, FR_STATUS_COMPLETED, notes=notes)
-        except FRError:
+        fr = self.pipeline.frs.get(fr_id, follow_redirect=True)
+        if fr is None:
+            raise FRError(f"unknown fr id: {fr_id}")
+        if fr.status in (FR_STATUS_OPEN, FR_STATUS_PLANNED):
             self.pipeline.frs.update_status(fr_id, FR_STATUS_IN_PROGRESS, notes=notes)
-            self.pipeline.frs.update_status(fr_id, FR_STATUS_COMPLETED, notes=notes)
+        self.pipeline.frs.update_status(fr_id, FR_STATUS_COMPLETED, notes=notes)
 
     async def start(self):
         """Rehydrate persisted PR watchers, then run the normal agent loop.
