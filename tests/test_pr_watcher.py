@@ -2154,6 +2154,134 @@ async def test_all_open_mode_backs_off_persistently_404ing_pending_pr(store):
     assert ("owner/repo", 9) not in gh.fetch_calls
 
 
+async def test_disappeared_pr_tracking_survives_a_process_restart(store):
+    """Codex review on PR #84, fourth round: purely in-memory tracking
+    loses a PR's disappearance entirely across a restart — the agent
+    comes back up, re-enumerates, and a PR that merged while it was
+    down was never "recently open" in the fresh process, so it's never
+    detected as disappeared at all. A second ``PRFleetWatcher`` built
+    against the SAME store + watcher_id (simulating a post-restart
+    process) must pick up exactly where the first left off.
+    """
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+
+    config = PRWatcherConfig(
+        watcher_id="prw_restart_test", repos=["owner/repo"],
+        pr_numbers=[], interval_s=60, started_at=0.0,
+    )
+    store.register_watcher(
+        watcher_id=config.watcher_id, repos=config.repos,
+        pr_numbers=config.pr_numbers, interval_s=config.interval_s,
+        started_at=config.started_at,
+    )
+
+    async def publish(topic: str, payload: dict) -> None:
+        published.append((topic, dict(payload)))
+
+    watcher_a = PRFleetWatcher(
+        config=config, store=store, publish=publish,
+        fetch_snapshot=gh.fetch_snapshot, list_open_prs=gh.list_open_prs,
+        now_fn=lambda: 0.0,
+    )
+    gh.open_prs["owner/repo"] = [9]
+    gh.snapshots[("owner/repo", 9)] = _make_snapshot(pr_number=9, head_sha="abc")
+    await watcher_a.poll_once()
+
+    # PR #9 merges while the process is "down" — no poll observes it.
+    gh.open_prs["owner/repo"] = []
+    gh.snapshots[("owner/repo", 9)] = _make_snapshot(
+        pr_number=9, head_sha="abc",
+        state="closed", merged=True, merged_at="2026-04-21T12:00:00Z",
+    )
+
+    # Simulate a restart: a brand new PRFleetWatcher instance, same
+    # store and watcher_id, constructed exactly like rehydrate() would.
+    calls: list[tuple[str, int, str]] = []
+
+    async def on_merged(repo: str, pr_number: int, title: str) -> None:
+        calls.append((repo, pr_number, title))
+
+    watcher_b = PRFleetWatcher(
+        config=config, store=store, publish=publish,
+        fetch_snapshot=gh.fetch_snapshot, list_open_prs=gh.list_open_prs,
+        now_fn=lambda: 0.0, on_merged=on_merged,
+    )
+    assert watcher_b._recently_open == {"owner/repo": {9}}
+
+    emitted = await watcher_b.poll_once()
+    assert emitted > 0
+    assert TOPIC_MERGED in _topics(published)
+    assert calls == [("owner/repo", 9, "")]
+
+
+async def test_on_merged_retries_after_a_failure_then_stops_once_synced(store):
+    """A crash or exception mid on_merged must not permanently lose the
+    FR-completion side effect (durable pr_watcher_merge_sync marker,
+    independent of the pr.merged bus dedupe) — but once it succeeds,
+    a still-merged PR that keeps getting fetched must NOT re-trigger it.
+    """
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    calls: list[tuple[str, int, str]] = []
+    should_fail = [True]
+
+    async def on_merged(repo: str, pr_number: int, title: str) -> None:
+        calls.append((repo, pr_number, title))
+        if should_fail[0]:
+            raise RuntimeError("simulated crash mid on_merged")
+
+    # Explicit pr_numbers mode: this PR stays polled forever regardless
+    # of merge state, so the "don't recall once synced" behavior is
+    # load-bearing here (not just the retry-until-success behavior).
+    watcher = _make_watcher(store, gh, published, pr_numbers=[9], on_merged=on_merged)
+    gh.snapshots[("owner/repo", 9)] = _make_snapshot(
+        pr_number=9, head_sha="abc",
+        state="closed", merged=True, merged_at="2026-04-21T12:00:00Z",
+    )
+
+    await watcher.poll_once()
+    assert len(calls) == 1
+    assert not watcher.store.is_merge_synced("prw_test", "owner/repo", 9)
+
+    should_fail[0] = False
+    await watcher.poll_once()
+    assert len(calls) == 2
+    assert watcher.store.is_merge_synced("prw_test", "owner/repo", 9)
+
+    # Already synced — must not be re-attempted even though the PR is
+    # still merged and still being fetched every cycle.
+    await watcher.poll_once()
+    assert len(calls) == 2
+
+
+def test_remove_watcher_clears_new_tracking_tables(store):
+    """remove_watcher must clean up the three tracking tables added for
+    crash-safe disappeared-PR retry and on_merged durability, matching
+    the existing registry/dedupe cleanup — otherwise a cycled watcher_id
+    would resurrect stale tracking rows from a prior watcher instance.
+    """
+    store.register_watcher("w1", ["owner/repo"], [], 60, 0.0)
+    store.replace_open_set_and_add_pending("w1", "owner/repo", {1, 2}, {3})
+    store.record_merge_observed("w1", "owner/repo", 4, "fix: thing")
+    store.mark_merge_synced("w1", "owner/repo", 4, 100.0)
+
+    assert store.load_open_sets("w1") == {"owner/repo": {1, 2}}
+    assert store.load_pending_terminal("w1") == {"owner/repo": {3}}
+    assert store.is_merge_synced("w1", "owner/repo", 4) is True
+
+    store.remove_watcher("w1")
+
+    assert store.load_open_sets("w1") == {}
+    assert store.load_pending_terminal("w1") == {}
+    # Row actually deleted, not just left un-synced — re-observing must
+    # be able to write a fresh pending row (INSERT OR IGNORE would
+    # silently no-op against a leftover synced row and never re-fire
+    # on_merged for a hypothetically-reused watcher_id).
+    store.record_merge_observed("w1", "owner/repo", 4, "fix: thing")
+    assert store.is_merge_synced("w1", "owner/repo", 4) is False
+
+
 # ---------------------------------------------------------------------------
 # Cooperative cancellation propagation (PR #39 Copilot R4).
 #
