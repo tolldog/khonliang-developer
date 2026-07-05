@@ -2215,6 +2215,69 @@ async def test_disappeared_pr_tracking_survives_a_process_restart(store):
     assert calls == [("owner/repo", 9, "")]
 
 
+async def test_failed_on_merged_does_not_orphan_all_open_mode_retry(store):
+    """Codex review on PR #84, second round on this exact mechanism:
+    clearing ``_pending_terminal`` BEFORE on_merged runs orphans the
+    retry for all-open mode — once cleared, a disappeared PR is neither
+    in the open set nor pending, so nothing ever triggers another fetch
+    of it again, even though the durable merge_sync row still says
+    "pending." on_merged failing must leave the PR pending so the next
+    cycle re-fetches it and retries on_merged too.
+    """
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    now = [0.0]
+    calls: list[tuple[str, int, str]] = []
+    should_fail = [True]
+
+    async def on_merged(repo: str, pr_number: int, title: str) -> None:
+        calls.append((repo, pr_number, title))
+        if should_fail[0]:
+            raise RuntimeError("simulated failure")
+
+    async def publish(topic: str, payload: dict) -> None:
+        published.append((topic, dict(payload)))
+
+    store.register_watcher(
+        watcher_id="prw_orphan_test", repos=["owner/repo"], pr_numbers=[],
+        interval_s=60, started_at=0.0,
+    )
+    watcher = PRFleetWatcher(
+        config=PRWatcherConfig(
+            watcher_id="prw_orphan_test", repos=["owner/repo"],
+            pr_numbers=[], interval_s=60, started_at=0.0,
+        ),
+        store=store, publish=publish,
+        fetch_snapshot=gh.fetch_snapshot, list_open_prs=gh.list_open_prs,
+        now_fn=lambda: now[0], on_merged=on_merged,
+    )
+
+    gh.open_prs["owner/repo"] = [9]
+    gh.snapshots[("owner/repo", 9)] = _make_snapshot(pr_number=9, head_sha="abc")
+    await watcher.poll_once()
+
+    # PR #9 disappears and merges. on_merged fails on this first look.
+    gh.open_prs["owner/repo"] = []
+    gh.snapshots[("owner/repo", 9)] = _make_snapshot(
+        pr_number=9, head_sha="abc",
+        state="closed", merged=True, merged_at="2026-04-21T12:00:00Z",
+    )
+    await watcher.poll_once()
+    assert len(calls) == 1
+    # The critical assertion: PR #9 must still be pending — otherwise
+    # it silently vanishes from tracking forever (neither open nor
+    # pending, no future poll will ever fetch it again).
+    assert watcher._pending_terminal["owner/repo"] == {9}
+    assert watcher.store.load_pending_terminal("prw_orphan_test") == {"owner/repo": {9}}
+
+    # Next cycle: on_merged succeeds this time.
+    should_fail[0] = False
+    await watcher.poll_once()
+    assert len(calls) == 2
+    assert watcher._pending_terminal.get("owner/repo", set()) == set()
+    assert watcher.store.is_merge_synced("prw_orphan_test", "owner/repo", 9)
+
+
 async def test_on_merged_retries_after_a_failure_then_stops_once_synced(store):
     """A crash or exception mid on_merged must not permanently lose the
     FR-completion side effect (durable pr_watcher_merge_sync marker,

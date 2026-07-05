@@ -1076,17 +1076,6 @@ class PRFleetWatcher:
             # A successful fetch clears the pair's 404 backoff — it is
             # demonstrably visible again and resumes full-speed polling.
             self._pair_backoff.pop((repo, pr_number), None)
-            # And clears it from the pending-terminal retry set (a no-op
-            # for a currently-open PR, which was never in it) — we've
-            # now actually observed this pair's current state, so
-            # whatever transition applies has had its chance to fire.
-            # In-memory and persisted together: this pair no longer
-            # needs a retry look regardless of process restarts.
-            if pr_number in self._pending_terminal.get(repo, ()):
-                self._pending_terminal[repo].discard(pr_number)
-                self.store.clear_pending_terminal(
-                    self.config.watcher_id, repo, pr_number,
-                )
             # Cache the latest observed snapshot for ``pr_fleet_status``
             # consumers. Stored before transition detection so even a
             # cycle that produces zero new transitions still surfaces the
@@ -1097,13 +1086,11 @@ class PRFleetWatcher:
             # pr.merged bus-dedupe above on purpose (see the comment in
             # _emit_transitions). record_merge_observed writes BEFORE
             # attempting on_merged so a crash mid-call, or a raise from
-            # on_merged itself, leaves a durable "still pending" row —
-            # the very next successful fetch of this pair (this cycle's
-            # if pending_terminal already pulled it in, or whenever
-            # explicit pr_numbers mode re-polls it) retries. Applies to
-            # BOTH watch modes: explicit pr_numbers keeps re-fetching a
-            # merged PR indefinitely too, so it needs the same
-            # already-synced check to avoid reprocessing it forever.
+            # on_merged itself, leaves a durable "still pending" row.
+            # Applies to BOTH watch modes: explicit pr_numbers keeps
+            # re-fetching a merged PR indefinitely too, so it needs the
+            # same already-synced check to avoid reprocessing it forever.
+            merge_sync_pending = False
             if snapshot.merged and self._on_merged is not None:
                 watcher_id = self.config.watcher_id
                 if not self.store.is_merge_synced(watcher_id, repo, pr_number):
@@ -1119,10 +1106,29 @@ class PRFleetWatcher:
                             "on_merged hook failed for %s#%d",
                             repo, pr_number, exc_info=True,
                         )
+                        merge_sync_pending = True
                     else:
                         self.store.mark_merge_synced(
                             watcher_id, repo, pr_number, self._now(),
                         )
+            # Only NOW clear the pending-terminal retry marker — after
+            # on_merged has had its chance and either succeeded or
+            # wasn't needed (Codex review, second round on this exact
+            # mechanism: clearing it BEFORE this point orphans the
+            # retry entirely for all-open mode. Once cleared, the PR is
+            # neither in the open set nor pending, so nothing ever
+            # triggers another fetch of it — even though the durable
+            # merge_sync row still says "pending," nothing acts on it
+            # again). If on_merged failed, leave the PR pending so the
+            # next cycle's _resolve_pr_set includes it again, re-fetches
+            # it, and retries on_merged too. A crash mid on_merged call
+            # never reaches this line at all, which is the safe default:
+            # the persisted pending_terminal row survives untouched.
+            if not merge_sync_pending and pr_number in self._pending_terminal.get(repo, ()):
+                self._pending_terminal[repo].discard(pr_number)
+                self.store.clear_pending_terminal(
+                    self.config.watcher_id, repo, pr_number,
+                )
         self.store.touch_last_poll(self.config.watcher_id, self._now())
         # Emit the aggregate digest only when at least one transition
         # fired this cycle. Silent windows cost zero digest events —
