@@ -248,18 +248,35 @@ class DeveloperAgent(BaseAgent):
         status (in_progress, already-completed, or any terminal state)
         attempts 'completed' directly, so a refusal names the real
         target status.
+
+        ``follow_redirect=False`` deliberately (Codex review on PR #84):
+        a PR title can still name an FR id that was later merged into a
+        larger consolidated FR via ``merge_frs``. Following the
+        redirect here would let one source FR's completion mark the
+        WHOLE merged target as 'completed' — potentially unblocking
+        dependents even though the target's combined scope hasn't
+        actually shipped. A non-merged FR's record is identical either
+        way (``get`` only redirects when status is already
+        FR_STATUS_MERGED), so this changes nothing for the normal path.
         """
         from developer.fr_store import (
             FR_STATUS_COMPLETED,
             FR_STATUS_IN_PROGRESS,
+            FR_STATUS_MERGED,
             FR_STATUS_OPEN,
             FR_STATUS_PLANNED,
             FRError,
         )
 
-        fr = self.pipeline.frs.get(fr_id, follow_redirect=True)
+        fr = self.pipeline.frs.get(fr_id, follow_redirect=False)
         if fr is None:
             raise FRError(f"unknown fr id: {fr_id}")
+        if fr.status == FR_STATUS_MERGED:
+            raise FRError(
+                f"{fr_id} was merged into {fr.merged_into!r} — refusing to "
+                "complete the merge target on behalf of one redirected "
+                "source FR"
+            )
         if fr.status in (FR_STATUS_OPEN, FR_STATUS_PLANNED):
             self.pipeline.frs.update_status(fr_id, FR_STATUS_IN_PROGRESS, notes=notes)
         self.pipeline.frs.update_status(fr_id, FR_STATUS_COMPLETED, notes=notes)

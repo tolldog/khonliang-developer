@@ -3774,3 +3774,42 @@ async def test_sync_fr_status_on_merge_reports_gap_on_illegal_transition(harness
     assert len(gaps) == 1
     assert "archived" in gaps[0] and "completed" in gaps[0]
     assert "in_progress" not in gaps[0]
+
+
+@pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_refuses_completing_a_merge_target(harness):
+    """Codex review on PR #84: a PR title can name an FR id that was
+    later merged/redirected into a larger consolidated FR. Following
+    the redirect would let one source FR's merge complete the WHOLE
+    target FR, potentially unblocking dependents before the target's
+    combined scope actually shipped. Must refuse and report a gap
+    instead, leaving the target's status untouched.
+    """
+    source = harness.agent.pipeline.frs.promote(
+        target="developer", title="Source FR", description="d",
+    )
+    other_source = harness.agent.pipeline.frs.promote(
+        target="developer", title="Other source FR", description="d",
+    )
+    merged = harness.agent.pipeline.frs.merge(
+        source_ids=[source.id, other_source.id],
+        title="Consolidated FR", description="d",
+    )
+
+    gaps: list[str] = []
+
+    async def fake_report_gap(operation, reason):
+        gaps.append(reason)
+
+    harness.agent._safe_report_gap = fake_report_gap
+
+    # A PR title naming the OLD (now-redirected) source FR id.
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 101, f"fix: old scope ({source.id})",
+    )
+
+    unchanged = harness.agent.pipeline.frs.get(merged.id)
+    assert unchanged.status == "open"
+    assert len(gaps) == 1
+    assert source.id in gaps[0]
+    assert merged.id in gaps[0]
