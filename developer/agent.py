@@ -277,6 +277,16 @@ class DeveloperAgent(BaseAgent):
                 "complete the merge target on behalf of one redirected "
                 "source FR"
             )
+        if fr.status == FR_STATUS_COMPLETED:
+            # Codex review on PR #84: a crash-retry (the watcher died
+            # after this call completed the FR but before
+            # pr_watcher_merge_sync.synced_at got marked) would
+            # otherwise reach update_status(COMPLETED) again.
+            # FRStore.update_status appends a notes_history entry even
+            # for a same-status call, so an unconditional retry would
+            # spam a duplicate audit line every time the crash-retry
+            # fires. Already done — nothing left to do.
+            return
         if fr.status in (FR_STATUS_OPEN, FR_STATUS_PLANNED):
             self.pipeline.frs.update_status(fr_id, FR_STATUS_IN_PROGRESS, notes=notes)
         self.pipeline.frs.update_status(fr_id, FR_STATUS_COMPLETED, notes=notes)

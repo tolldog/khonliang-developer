@@ -3813,3 +3813,30 @@ async def test_sync_fr_status_on_merge_refuses_completing_a_merge_target(harness
     assert len(gaps) == 1
     assert source.id in gaps[0]
     assert merged.id in gaps[0]
+
+
+@pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_is_idempotent_on_already_completed_fr(harness):
+    """Codex review on PR #84: a crash-retry (the watcher died after
+    _sync_fr_status_on_merge completed the FR but before
+    pr_watcher_merge_sync.synced_at was marked) reaches this method
+    again with the FR already 'completed'. update_status appends a
+    notes_history entry even for a same-status call, so an
+    unconditional retry would spam a duplicate audit line on every
+    crash-retry. Must be a no-op once already completed.
+    """
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Already completed", description="d",
+    )
+    harness.agent.pipeline.frs.update_status(fr.id, "in_progress")
+    harness.agent.pipeline.frs.update_status(fr.id, "completed")
+    before = harness.agent.pipeline.frs.get(fr.id)
+    history_len_before = len(before.notes_history)
+
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 102, f"fix: retry ({fr.id})",
+    )
+
+    after = harness.agent.pipeline.frs.get(fr.id)
+    assert after.status == "completed"
+    assert len(after.notes_history) == history_len_before
