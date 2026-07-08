@@ -1732,10 +1732,16 @@ class DeveloperAgent(BaseAgent):
             # above but are invisible to spec/repo_context — surface
             # that gap explicitly rather than letting the response look
             # complete (Codex review round 4 on PR #86).
+            # Scope this to items that actually matched the request
+            # (related_frs/related_milestones), not every FR/milestone
+            # in the store — otherwise an unrelated stray project in
+            # the database pollutes every cross-project briefing with
+            # a spurious "missing context" gap (Codex review round 7
+            # on PR #86).
             fr_and_milestone_projects = {
-                getattr(f, "project", None) for f in frs
+                f.get("project") for f in related_frs
             } | {
-                getattr(m, "project", None) for m in milestones
+                m.get("project") for m in related_milestones
             }
             unconfigured = sorted(
                 p for p in fr_and_milestone_projects
@@ -1784,7 +1790,14 @@ class DeveloperAgent(BaseAgent):
         #     N-project view): describe every configured project,
         #     tagged, rather than picking the first one arbitrarily.
         repo_context: dict[str, Any]
-        if project_raw and not spec_projects:
+        if detail == "compact":
+            # The compact response shape never includes repo_context
+            # (see the compact-projection block below) — building it
+            # anyway forces a filesystem scan of every configured repo
+            # for the cheapest, most latency-sensitive detail level,
+            # for output nobody sees (Codex review round 7 on PR #86).
+            repo_context = {}
+        elif project_raw and not spec_projects:
             repo_context = {
                 "available": False,
                 "note": f"project '{project_raw}' is not configured; repo context skipped",
