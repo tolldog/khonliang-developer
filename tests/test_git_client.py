@@ -195,6 +195,24 @@ def test_origin_url_returns_none_without_origin(client):
     assert client.origin_url() is None
 
 
+def test_remote_url_resolves_arbitrary_remote_name(client, repo_path):
+    _run("remote", "add", "origin", "git@github.com:owner/repo.git", cwd=repo_path)
+    _run("remote", "add", "upstream", "git@github.com:someone-else/repo.git", cwd=repo_path)
+
+    assert client.remote_url("origin") == "git@github.com:owner/repo.git"
+    assert client.remote_url("upstream") == "git@github.com:someone-else/repo.git"
+
+
+def test_remote_url_returns_none_for_unconfigured_remote(client, repo_path):
+    _run("remote", "add", "origin", "git@github.com:owner/repo.git", cwd=repo_path)
+    assert client.remote_url("upstream") is None
+
+
+def test_remote_url_defaults_to_origin(client, repo_path):
+    _run("remote", "add", "origin", "git@github.com:owner/repo.git", cwd=repo_path)
+    assert client.remote_url() == client.origin_url()
+
+
 # ---------------------------------------------------------------------------
 # list_branches + log + show + rev_parse + diff
 # ---------------------------------------------------------------------------
@@ -248,6 +266,37 @@ def test_rev_parse_returns_full_sha(client):
 def test_rev_parse_unknown_ref_raises_not_found(client):
     with pytest.raises(GitNotFoundError):
         client.rev_parse("totally-not-a-ref")
+
+
+def test_remote_branch_sha_returns_sha(client, monkeypatch):
+    from git.cmd import Git as _GitCmd
+
+    def fake_ls_remote(self_git, *args, **kwargs):
+        return "abc123def456\trefs/heads/feat/x"
+
+    monkeypatch.setattr(_GitCmd, "ls_remote", fake_ls_remote, raising=False)
+    assert client.remote_branch_sha("origin", "feat/x") == "abc123def456"
+
+
+def test_remote_branch_sha_returns_none_when_branch_missing(client, monkeypatch):
+    from git.cmd import Git as _GitCmd
+
+    def fake_ls_remote(self_git, *args, **kwargs):
+        return ""
+
+    monkeypatch.setattr(_GitCmd, "ls_remote", fake_ls_remote, raising=False)
+    assert client.remote_branch_sha("origin", "never-pushed") is None
+
+
+def test_remote_branch_sha_raises_client_error_on_failure(client, monkeypatch):
+    from git.cmd import Git as _GitCmd
+
+    def fake_ls_remote(self_git, *args, **kwargs):
+        raise RuntimeError("could not resolve host")
+
+    monkeypatch.setattr(_GitCmd, "ls_remote", fake_ls_remote, raising=False)
+    with pytest.raises(GitClientError, match="ls-remote failed"):
+        client.remote_branch_sha("origin", "feat/x")
 
 
 def test_diff_working_tree_vs_head(client, repo_path):
@@ -357,6 +406,47 @@ def test_stage_and_commit(client, repo_path):
 
     commit = client.commit("feat: add staged.txt")
     assert commit.message == "feat: add staged.txt"
+    assert client.status().staged == []
+
+
+def test_stage_handles_unstaged_deletion(client, repo_path):
+    """A tracked file removed from disk but not yet `git rm`'d must
+    still be stageable — GitPython's index.add() errors on a path that
+    no longer exists, so stage() routes missing paths through
+    index.remove() instead (Codex R3 on PR #88).
+    """
+    (repo_path / "gone.txt").write_text("x\n")
+    client.stage(["gone.txt"])
+    client.commit("feat: add gone.txt")
+
+    (repo_path / "gone.txt").unlink()
+    client.stage(["gone.txt"])
+    s = client.status()
+    # RepoStatus.deleted covers both staged and unstaged deletions
+    # (see status()'s XY-code parsing) — the commit below is the real
+    # assertion that the deletion was actually staged, not left dirty.
+    assert "gone.txt" in s.deleted
+    commit = client.commit("chore: remove gone.txt")
+    assert commit.message == "chore: remove gone.txt"
+    assert not (repo_path / "gone.txt").exists()
+    assert client.status().is_dirty is False
+
+
+def test_stage_handles_dangling_symlink(client, repo_path):
+    """A tracked or newly-added dangling symlink is a real,
+    intentionally-versioned entry — Path.exists() follows symlinks and
+    reports False for a broken link, which would misroute it through
+    index.remove() as if it were a deletion. os.path.lexists checks the
+    link itself (Codex R6 on PR #88).
+    """
+    link = repo_path / "broken_link"
+    link.symlink_to("does-not-exist-target")
+    client.stage(["broken_link"])
+    s = client.status()
+    assert "broken_link" in s.staged
+
+    commit = client.commit("feat: add broken symlink")
+    assert commit.message == "feat: add broken symlink"
     assert client.status().staged == []
 
 

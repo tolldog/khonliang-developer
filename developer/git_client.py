@@ -345,15 +345,29 @@ class GitClient:
 
     def origin_url(self) -> str | None:
         """Return the configured origin URL, or None when origin is absent."""
+        return self.remote_url("origin")
+
+    def remote_url(self, remote: str = "origin") -> str | None:
+        """Return the configured URL for ``remote``, or None if absent.
+
+        Generalizes :meth:`origin_url` to an arbitrary remote name.
+        Callers that resolve a GitHub ``owner/name`` from "the remote
+        we actually pushed to" (rather than hardcoding ``origin``) use
+        this — see ``maybe_update_pr`` in ``developer/pr_review_loop.py``
+        (fr_developer_35fe69af Codex R1: pushing to a non-``origin``
+        remote previously still resolved the PR target repo from
+        ``origin``, silently opening/reviewing the PR against the wrong
+        repo whenever a caller had a second remote configured).
+        """
         repo = self._get_repo()
         try:
-            remote = repo.remotes.origin
+            remote_obj = repo.remotes[remote]
         except (AttributeError, IndexError):
             return None
         try:
-            urls = list(remote.urls)
+            urls = list(remote_obj.urls)
         except Exception as e:
-            raise GitClientError(f"failed to read origin URL: {e}") from e
+            raise GitClientError(f"failed to read {remote!r} remote URL: {e}") from e
         return urls[0] if urls else None
 
     def list_branches(self, *, local: bool = True, remote: bool = False) -> list[GitBranch]:
@@ -418,6 +432,30 @@ class GitClient:
             return repo.git.rev_parse(ref)
         except Exception as e:
             raise GitNotFoundError(f"unknown ref: {ref}") from e
+
+    def remote_branch_sha(self, remote: str, branch: str) -> Optional[str]:
+        """Return the actual current tip sha of ``branch`` on ``remote``.
+
+        A real network round-trip (``git ls-remote``) rather than a
+        local remote-tracking ref lookup — the local ref is only as
+        fresh as the last fetch and may not even exist if the branch
+        was never fetched/tracked locally, which would otherwise make
+        "is there anything to push" unanswerable (Codex R5 on PR #88's
+        maybe_update_pr fix depends on this being authoritative, not
+        best-effort-local).
+
+        Returns ``None`` if the branch doesn't exist on the remote yet
+        (a brand-new branch never pushed before) rather than raising —
+        that's an expected, common state, not an error.
+        """
+        repo = self._get_repo()
+        try:
+            output = repo.git.ls_remote(remote, f"refs/heads/{branch}")
+        except Exception as e:
+            raise GitClientError(f"ls-remote failed: {e}") from e
+        if not output.strip():
+            return None
+        return output.split()[0]
 
     def diff(
         self, ref_a: str = "HEAD", ref_b: Optional[str] = None,
@@ -590,8 +628,26 @@ class GitClient:
                 f"really want to capture every change in the working tree"
             )
         repo = self._get_repo()
+        # GitPython's index.add() stages new/modified content but
+        # errors on a path whose file no longer exists on disk (a
+        # tracked-file deletion not yet `git rm`'d) — split the batch so
+        # a deletion mixed in with ordinary changes doesn't blow up the
+        # whole call (surfaced via maybe_update_pr's unstaged-deletion
+        # handling, Codex R3 on PR #88).
+        #
+        # ``Path.exists()`` follows symlinks, so a tracked or
+        # newly-added dangling/broken symlink (a real, intentionally
+        # versioned entry) would look "missing" and get routed through
+        # index.remove() instead of being added — use os.path.lexists,
+        # which checks the link itself (Codex R6 on PR #88).
+        root = Path(repo.working_tree_dir)
+        existing = [p for p in paths if os.path.lexists(root / p)]
+        missing = [p for p in paths if not os.path.lexists(root / p)]
         try:
-            repo.index.add(paths)
+            if existing:
+                repo.index.add(existing)
+            if missing:
+                repo.index.remove(missing)
         except Exception as e:
             raise GitClientError(f"stage failed: {e}") from e
         return list(paths)

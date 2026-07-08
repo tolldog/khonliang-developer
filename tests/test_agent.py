@@ -546,6 +546,141 @@ async def test_git_pr_commit_push_handler_refuses_main(harness, git_repo):
     assert "protected" in result["error"]
 
 
+# -- PR-iteration composites (fr_developer_35fe69af) --
+
+
+def test_pr_review_loop_skills_registered(harness):
+    harness.assert_skill_exists("request_copilot_review", description="Copilot")
+    harness.assert_skill_exists("maybe_update_pr", description="Copilot")
+    harness.assert_skill_exists("merge_pr", description="Squash-merge")
+
+
+@pytest.mark.asyncio
+async def test_request_copilot_review_handler_requires_args(harness):
+    result = await harness.call("request_copilot_review", {"repo": "", "pr_number": 1})
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_request_copilot_review_handler_delegates_to_github_client(harness, monkeypatch):
+    import developer.github_client as gh_mod
+
+    calls = []
+
+    class _FakeClient:
+        async def request_copilot_review(self, repo, pr_number):
+            calls.append((repo, pr_number))
+            return {"requested": True, "already_requested": False, "pr_node_id": "PR_x"}
+
+    monkeypatch.setattr(gh_mod, "GithubClient", _FakeClient)
+
+    result = await harness.call("request_copilot_review", {
+        "repo": "o/n", "pr_number": 84,
+    })
+    assert result == {"requested": True, "already_requested": False, "pr_node_id": "PR_x"}
+    assert calls == [("o/n", 84)]
+
+
+@pytest.mark.asyncio
+async def test_request_copilot_review_handler_surfaces_client_error(harness, monkeypatch):
+    import developer.github_client as gh_mod
+
+    class _FakeClient:
+        async def request_copilot_review(self, repo, pr_number):
+            raise gh_mod.GithubClientError("boom")
+
+    monkeypatch.setattr(gh_mod, "GithubClient", _FakeClient)
+
+    result = await harness.call("request_copilot_review", {"repo": "o/n", "pr_number": 84})
+    assert result == {"error": "boom"}
+
+
+@pytest.mark.asyncio
+async def test_maybe_update_pr_handler_requires_args(harness):
+    result = await harness.call("maybe_update_pr", {"cwd": "", "branch": "x"})
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_maybe_update_pr_handler_delegates_to_pr_review_loop(harness, monkeypatch):
+    import developer.pr_review_loop as loop_mod
+
+    calls = {}
+
+    async def fake_maybe_update_pr(cwd, branch, **kwargs):
+        calls["cwd"] = cwd
+        calls["branch"] = branch
+        calls["kwargs"] = kwargs
+        return {"pr_url": "https://github.com/o/n/pull/9", "pr_number": 9,
+                "repo": "o/n", "created": True, "committed": True,
+                "review_requested": True, "already_requested": False}
+
+    monkeypatch.setattr(loop_mod, "maybe_update_pr", fake_maybe_update_pr)
+
+    result = await harness.call("maybe_update_pr", {
+        "cwd": "/tmp/somewhere", "branch": "feat/x", "commit_message": "msg",
+    })
+    assert result["pr_number"] == 9
+    assert calls["cwd"] == "/tmp/somewhere"
+    assert calls["branch"] == "feat/x"
+    assert calls["kwargs"]["commit_message"] == "msg"
+    assert calls["kwargs"]["auto_request_review"] is True
+
+
+@pytest.mark.asyncio
+async def test_maybe_update_pr_handler_surfaces_git_guard_error(harness, monkeypatch):
+    import developer.pr_review_loop as loop_mod
+    from developer.git_client import GitGuardError
+
+    async def fake_maybe_update_pr(cwd, branch, **kwargs):
+        raise GitGuardError("branch mismatch")
+
+    monkeypatch.setattr(loop_mod, "maybe_update_pr", fake_maybe_update_pr)
+
+    result = await harness.call("maybe_update_pr", {
+        "cwd": "/tmp/somewhere", "branch": "feat/x",
+    })
+    assert result == {"error": "branch mismatch"}
+
+
+@pytest.mark.asyncio
+async def test_merge_pr_handler_requires_pr_url(harness):
+    result = await harness.call("merge_pr", {"pr_url": ""})
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_merge_pr_handler_delegates_and_passes_fr_sync_hook(harness, monkeypatch):
+    import developer.pr_review_loop as loop_mod
+
+    calls = {}
+
+    async def fake_merge_pr_and_sync(pr_url, **kwargs):
+        calls["pr_url"] = pr_url
+        calls["kwargs"] = kwargs
+        return {"repo": "o/n", "pr_number": 9, "merged": True, "sha": "abc",
+                "branch": "feat/x", "branch_deleted": True}
+
+    monkeypatch.setattr(loop_mod, "merge_pr_and_sync", fake_merge_pr_and_sync)
+
+    result = await harness.call("merge_pr", {
+        "pr_url": "https://github.com/o/n/pull/9",
+    })
+    assert result["merged"] is True
+    assert calls["pr_url"] == "https://github.com/o/n/pull/9"
+    # The composite must wire the same FR auto-completion hook the PR
+    # watcher uses for merge-observed FR syncing — not a second,
+    # divergent mechanism.
+    assert calls["kwargs"]["on_merged"] == harness.agent._sync_fr_status_on_merge
+
+
+@pytest.mark.asyncio
+async def test_merge_pr_handler_surfaces_pr_url_parse_error(harness):
+    result = await harness.call("merge_pr", {"pr_url": "not-a-url"})
+    assert "error" in result
+    assert "not a recognized GitHub PR URL" in result["error"]
+
+
 @pytest.mark.asyncio
 async def test_git_push_rejects_implicit_detached_head(harness, git_repo, monkeypatch):
     import subprocess as _sub
