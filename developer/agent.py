@@ -5333,13 +5333,21 @@ def _rank_briefing_items(items, keywords: set[str], *, text_fn, to_dict, limit: 
     ``keywords`` set (e.g. a request that's all stopwords) yields an empty
     list rather than an arbitrary unranked slice, so callers can tell
     "nothing matched" from "nothing scored."
+
+    Matches on whole tokens, not substrings: the candidate text is
+    tokenized with the same word pattern ``_extract_briefing_keywords``
+    uses, then scored via set intersection. A naive ``kw in text``
+    substring check would let a 2-char acronym keyword like "pr" match
+    inside unrelated words ("improve", "pretty"), polluting results —
+    exactly the false-positive risk the shorter min-length keyword cutoff
+    introduced (Codex review round 5 on PR #86).
     """
     if not keywords:
         return []
     scored = []
     for item in items:
-        text = text_fn(item).lower()
-        score = sum(1 for kw in keywords if kw in text)
+        text_tokens = set(re.findall(r"[a-z0-9_]+", text_fn(item).lower()))
+        score = len(keywords & text_tokens)
         if score > 0:
             scored.append((score, item))
     scored.sort(key=lambda pair: pair[0], reverse=True)

@@ -4333,3 +4333,29 @@ async def test_compose_extension_briefing_surfaces_unconfigured_fr_project_gap(h
     })
 
     assert any("ghost-project" in g for g in result["gaps"])
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_keyword_match_is_whole_token_not_substring(harness):
+    """Short keywords must not match as substrings inside unrelated words.
+
+    Codex review round 5 on PR #86: after lowering the keyword min
+    length to 2 for acronym support, a naive ``kw in text`` substring
+    check let "pr" match inside "improve" / "ui" match inside
+    "guideline" — polluting related_frs with unrelated results.
+    """
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Improve build guideline documentation",
+        description="Cleanup unrelated formatting fixes",
+        priority="low",
+        concept="docs",
+        project="developer",
+    )
+
+    result = await harness.call("compose_extension_briefing", {
+        "request": "update PR UI",
+        "project": "developer",
+    })
+
+    assert result["related_frs"] == []
