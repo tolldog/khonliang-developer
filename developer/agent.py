@@ -1091,6 +1091,49 @@ class DeveloperAgent(BaseAgent):
                               "description": "optional bug target override; defaults "
                               "to the agent's own type"}},
                   since="0.16.0"),
+            # -- dev-repo registry (fr_developer_5f3dc62e) --
+            Skill("dev_repos_register",
+                  "Idempotent upsert of a dev-lifecycle repo registry entry "
+                  "(distinct from researcher's ingestion-focused repo registry).",
+                  {"project": {"type": "string", "required": True,
+                               "description": "canonical project slug"},
+                   "repo_path": {"type": "string", "required": True},
+                   "default_branch": {"type": "string", "default": "main"},
+                   "remote_url": {"type": "string", "default": ""},
+                   "test_command": {"type": "string", "default": ""},
+                   "compile_command": {"type": "string", "default": ""},
+                   "reviewer_convention": {"type": "string", "default": ""},
+                   "owning_agents": {"type": "string", "default": "",
+                                      "description": "comma-separated (or list) "
+                                      "of bus agent_ids"}},
+                  since="0.17.0"),
+            Skill("dev_repos_list", "List registered dev repos, optionally scoped.",
+                  {"scope": {"type": "string", "default": "",
+                              "description": "comma-separated (or list) of "
+                              "project slugs to filter to; empty = all"}},
+                  since="0.17.0"),
+            Skill("dev_repos_get", "Fetch a single registered dev repo by project slug.",
+                  {"project": {"type": "string", "required": True}},
+                  since="0.17.0"),
+            Skill("dev_repos_resolve_target",
+                  "Resolve an FR's target field to its registered dev repo.",
+                  {"fr_id": {"type": "string", "required": True}},
+                  since="0.17.0"),
+            Skill("git_status_all",
+                  "Aggregate working-tree status across every registered dev repo.",
+                  {"scope": {"type": "string", "default": "",
+                              "description": "comma-separated (or list) of "
+                              "project slugs to filter to; empty = all"}},
+                  since="0.17.0"),
+            Skill("audit_repo_hygiene_all",
+                  "Run audit_repo_hygiene across every registered dev repo and "
+                  "cache the disposition on each registry entry.",
+                  {"scope": {"type": "string", "default": "",
+                              "description": "comma-separated (or list) of "
+                              "project slugs to filter to; empty = all"},
+                   "include_text_scan": {"type": "boolean", "default": True},
+                   "max_text_files": {"type": "integer", "default": 120}},
+                  since="0.17.0"),
         ]
 
     def register_collaborations(self):
@@ -2868,6 +2911,148 @@ class DeveloperAgent(BaseAgent):
         result["applied_changes"] = applied.get("applied_changes", [])
         result["skipped"] = applied.get("skipped", "")
         return {"audit": result}
+
+    # ------------------------------------------------------------------
+    # Dev-repo registry (fr_developer_5f3dc62e)
+    # ------------------------------------------------------------------
+
+    @handler("dev_repos_register")
+    async def handle_dev_repos_register(self, args):
+        from developer.dev_repo_store import DevRepoError
+
+        project = str(args.get("project") or "").strip()
+        repo_path = str(args.get("repo_path") or "").strip()
+        if not project:
+            return {"error": "project is required"}
+        if not repo_path:
+            return {"error": "repo_path is required"}
+        try:
+            repo = self.pipeline.dev_repos.register(
+                project,
+                repo_path,
+                default_branch=str(args.get("default_branch") or "main").strip() or "main",
+                remote_url=str(args.get("remote_url") or "").strip(),
+                test_command=str(args.get("test_command") or "").strip(),
+                compile_command=str(args.get("compile_command") or "").strip(),
+                reviewer_convention=str(args.get("reviewer_convention") or "").strip(),
+                owning_agents=_parse_paths(args.get("owning_agents")),
+            )
+        except DevRepoError as e:
+            return {"error": f"invalid argument: {e}"}
+        return {"repo": repo.to_dict()}
+
+    @handler("dev_repos_list")
+    async def handle_dev_repos_list(self, args):
+        scope = _parse_paths(args.get("scope")) or None
+        repos = self.pipeline.dev_repos.list(scope=scope)
+        return {"count": len(repos), "repos": [r.to_dict() for r in repos]}
+
+    @handler("dev_repos_get")
+    async def handle_dev_repos_get(self, args):
+        from developer.dev_repo_store import DevRepoError
+
+        project = str(args.get("project") or "").strip()
+        if not project:
+            return {"error": "project is required"}
+        try:
+            repo = self.pipeline.dev_repos.get(project)
+        except DevRepoError as e:
+            return {"error": f"invalid argument: {e}"}
+        if repo is None:
+            return {"repo": None}
+        return {"repo": repo.to_dict()}
+
+    @handler("dev_repos_resolve_target")
+    async def handle_dev_repos_resolve_target(self, args):
+        from developer.dev_repo_store import DevRepoError, resolve_fr_target
+
+        fr_id = str(args.get("fr_id") or "").strip()
+        if not fr_id:
+            return {"error": "fr_id is required"}
+        try:
+            return resolve_fr_target(self.pipeline.frs, self.pipeline.dev_repos, fr_id)
+        except DevRepoError as e:
+            return {"error": f"invalid argument: {e}"}
+
+    @handler("git_status_all")
+    async def handle_git_status_all(self, args):
+        """Aggregate git status across every registered dev repo.
+
+        Best-effort per-repo: a repo whose ``repo_path`` no longer
+        exists, isn't a git checkout, or otherwise fails to read status
+        surfaces an ``{"error": ...}`` entry rather than failing the
+        whole aggregate — one broken registration shouldn't hide the
+        status of every other repo.
+        """
+        from developer.git_client import GitClient, GitClientError
+
+        scope = _parse_paths(args.get("scope")) or None
+        repos = self.pipeline.dev_repos.list(scope=scope)
+        results = []
+        for repo in repos:
+            entry: dict[str, Any] = {"project": repo.project, "repo_path": repo.repo_path}
+            try:
+                s = GitClient(repo.repo_path).status()
+            except GitClientError as e:
+                entry["error"] = str(e)
+            else:
+                entry.update({
+                    "branch": s.branch,
+                    "is_dirty": s.is_dirty,
+                    "untracked": s.untracked,
+                    "modified": s.modified,
+                    "staged": s.staged,
+                    "deleted": s.deleted,
+                    "ahead": s.ahead,
+                    "behind": s.behind,
+                    "detached": s.detached,
+                })
+            results.append(entry)
+        return {"count": len(results), "repos": results}
+
+    @handler("audit_repo_hygiene_all")
+    async def handle_audit_repo_hygiene_all(self, args):
+        """Run audit_repo_hygiene per registered repo; cache the disposition.
+
+        Thin wrapper over the existing single-repo ``audit_repo_hygiene``
+        (per fr_developer_5f3dc62e's scoping note: this is a fan-out, not
+        a reimplementation). Best-effort per-repo, same rationale as
+        ``git_status_all``. On success, stamps
+        ``last_hygiene_audit_at`` / ``last_hygiene_disposition`` on the
+        registry entry via :meth:`DevRepoStore.record_hygiene_audit`.
+        """
+        from developer.dev_repo_store import DevRepoError
+        from developer.repo_hygiene import audit_repo_hygiene
+
+        scope = _parse_paths(args.get("scope")) or None
+        include_text_scan = _bool_arg(args, "include_text_scan", True)
+        max_text_files = _int_arg(args, "max_text_files", 120)
+        repos = self.pipeline.dev_repos.list(scope=scope)
+        results = []
+        for repo in repos:
+            entry: dict[str, Any] = {"project": repo.project, "repo_path": repo.repo_path}
+            try:
+                audit = audit_repo_hygiene(
+                    repo.repo_path,
+                    include_text_scan=include_text_scan,
+                    max_text_files=max_text_files,
+                )
+            except Exception as e:
+                await self._safe_report_gap("audit_repo_hygiene_all", f"{repo.project}: {e}")
+                entry["error"] = str(e)
+                results.append(entry)
+                continue
+            audit_dict = audit.to_dict()
+            disposition = str(audit_dict.get("summary") or "")
+            try:
+                self.pipeline.dev_repos.record_hygiene_audit(
+                    repo.project, disposition=disposition,
+                )
+            except DevRepoError as e:
+                entry["error"] = f"audit succeeded but registry stamp failed: {e}"
+            entry["audit"] = audit_dict
+            results.append(entry)
+        return {"count": len(results), "audits": results}
 
     # -- developer-owned FR lifecycle --
 

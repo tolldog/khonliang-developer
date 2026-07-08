@@ -23,6 +23,7 @@ from khonliang_researcher.doc_reader import LocalDocReader
 
 from developer.bug_store import BugStore
 from developer.config import Config
+from developer.dev_repo_store import DevRepoStore
 from developer.dogfood_store import DogfoodStore
 from developer.fr_store import FRStore
 from developer.milestone_store import MilestoneStore
@@ -57,6 +58,7 @@ class Pipeline:
     bugs: BugStore
     dogfood: DogfoodStore
     projects: ProjectStore
+    dev_repos: DevRepoStore
 
     @classmethod
     def from_config(cls, config: Config) -> "Pipeline":
@@ -117,6 +119,13 @@ class Pipeline:
         # remain project-implicit — Phase 3 migrates them.
         projects = ProjectStore(knowledge_store=knowledge)
 
+        # Dev-repo registry (fr_developer_5f3dc62e). Distinct from
+        # ProjectStore: this is developer's own dev-lifecycle registry
+        # (test/compile commands, reviewer convention, owning agents,
+        # cached hygiene/PR state) keyed by the same project-slug
+        # convention, not researcher's ingestion-focused repo registry.
+        dev_repos = DevRepoStore(knowledge=knowledge)
+
         return cls(
             config=config,
             knowledge=knowledge,
@@ -131,6 +140,7 @@ class Pipeline:
             bugs=bugs,
             dogfood=dogfood,
             projects=projects,
+            dev_repos=dev_repos,
         )
 
 
