@@ -4077,3 +4077,95 @@ async def test_audit_repo_hygiene_all_caches_disposition(harness, git_repo):
     fetched = await harness.call("dev_repos_get", {"project": "developer"})
     assert fetched["repo"]["last_hygiene_audit_at"] > 0
     assert fetched["repo"]["last_hygiene_disposition"]
+
+# -- compose_extension_briefing (fr_developer_41d50a99) --
+
+def test_compose_extension_briefing_skill_registered(harness):
+    harness.assert_skill_exists("compose_extension_briefing", description="briefing")
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_requires_request(harness):
+    result = await harness.call("compose_extension_briefing", {})
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_finds_related_fr(harness):
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Add rate limiting to pr_watcher",
+        description="Throttle GitHub polling to avoid hitting API limits",
+        priority="high",
+        concept="pr_watcher",
+        project="developer",
+    )
+    # A distractor FR that shares no keywords with the request.
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Refactor spec reader glob logic",
+        description="Cleanup path handling in the doc walker",
+        priority="low",
+        concept="specs",
+        project="developer",
+    )
+
+    result = await harness.call("compose_extension_briefing", {
+        "request": "add rate limiting to the pr_watcher",
+        "project": "developer",
+    })
+
+    assert result["request"] == "add rate limiting to the pr_watcher"
+    assert result["project"] == "developer"
+    ids = [f["id"] for f in result["related_frs"]]
+    assert any("rate" in f["title"].lower() for f in result["related_frs"])
+    assert len(ids) == 1  # the distractor scores 0 and is excluded
+    assert "repo_context" in result
+    assert result["research_corpus_context"]["available"] is False
+    assert result["gaps"]  # documents the researcher/librarian gap
+    assert result["detail"] == "brief"
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_compact_detail(harness):
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Add rate limiting to webhook installer",
+        description="Throttle webhook installs",
+        priority="medium",
+        concept="webhook",
+        project="developer",
+    )
+
+    result = await harness.call("compose_extension_briefing", {
+        "request": "add rate limiting to webhook installer",
+        "project": "developer",
+        "detail": "compact",
+    })
+
+    assert set(result.keys()) == {
+        "request", "project", "related_fr_ids", "related_spec_paths",
+        "related_milestone_ids", "gap_count", "detail",
+    }
+    assert len(result["related_fr_ids"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_no_matches_returns_empty_lists(harness):
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Completely unrelated topic",
+        description="Nothing to do with the ask",
+        priority="low",
+        concept="unrelated",
+        project="developer",
+    )
+
+    result = await harness.call("compose_extension_briefing", {
+        "request": "zzz qqq nonexistent keyword combination",
+        "project": "developer",
+    })
+
+    assert result["related_frs"] == []
+    assert result["related_specs"] == []
+    assert result["related_milestones"] == []

@@ -440,6 +440,22 @@ class DeveloperAgent(BaseAgent):
                    "include_live": {"type": "boolean", "default": True,
                                     "description": "overlay live-agent state from /v1/services"}},
                   since="0.18.0"),
+            # Cold-start entry skill (fr_developer_41d50a99). Composes
+            # developer-local FR/spec/milestone/repo context into one
+            # briefing so an ephemeral external LLM makes one call
+            # instead of scanning the codebase or corpus stores itself.
+            Skill("compose_extension_briefing",
+                  "Compose a single briefing (related FRs/specs/milestones, "
+                  "repo context) for a natural-language feature-extension "
+                  "request — a cold-start entry point so callers stop "
+                  "researching and start acting.",
+                  {"request": {"type": "string", "required": True,
+                               "description": "natural-language feature-extension ask"},
+                   "project": {"type": "string", "default": "",
+                               "description": "project slug; empty = cross-project FR/milestone view"},
+                   "detail": {"type": "string", "default": "brief",
+                              "description": "compact / brief / full"}},
+                  since="0.21.0"),
             # Project lifecycle (fr_developer_5d0a8711 Phase 2). Thin
             # wrappers over ProjectStore; cross-store migration (adding
             # `project` dimension to FR / milestone / spec / bug / dogfood)
@@ -1592,6 +1608,175 @@ class DeveloperAgent(BaseAgent):
             services_payload=services_payload,
         )
         return view.to_dict(detail=detail)
+
+    @handler("compose_extension_briefing")
+    async def handle_compose_extension_briefing(self, args):
+        """Cold-start entry skill: compose one briefing for a feature-extension ask.
+
+        fr_developer_41d50a99. Goal: an ephemeral external LLM (Claude/
+        Copilot/Codex/GPT) makes ONE call here instead of scanning the
+        codebase or researcher/librarian stores itself. This handler is
+        pure COMPOSITION over developer-local stores already owned by
+        this repo (FR store, milestone store, spec reader, repo
+        introspection) — it deliberately does not re-implement corpus
+        search and does not make a live bus call into researcher/
+        librarian for cross-agent context; that gap is surfaced via
+        ``research_corpus_context`` + ``gaps`` for a follow-up FR to wire.
+        """
+        allowed_detail = {"compact", "brief", "full"}
+        detail = str(args.get("detail") or "brief").strip().lower()
+        if detail not in allowed_detail:
+            detail = "brief"
+
+        request = str(args.get("request") or "").strip()
+        if not request:
+            return {"error": "request is required"}
+
+        project_raw = str(args.get("project") or "").strip()
+        # None = cross-project view for FR/milestone stores (matches
+        # list_frs_local / list_milestones semantics elsewhere in this
+        # file). Specs need a concrete project (SpecReader.list_specs
+        # keys off config.projects), so that lookup resolves separately
+        # below with a fallback to the first configured project.
+        fr_project = project_raw or None
+
+        keywords = _extract_briefing_keywords(request)
+        gaps: list[str] = []
+
+        try:
+            frs = self.pipeline.frs.list(
+                status=None, include_all=False, project=fr_project,
+            )
+        except Exception as e:
+            await self.report_gap("compose_extension_briefing", f"FR lookup failed: {e}")
+            frs = []
+        related_frs = _rank_briefing_items(
+            frs,
+            keywords,
+            text_fn=lambda f: f"{f.title} {f.description}",
+            to_dict=lambda f, score: {
+                "id": f.id,
+                "title": f.title,
+                "status": f.status,
+                "priority": f.priority,
+                "target": f.target,
+                "project": f.project,
+                "score": score,
+            },
+        )
+
+        try:
+            milestones = self.pipeline.milestones.list(project=fr_project)
+        except Exception as e:
+            await self.report_gap("compose_extension_briefing", f"milestone lookup failed: {e}")
+            milestones = []
+        related_milestones = _rank_briefing_items(
+            milestones,
+            keywords,
+            text_fn=lambda m: f"{m.title} {m.summary}",
+            to_dict=lambda m, score: {
+                "id": m.id,
+                "title": m.title,
+                "status": m.status,
+                "target": m.target,
+                "project": m.project,
+                "score": score,
+            },
+        )
+
+        # SpecReader.list_specs needs a project key that exists in
+        # config.projects (repo + specs_dir), which is a different
+        # namespace than the FR/milestone `project` field. Prefer the
+        # caller's project if it's configured; otherwise fall back to
+        # the first configured project so the briefing still says
+        # something useful rather than silently returning no specs.
+        configured_projects = getattr(self.pipeline.config, "projects", {}) or {}
+        if project_raw and project_raw in configured_projects:
+            spec_project = project_raw
+        else:
+            spec_project = next(iter(configured_projects), "")
+            if project_raw and project_raw not in configured_projects:
+                gaps.append(
+                    f"project '{project_raw}' has no configured specs_dir; "
+                    f"spec search fell back to '{spec_project}'"
+                )
+        try:
+            specs = self.pipeline.specs.list_specs(spec_project) if spec_project else []
+        except Exception as e:
+            await self.report_gap("compose_extension_briefing", f"spec lookup failed: {e}")
+            specs = []
+        related_specs = _rank_briefing_items(
+            specs,
+            keywords,
+            text_fn=lambda s: f"{s.title} {s.fr}",
+            to_dict=lambda s, score: {
+                "path": s.path,
+                "title": s.title,
+                "fr": s.fr,
+                "status": s.status,
+                "score": score,
+            },
+        )
+
+        # Repo context: reuse project_ecosystem's heuristic discovery,
+        # no live-agent overlay (no bus call from inside this skill —
+        # keeps this handler's cost bounded to local filesystem reads).
+        repo_context: dict[str, Any] = {}
+        try:
+            start_dir = None
+            proj_cfg = configured_projects.get(spec_project) if spec_project else None
+            repo = getattr(proj_cfg, "repo", None)
+            if repo:
+                start_dir = Path(repo)
+            if start_dir is None:
+                start_dir = Path.cwd()
+            view = _project_ecosystem.build_view(start_dir, domain="generic")
+            repo_context = view.to_dict(detail="compact")
+        except Exception as e:
+            await self.report_gap("compose_extension_briefing", f"repo context failed: {e}")
+            repo_context = {"error": str(e)}
+
+        # Cross-agent corpus context (researcher's KnowledgeStore/concept
+        # graph, librarian's classification/neighborhoods) is explicitly
+        # OUT of scope for this FR — composition stays developer-local.
+        # This is the documented placeholder a future FR wires a bus call
+        # into, per fr_developer_41d50a99's stated scope boundary.
+        research_corpus_context = {
+            "available": False,
+            "note": (
+                "researcher/librarian corpus context not wired into this "
+                "skill yet (fr_developer_41d50a99 scoped this to "
+                "developer-local stores only); a follow-up FR should add "
+                "a bus call for cross-agent evidence."
+            ),
+        }
+        gaps.append(
+            "no live researcher/librarian corpus lookup — see "
+            "research_corpus_context"
+        )
+
+        result = {
+            "request": request,
+            "project": project_raw or fr_project or "",
+            "related_frs": related_frs,
+            "related_specs": related_specs,
+            "related_milestones": related_milestones,
+            "repo_context": repo_context,
+            "research_corpus_context": research_corpus_context,
+            "gaps": gaps,
+            "detail": detail,
+        }
+        if detail == "compact":
+            result = {
+                "request": request,
+                "project": result["project"],
+                "related_fr_ids": [f["id"] for f in related_frs],
+                "related_spec_paths": [s["path"] for s in related_specs],
+                "related_milestone_ids": [m["id"] for m in related_milestones],
+                "gap_count": len(gaps),
+                "detail": detail,
+            }
+        return result
 
     # -- researcher evidence/concept skills (via bus-lib self.request) --
 
@@ -5029,6 +5214,44 @@ def _bool_arg(args: dict, name: str, default: bool = False) -> bool:
     if isinstance(raw, str):
         return raw.strip().lower() not in {"", "0", "false", "no", "off"}
     return bool(raw)
+
+
+_BRIEFING_STOPWORDS = frozenset({
+    "the", "a", "an", "to", "of", "for", "and", "or", "in", "on", "with",
+    "is", "are", "be", "add", "make", "this", "that", "it", "as", "at",
+    "by", "from", "into", "so", "we", "our", "please", "want", "need",
+})
+
+
+def _extract_briefing_keywords(request: str) -> set[str]:
+    """Lowercase word tokens from a free-form request, minus stopwords/short words.
+
+    Deliberately simple (no stemming, no embeddings) — this skill composes
+    developer-local data, it doesn't run relevance scoring; the FR scopes
+    real semantic matching out (see ``research_corpus_context`` gap).
+    """
+    tokens = re.findall(r"[a-z0-9_]+", request.lower())
+    return {t for t in tokens if len(t) >= 3 and t not in _BRIEFING_STOPWORDS}
+
+
+def _rank_briefing_items(items, keywords: set[str], *, text_fn, to_dict, limit: int = 8):
+    """Score items by keyword overlap against ``text_fn(item)``, descending.
+
+    Only items with at least one keyword hit are returned — an empty
+    ``keywords`` set (e.g. a request that's all stopwords) yields an empty
+    list rather than an arbitrary unranked slice, so callers can tell
+    "nothing matched" from "nothing scored."
+    """
+    if not keywords:
+        return []
+    scored = []
+    for item in items:
+        text = text_fn(item).lower()
+        score = sum(1 for kw in keywords if kw in text)
+        if score > 0:
+            scored.append((score, item))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [to_dict(item, score) for score, item in scored[:limit]]
 
 
 def _is_timeout_error(err: object) -> bool:
