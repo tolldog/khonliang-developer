@@ -42,6 +42,23 @@ def test_parse_owner_repo_from_origin_https_no_dotgit():
     ) == "tolldog/khonliang-developer"
 
 
+def test_parse_owner_repo_from_origin_https_with_token_userinfo():
+    """Codex R2 on PR #88: token-authenticated HTTPS remotes (CI, PAT
+    clones) commonly embed userinfo before the host — must not fail to
+    parse just because the previous regex only matched bare
+    ``https://github.com/...``.
+    """
+    assert parse_owner_repo_from_origin(
+        "https://x-access-token:ghp_abc123@github.com/tolldog/khonliang-developer.git"
+    ) == "tolldog/khonliang-developer"
+
+
+def test_parse_owner_repo_from_origin_https_with_bare_username():
+    assert parse_owner_repo_from_origin(
+        "https://tolldog@github.com/tolldog/khonliang-developer.git"
+    ) == "tolldog/khonliang-developer"
+
+
 def test_parse_owner_repo_from_origin_empty_raises():
     with pytest.raises(PrReviewLoopError, match="empty"):
         parse_owner_repo_from_origin("")
@@ -147,6 +164,34 @@ async def test_maybe_update_pr_creates_pr_and_requests_review_for_dirty_repo(
     assert result["review_requested"] is True
     assert fake_gh.create_calls[0]["head"] == "feat/x"
     assert fake_gh.request_calls == [("tolldog/khonliang-developer", 101)]
+
+
+@pytest.mark.asyncio
+async def test_maybe_update_pr_commits_already_staged_changes(git_repo, no_op_push):
+    """Codex R2 on PR #88: a caller that already ran `git add` before
+    calling this helper (or a prior partial git_stage) must still get
+    those changes committed — the API is documented as "stage+commit
+    uncommitted changes," and staged-but-uncommitted is uncommitted.
+    Previously only modified/untracked were checked, silently skipping
+    pre-staged changes: no commit, no push, no review request.
+    """
+    (git_repo / "new_file.txt").write_text("brand new\n")
+    _sub.run(["git", "add", "new_file.txt"], cwd=str(git_repo), check=True,
+              stdout=_sub.DEVNULL, stderr=_sub.DEVNULL)
+
+    from developer.git_client import GitClient
+    status = GitClient(str(git_repo)).status()
+    assert status.staged == ["new_file.txt"]
+    assert status.modified == [] and status.untracked == []  # sanity: pure staged case
+
+    fake_gh = _FakeGithubClient(existing_pr=None)
+    result = await maybe_update_pr(str(git_repo), "feat/x", github_client=fake_gh)
+
+    assert result["committed"] is True
+    assert result["review_requested"] is True
+    log = _sub.run(["git", "log", "--oneline", "-1"], cwd=str(git_repo), check=True,
+                    capture_output=True, text=True).stdout
+    assert "sync feat/x" in log or "feat/x" in log  # default-generated commit message landed
 
 
 @pytest.mark.asyncio
@@ -357,6 +402,29 @@ async def test_merge_pr_and_sync_skips_branch_delete_for_fork_pr():
     assert on_merged_calls == [
         ("tolldog/khonliang-developer", 84, "fr_developer_1234abcd: thing")
     ]
+
+
+@pytest.mark.asyncio
+async def test_merge_pr_and_sync_skips_branch_delete_when_head_repo_unknown():
+    """Codex R2 on PR #88: an empty head_repo (GitHub doesn't report it —
+    e.g. the source fork was deleted after merge) must NOT be treated as
+    "same repo, safe to delete." An unconfirmed answer gets the same
+    safe skip as a genuine fork mismatch, just with a different note so
+    the two causes stay distinguishable.
+    """
+    fake_gh = _FakeGithubClientForMerge(
+        head_repo="", base_repo="tolldog/khonliang-developer",
+    )
+
+    result = await merge_pr_and_sync(
+        "https://github.com/tolldog/khonliang-developer/pull/84",
+        github_client=fake_gh,
+    )
+
+    assert result["merged"] is True
+    assert result["branch_deleted"] is False
+    assert result["note"] == "head_repo_unknown"
+    assert fake_gh.delete_calls == []
 
 
 @pytest.mark.asyncio

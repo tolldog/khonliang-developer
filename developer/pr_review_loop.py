@@ -14,13 +14,17 @@ three pieces that are self-contained and used on every cycle:
   so a manually-triggered merge gets the same "record in store"
   treatment as one observed by the PR watcher.
 
-**Fork PRs are out of scope** (fr_developer_35fe69af Codex R1 follow-up):
+**Fork PRs are out of scope** (fr_developer_35fe69af Codex R1/R2 follow-up):
 this repo's workflow is sole-maintainer, always-push-to-origin, no fork
-PRs. ``merge_pr_and_sync`` detects a fork-shaped PR (head repo != base
-repo) and skips branch deletion with a ``fork_pr_unsupported`` note
-rather than deleting the wrong branch or silently no-op'ing; full fork
-support (resolving ``delete_branch``/``create_pr`` against the head
-repo) is left for a follow-up FR if this repo ever needs it.
+PRs. ``merge_pr_and_sync`` only deletes the head branch when ``head_repo``
+is *positively confirmed* to equal ``base_repo``; a genuine mismatch
+skips with ``"note": "fork_pr_unsupported"`` and an empty/unknown
+``head_repo`` (e.g. a since-deleted fork) skips with
+``"note": "head_repo_unknown"`` — neither case is treated as "safe to
+delete," since an unknown answer is not a confirmed same-repo match.
+Full fork support (resolving ``delete_branch``/``create_pr`` against the
+head repo) is left for a follow-up FR (fr_developer_00259318) if this
+repo ever needs it.
 
 **Scoping note (fr_developer_35fe69af):** ``schedule_pr_review_loop``
 (subscribe to ``pr.*`` bus events with stale-timeout self-escalation)
@@ -68,7 +72,7 @@ class PrReviewLoopError(RuntimeError):
 
 
 _ORIGIN_URL_RE = re.compile(
-    r"(?:git@github\.com:|https://github\.com/)"
+    r"(?:git@github\.com:|https://(?:[^@/]+@)?github\.com/)"
     r"(?P<owner>[^/]+)/(?P<name>[^/]+?)(?:\.git)?/?$"
 )
 
@@ -85,6 +89,13 @@ def parse_owner_repo_from_origin(url: Optional[str]) -> str:
     any remote's URL: the caller passes whichever remote's URL is
     actually relevant, e.g. ``git.remote_url(remote)`` for the remote
     that was actually pushed to (see ``maybe_update_pr`` below).
+
+    Handles authenticated HTTPS remotes (Codex R2 on PR #88: token-based
+    clones — CI, PAT-based remotes — commonly look like
+    ``https://x-access-token:TOKEN@github.com/owner/repo.git`` or
+    ``https://user@github.com/owner/repo.git``; the userinfo segment
+    before ``@github.com`` is stripped before matching owner/repo,
+    rather than causing the whole URL to fail to match).
 
     Raises :class:`PrReviewLoopError` for an empty/unrecognized URL —
     ``maybe_update_pr`` needs a real ``owner/name`` before it can talk
@@ -123,10 +134,12 @@ async def maybe_update_pr(
 ) -> dict:
     """Single-call "sync my branch to a PR" entry point.
 
-    1. Stage + commit any uncommitted changes (modified + untracked
-       paths only — deleted paths aren't handled because
-       :meth:`GitClient.stage` is add-only; a working tree with only
-       deletions pending is left for the caller to commit explicitly).
+    1. Stage + commit any uncommitted changes — modified, untracked, or
+       already-staged paths all count (staging only happens for the
+       modified/untracked set; already-staged paths are committed as-is).
+       Deleted paths aren't auto-staged because :meth:`GitClient.stage`
+       is add-only; a working tree with only deletions pending is left
+       for the caller to commit explicitly.
     2. Push the branch (idempotent — a no-op push when nothing's new).
     3. Create a PR for the branch if none is open yet (conventional
        body), else reuse the existing one.
@@ -161,11 +174,20 @@ async def maybe_update_pr(
         )
 
     status = git.status()
-    changed_paths = sorted(set(status.modified) | set(status.untracked))
+    # ``staged`` is included: a caller that already ran `git add` (or a
+    # prior partial ``git_stage`` call) before invoking this helper still
+    # needs those changes committed — this API is documented as
+    # "stage+commit uncommitted changes," and staged-but-uncommitted is
+    # squarely "uncommitted" (Codex R2 on PR #88: previously only
+    # modified/untracked were checked, so pre-staged changes were
+    # silently skipped — no commit, no push, no review request).
+    unstaged_paths = sorted(set(status.modified) | set(status.untracked))
+    already_staged = bool(status.staged)
     committed = False
-    if changed_paths:
+    if unstaged_paths or already_staged:
         message = commit_message.strip() or f"chore: sync {branch}"
-        git.stage(changed_paths)
+        if unstaged_paths:
+            git.stage(unstaged_paths)
         git.commit(message, branch_hint=branch)
         committed = True
     # Commits made locally before this call (e.g. via a prior
@@ -245,18 +267,29 @@ async def merge_pr_and_sync(
     branch was already deleted, or protection rules block it) doesn't
     unwind the merge — the merge is the state that matters.
 
-    **Fork PRs are explicitly unsupported for branch deletion**
-    (fr_developer_35fe69af Codex R1): this repo's workflow always
-    pushes to ``origin`` and never opens fork-based PRs, so
-    ``delete_branch(repo, head_ref)`` assumes the head branch lives in
+    **Fork PRs (and unknown head repos) are explicitly unsupported for
+    branch deletion** (fr_developer_35fe69af Codex R1 + R2): this repo's
+    workflow always pushes to ``origin`` and never opens fork-based PRs,
+    so ``delete_branch(repo, head_ref)`` assumes the head branch lives in
     the same repo the PR was opened against. For a fork-based PR the
     head branch actually lives in the fork, and blindly deleting
     ``head_ref`` against the base repo would either no-op (branch of
     that name doesn't exist there) or, worse, delete an unrelated
     same-named branch that does. Rather than build full fork support,
-    this detects the mismatch via ``get_pr``'s ``head_repo``/``base_repo``
-    fields and skips the delete, returning ``branch_deleted=False`` with
-    ``"note": "fork_pr_unsupported"`` — fail loud/safe, not silent/wrong.
+    this only deletes when ``get_pr``'s ``head_repo`` is *positively
+    confirmed* to match ``base_repo`` (case-insensitive). Two cases skip
+    the delete instead:
+
+    - ``head_repo != base_repo`` — a genuine fork PR
+      (``"note": "fork_pr_unsupported"``).
+    - ``head_repo`` is empty — GitHub doesn't know (or no longer knows,
+      e.g. the source fork was deleted after merge) which repo the head
+      branch lives in. Codex R2 flagged that the earlier version treated
+      this as "same repo" and fell through to deleting — an empty
+      answer is UNKNOWN, not a confirmed same-repo match, so it gets the
+      same safe skip (``"note": "head_repo_unknown"``).
+
+    Either way: fail loud/safe, not silent/wrong.
     """
     from developer.github_client import GithubClient, GithubClientError
 
@@ -267,29 +300,42 @@ async def merge_pr_and_sync(
     title = str(pr.get("title") or "")
     head_ref = str(pr.get("head") or "")
     head_repo = str(pr.get("head_repo") or "")
-    base_repo = str(pr.get("base_repo") or "")
-    is_fork_pr = bool(head_repo) and bool(base_repo) and head_repo.lower() != base_repo.lower()
+    base_repo = str(pr.get("base_repo") or "") or repo
+    # Only a POSITIVELY CONFIRMED same-repo match is safe to delete
+    # against. An empty head_repo is "unknown", not "same repo".
+    same_repo_confirmed = bool(head_repo) and head_repo.lower() == base_repo.lower()
 
     merge_result = await gh.merge_pr(repo, pr_number, method=merge_method)
 
     branch_deleted = False
     note = ""
-    if is_fork_pr:
-        note = "fork_pr_unsupported"
-        logger.warning(
-            "merge_pr_and_sync(%s#%d): head repo %r differs from base "
-            "repo %r (fork PR) — skipping branch delete, this workflow "
-            "doesn't support fork PRs yet",
-            repo, pr_number, head_repo, base_repo,
-        )
-    elif delete_branch and head_ref:
-        try:
-            branch_deleted = await gh.delete_branch(repo, head_ref)
-        except GithubClientError as e:
-            logger.warning(
-                "merge_pr_and_sync(%s#%d): branch delete failed (best-effort): %s",
-                repo, pr_number, e,
-            )
+    if delete_branch and head_ref:
+        if not same_repo_confirmed:
+            if head_repo:
+                note = "fork_pr_unsupported"
+                logger.warning(
+                    "merge_pr_and_sync(%s#%d): head repo %r differs from "
+                    "base repo %r (fork PR) — skipping branch delete, "
+                    "this workflow doesn't support fork PRs yet",
+                    repo, pr_number, head_repo, base_repo,
+                )
+            else:
+                note = "head_repo_unknown"
+                logger.warning(
+                    "merge_pr_and_sync(%s#%d): head repo unknown (empty) "
+                    "— skipping branch delete rather than assuming it's "
+                    "safe to delete against the base repo",
+                    repo, pr_number,
+                )
+        else:
+            try:
+                branch_deleted = await gh.delete_branch(repo, head_ref)
+            except GithubClientError as e:
+                logger.warning(
+                    "merge_pr_and_sync(%s#%d): branch delete failed "
+                    "(best-effort): %s",
+                    repo, pr_number, e,
+                )
 
     if on_merged is not None:
         try:
