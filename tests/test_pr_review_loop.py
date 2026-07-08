@@ -467,6 +467,33 @@ async def test_merge_pr_and_sync_skips_branch_delete_when_head_repo_unknown():
 
 
 @pytest.mark.asyncio
+async def test_merge_pr_and_sync_skips_side_effects_when_merge_not_confirmed():
+    """Codex R4 on PR #88: gh.merge_pr() can return merged=false (e.g.
+    a branch-protection check rejected the merge between pre-flight and
+    the call). The old code proceeded to delete the head branch and
+    fire on_merged regardless — deleting a live branch and marking the
+    FR complete for work that never actually landed. Both must be
+    skipped when the merge wasn't confirmed.
+    """
+    fake_gh = _FakeGithubClientForMerge(merged=False)
+    on_merged_calls = []
+
+    async def fake_on_merged(repo, pr_number, title):
+        on_merged_calls.append((repo, pr_number, title))
+
+    result = await merge_pr_and_sync(
+        "https://github.com/tolldog/khonliang-developer/pull/84",
+        github_client=fake_gh, on_merged=fake_on_merged,
+    )
+
+    assert result["merged"] is False
+    assert result["branch_deleted"] is False
+    assert result["note"] == "merge_not_confirmed"
+    assert fake_gh.delete_calls == []
+    assert on_merged_calls == []
+
+
+@pytest.mark.asyncio
 async def test_merge_pr_and_sync_skips_branch_delete_when_disabled():
     fake_gh = _FakeGithubClientForMerge()
 

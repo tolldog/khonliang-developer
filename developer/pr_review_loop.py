@@ -317,10 +317,19 @@ async def merge_pr_and_sync(
     same_repo_confirmed = bool(head_repo) and head_repo.lower() == base_repo.lower()
 
     merge_result = await gh.merge_pr(repo, pr_number, method=merge_method)
+    merged = bool(merge_result.get("merged", False))
 
     branch_deleted = False
     note = ""
-    if delete_branch and head_ref:
+    # GitHub can report merged=false (e.g. the merge was rejected by a
+    # branch-protection check between the pre-flight and the call) —
+    # deleting the head branch or firing on_merged in that case would
+    # delete a live branch and mark the FR complete for work that never
+    # actually landed (Codex R4 on PR #88). Gate everything below on a
+    # confirmed merge.
+    if not merged:
+        note = "merge_not_confirmed"
+    elif delete_branch and head_ref:
         if not same_repo_confirmed:
             if head_repo:
                 note = "fork_pr_unsupported"
@@ -348,7 +357,7 @@ async def merge_pr_and_sync(
                     repo, pr_number, e,
                 )
 
-    if on_merged is not None:
+    if merged and on_merged is not None:
         try:
             await on_merged(repo, pr_number, title)
         except Exception as e:
@@ -360,7 +369,7 @@ async def merge_pr_and_sync(
     return {
         "repo": repo,
         "pr_number": pr_number,
-        "merged": bool(merge_result.get("merged", False)),
+        "merged": merged,
         "sha": str(merge_result.get("sha") or ""),
         "branch": head_ref,
         "branch_deleted": branch_deleted,
