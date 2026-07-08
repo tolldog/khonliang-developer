@@ -22,6 +22,10 @@ data/*.db-wal
 # Copy config.example.yaml to config.yaml and edit for your environment.
 config.yaml
 
+# Local deploy manifest — contains absolute, machine-specific paths.
+# Copy deploy.yaml.example to deploy.yaml and edit for your environment.
+deploy.yaml
+
 # Local Claude Code MCP server registration. Contains absolute paths
 # to sibling MCP servers. Copy .mcp.example.json to .mcp.json and edit
 # the paths for your environment.
