@@ -1644,8 +1644,15 @@ class DeveloperAgent(BaseAgent):
         gaps: list[str] = []
 
         try:
+            # include_all=True: a request extending an already-shipped
+            # feature needs its completed/archived FR to surface too —
+            # this skill's whole promise is "stop researching, here's
+            # everything," so terminal-status FRs must not be dropped
+            # pre-fetch. Keyword ranking (with its score-based cap)
+            # naturally deprioritizes stale noise without excluding it
+            # outright (Codex review finding on PR #86).
             frs = self.pipeline.frs.list(
-                status=None, include_all=False, project=fr_project,
+                status=None, include_all=True, project=fr_project,
             )
         except Exception as e:
             await self.report_gap("compose_extension_briefing", f"FR lookup failed: {e}")
@@ -1686,25 +1693,35 @@ class DeveloperAgent(BaseAgent):
 
         # SpecReader.list_specs needs a project key that exists in
         # config.projects (repo + specs_dir), which is a different
-        # namespace than the FR/milestone `project` field. Prefer the
-        # caller's project if it's configured; otherwise fall back to
-        # the first configured project so the briefing still says
-        # something useful rather than silently returning no specs.
+        # namespace than the FR/milestone `project` field. When the
+        # caller scoped to one project, look at only that project's
+        # specs_dir. When the caller left `project` empty (an
+        # explicitly cross-project briefing, per fr_project=None
+        # above), spec discovery must cover every configured project
+        # too — restricting to just the first one silently drops specs
+        # under any other project (Codex review finding on PR #86).
         configured_projects = getattr(self.pipeline.config, "projects", {}) or {}
-        if project_raw and project_raw in configured_projects:
-            spec_project = project_raw
+        if project_raw:
+            if project_raw in configured_projects:
+                spec_projects = [project_raw]
+            else:
+                spec_projects = list(configured_projects)[:1]
+                if spec_projects:
+                    gaps.append(
+                        f"project '{project_raw}' has no configured specs_dir; "
+                        f"spec search fell back to '{spec_projects[0]}'"
+                    )
         else:
-            spec_project = next(iter(configured_projects), "")
-            if project_raw and project_raw not in configured_projects:
-                gaps.append(
-                    f"project '{project_raw}' has no configured specs_dir; "
-                    f"spec search fell back to '{spec_project}'"
+            spec_projects = list(configured_projects)
+
+        specs: list = []
+        for proj_key in spec_projects:
+            try:
+                specs.extend(self.pipeline.specs.list_specs(proj_key))
+            except Exception as e:
+                await self.report_gap(
+                    "compose_extension_briefing", f"spec lookup failed for {proj_key}: {e}",
                 )
-        try:
-            specs = self.pipeline.specs.list_specs(spec_project) if spec_project else []
-        except Exception as e:
-            await self.report_gap("compose_extension_briefing", f"spec lookup failed: {e}")
-            specs = []
         related_specs = _rank_briefing_items(
             specs,
             keywords,
@@ -1721,10 +1738,14 @@ class DeveloperAgent(BaseAgent):
         # Repo context: reuse project_ecosystem's heuristic discovery,
         # no live-agent overlay (no bus call from inside this skill —
         # keeps this handler's cost bounded to local filesystem reads).
+        # Anchors on the first spec-scoped project (single project when
+        # scoped; first configured one when cross-project) — repo intro
+        # is inherently single-repo-shaped, unlike spec discovery above.
         repo_context: dict[str, Any] = {}
         try:
             start_dir = None
-            proj_cfg = configured_projects.get(spec_project) if spec_project else None
+            repo_anchor_project = spec_projects[0] if spec_projects else ""
+            proj_cfg = configured_projects.get(repo_anchor_project) if repo_anchor_project else None
             repo = getattr(proj_cfg, "repo", None)
             if repo:
                 start_dir = Path(repo)

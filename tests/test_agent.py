@@ -4169,3 +4169,66 @@ async def test_compose_extension_briefing_no_matches_returns_empty_lists(harness
     assert result["related_frs"] == []
     assert result["related_specs"] == []
     assert result["related_milestones"] == []
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_surfaces_completed_fr(harness):
+    """A shipped feature's completed FR must still surface (Codex review, PR #86).
+
+    include_all=False would strip terminal-status FRs before keyword
+    ranking, so a request extending already-shipped work would report
+    "nothing found" and lose the prior implementation context this skill
+    exists to preserve.
+    """
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Add rate limiting to webhook installer",
+        description="Throttle webhook installs to avoid API limits",
+        priority="high",
+        concept="webhook",
+        project="developer",
+    )
+    harness.agent.pipeline.frs.update_status(fr.id, "planned")
+    harness.agent.pipeline.frs.update_status(fr.id, "in_progress")
+    harness.agent.pipeline.frs.update_status(fr.id, "completed")
+
+    result = await harness.call("compose_extension_briefing", {
+        "request": "extend the rate limiting on webhook installer",
+        "project": "developer",
+    })
+
+    ids = [f["id"] for f in result["related_frs"]]
+    assert fr.id in ids
+    completed = next(f for f in result["related_frs"] if f["id"] == fr.id)
+    assert completed["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_cross_project_finds_specs_in_all_projects(
+    temp_config_file, tmp_path,
+):
+    """A cross-project briefing (project="") must search every configured project's specs_dir.
+
+    Restricting to only the first configured project (Codex review, PR
+    #86) silently drops specs that live under any other project.
+    """
+    second_repo = tmp_path / "second_repo"
+    (second_repo / "specs" / "widget").mkdir(parents=True)
+    (second_repo / "specs" / "widget" / "spec.md").write_text(
+        "# Widget rate limiting\n\n**FR:** `fr_second_00000000`\n"
+    )
+
+    config_path = temp_config_file({
+        "projects": {
+            "second": {"repo": str(second_repo), "specs_dir": "specs"},
+        },
+    })
+    harness2 = AgentTestHarness(DeveloperAgent, config_path=str(config_path))
+
+    result = await harness2.call("compose_extension_briefing", {
+        "request": "widget rate limiting",
+        # project omitted -> cross-project briefing
+    })
+
+    paths = [s["path"] for s in result["related_specs"]]
+    assert any("second_repo" in p for p in paths)
