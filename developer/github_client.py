@@ -585,6 +585,129 @@ class GithubClient:
         pr = resp.parsed_data
         return {"number": pr.number, "html_url": pr.html_url}
 
+    async def find_open_pr_for_branch(self, repo: str, branch: str) -> Optional[dict]:
+        """Return the open PR whose head is ``branch``, or ``None``.
+
+        Used by ``maybe_update_pr`` (fr_developer_35fe69af) to decide
+        create-vs-reuse without the caller having to track a PR number
+        across restarts. ``head`` filters server-side as
+        ``"<owner>:<branch>"`` per GitHub's REST convention; only the
+        first match is returned since a branch can have at most one
+        open PR against a given repo.
+        """
+        owner, name = self._split_repo(repo)
+        try:
+            resp = await self._client().rest.pulls.async_list(
+                owner=owner, repo=name, head=f"{owner}:{branch}", state="open",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            raise GithubClientError(
+                f"find_open_pr_for_branch({repo}, {branch}): {e}"
+            ) from e
+        items = resp.parsed_data
+        if not items:
+            return None
+        pr = items[0]
+        return {"number": pr.number, "html_url": pr.html_url}
+
+    async def delete_branch(self, repo: str, branch: str) -> bool:
+        """Delete a remote branch by ref. Used after a squash-merge."""
+        owner, name = self._split_repo(repo)
+        try:
+            await self._client().rest.git.async_delete_ref(
+                owner=owner, repo=name, ref=f"heads/{branch}",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            raise GithubClientError(f"delete_branch({repo}, {branch}): {e}") from e
+        return True
+
+    async def request_copilot_review(self, repo: str, pr_number: int) -> dict:
+        """Request a Copilot review via GraphQL ``requestReviews`` + ``botIds``.
+
+        **Why GraphQL, not REST:** the REST
+        ``/pulls/{n}/requested_reviewers`` endpoint 422s with "not a
+        collaborator" when the reviewer is a bot — bot review requests
+        are GraphQL-only (``requestReviews(input: {botIds: [...]})``).
+        This is the canonical wrapper referenced by this repo's own
+        CLAUDE.md convention for re-triggering Copilot review.
+
+        **Idempotent:** a GraphQL lookup first checks
+        ``pullRequest.reviewRequests`` for an already-pending request
+        from :data:`COPILOT_BOT_ID`; if found, the mutation is skipped
+        and ``already_requested=True`` is returned. REST's
+        ``list_requested_reviewers`` doesn't surface bot requests (its
+        schema only has ``users``/``teams``), so the idempotency check
+        has to go through GraphQL too — a second REST-based check would
+        silently miss existing bot requests and double-fire the mutation
+        every call.
+
+        ``union=True`` on the mutation additively requests Copilot
+        without displacing any other already-requested reviewers.
+        """
+        owner, name = self._split_repo(repo)
+        lookup = """
+        query($owner: String!, $name: String!, $number: Int!) {
+          repository(owner: $owner, name: $name) {
+            pullRequest(number: $number) {
+              id
+              reviewRequests(first: 50) {
+                nodes { requestedReviewer { __typename ... on Bot { id } } }
+              }
+            }
+          }
+        }
+        """
+        try:
+            data = await self._client().graphql.arequest(
+                lookup, {"owner": owner, "name": name, "number": pr_number},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            raise GithubClientError(
+                f"request_copilot_review({repo}#{pr_number}): lookup failed: {e}"
+            ) from e
+        repository = data.get("repository") if isinstance(data, dict) else None
+        pr = repository.get("pullRequest") if repository else None
+        if not pr:
+            raise GithubNotFoundError(
+                f"request_copilot_review({repo}#{pr_number}): PR not found"
+            )
+        pr_node_id = pr["id"]
+        nodes = ((pr.get("reviewRequests") or {}).get("nodes")) or []
+        already = any(
+            (n.get("requestedReviewer") or {}).get("id") == COPILOT_BOT_ID
+            for n in nodes
+        )
+        if already:
+            return {
+                "requested": False,
+                "already_requested": True,
+                "pr_node_id": pr_node_id,
+            }
+        mutation = """
+        mutation($prId: ID!, $botIds: [ID!]) {
+          requestReviews(input: {pullRequestId: $prId, botIds: $botIds, union: true}) {
+            pullRequest { number }
+          }
+        }
+        """
+        try:
+            await self._client().graphql.arequest(
+                mutation, {"prId": pr_node_id, "botIds": [COPILOT_BOT_ID]},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            raise GithubClientError(
+                f"request_copilot_review({repo}#{pr_number}): mutation failed: {e}"
+            ) from e
+        return {"requested": True, "already_requested": False, "pr_node_id": pr_node_id}
+
     async def merge_pr(
         self, repo: str, pr_number: int, *,
         method: str = "squash",
@@ -708,6 +831,14 @@ def _latest_copilot_clear_comment(comments: list[dict], *, head_sha: str = "") -
             continue
         return body
     return ""
+
+
+# Copilot's GraphQL bot node id. Stable across this user's repos (see
+# ~/.claude/CLAUDE.md's Copilot re-review convention); used as the
+# ``botIds`` argument to the ``requestReviews`` GraphQL mutation in
+# :meth:`GithubClient.request_copilot_review`. If it ever rotates,
+# re-derive it from a prior Copilot review's ``author.id`` on any PR.
+COPILOT_BOT_ID = "BOT_kgDOCnlnWA"
 
 
 def is_copilot_login(login: str) -> bool:

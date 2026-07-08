@@ -1043,3 +1043,159 @@ async def test_create_pr_propagates_cancellation():
     _install_fake_gh(c, raise_on={"pulls.async_create": asyncio.CancelledError()})
     with pytest.raises(asyncio.CancelledError):
         await c.create_pr("o/n", title="t", body="b", head="h")
+
+
+# -- find_open_pr_for_branch / delete_branch / request_copilot_review
+# (fr_developer_35fe69af) --
+
+
+def _install_fake_gh_ext(client, *, list_prs=None, delete_raise=None,
+                          graphql_responses=None, graphql_raise_on_call=None):
+    """Fake ``_gh`` covering ``rest.pulls.async_list``,
+    ``rest.git.async_delete_ref``, and ``graphql.arequest`` — the three
+    surfaces the new PR-review-loop primitives need beyond what
+    ``_install_fake_gh`` already covers.
+
+    ``graphql_responses`` is a list consumed in call order (lookup, then
+    mutation) so a test can assert the idempotency short-circuit skips
+    the second (mutation) call by only ever providing one response.
+    """
+    graphql_calls: list[tuple] = []
+    responses = list(graphql_responses or [])
+
+    class _Pulls:
+        async def async_list(self, **kwargs):
+            return _FakeResponse2(list_prs if list_prs is not None else [])
+
+    class _Git:
+        async def async_delete_ref(self, **kwargs):
+            if delete_raise is not None:
+                raise delete_raise
+            return None
+
+    class _Graphql:
+        async def arequest(self, query, variables=None):
+            graphql_calls.append((query, variables))
+            if graphql_raise_on_call is not None and len(graphql_calls) in graphql_raise_on_call:
+                raise graphql_raise_on_call[len(graphql_calls)]
+            idx = len(graphql_calls) - 1
+            if idx < len(responses):
+                return responses[idx]
+            return {}
+
+    class _Rest:
+        pulls = _Pulls()
+        git = _Git()
+
+    class _Gh:
+        rest = _Rest()
+        graphql = _Graphql()
+
+    client._gh = _Gh()
+    return graphql_calls
+
+
+@pytest.mark.asyncio
+async def test_find_open_pr_for_branch_returns_first_match():
+    c = GithubClient(token="t")
+    _install_fake_gh_ext(c, list_prs=[_FakePR(number=7)])
+    result = await c.find_open_pr_for_branch("o/n", "feat/x")
+    assert result == {"number": 7, "html_url": "https://github.com/o/n/pull/7"}
+
+
+@pytest.mark.asyncio
+async def test_find_open_pr_for_branch_returns_none_when_no_match():
+    c = GithubClient(token="t")
+    _install_fake_gh_ext(c, list_prs=[])
+    result = await c.find_open_pr_for_branch("o/n", "feat/x")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_delete_branch_success():
+    c = GithubClient(token="t")
+    _install_fake_gh_ext(c)
+    assert await c.delete_branch("o/n", "feat/x") is True
+
+
+@pytest.mark.asyncio
+async def test_delete_branch_wraps_errors():
+    c = GithubClient(token="t")
+    _install_fake_gh_ext(c, delete_raise=_FakeHttpError(422))
+    with pytest.raises(GithubClientError, match="delete_branch"):
+        await c.delete_branch("o/n", "feat/x")
+
+
+@pytest.mark.asyncio
+async def test_request_copilot_review_requests_when_not_already_requested():
+    from developer.github_client import COPILOT_BOT_ID
+
+    c = GithubClient(token="t")
+    lookup_response = {
+        "repository": {
+            "pullRequest": {
+                "id": "PR_kwabc",
+                "reviewRequests": {"nodes": []},
+            }
+        }
+    }
+    calls = _install_fake_gh_ext(c, graphql_responses=[lookup_response, {}])
+    result = await c.request_copilot_review("o/n", 84)
+    assert result == {
+        "requested": True,
+        "already_requested": False,
+        "pr_node_id": "PR_kwabc",
+    }
+    # Two GraphQL round-trips: the reviewRequests lookup, then the mutation.
+    assert len(calls) == 2
+    mutation_query, mutation_vars = calls[1]
+    assert "requestReviews" in mutation_query
+    assert mutation_vars == {"prId": "PR_kwabc", "botIds": [COPILOT_BOT_ID]}
+
+
+@pytest.mark.asyncio
+async def test_request_copilot_review_is_idempotent_when_already_requested():
+    from developer.github_client import COPILOT_BOT_ID
+
+    c = GithubClient(token="t")
+    lookup_response = {
+        "repository": {
+            "pullRequest": {
+                "id": "PR_kwabc",
+                "reviewRequests": {
+                    "nodes": [
+                        {"requestedReviewer": {"__typename": "Bot", "id": COPILOT_BOT_ID}}
+                    ]
+                },
+            }
+        }
+    }
+    # Only one response is provided — if the mutation fired anyway, the
+    # second call would fall through to the empty-dict default and the
+    # test would still pass, so assert call count explicitly instead.
+    calls = _install_fake_gh_ext(c, graphql_responses=[lookup_response])
+    result = await c.request_copilot_review("o/n", 84)
+    assert result == {
+        "requested": False,
+        "already_requested": True,
+        "pr_node_id": "PR_kwabc",
+    }
+    assert len(calls) == 1  # mutation skipped entirely
+
+
+@pytest.mark.asyncio
+async def test_request_copilot_review_raises_not_found_when_pr_missing():
+    from developer.github_client import GithubNotFoundError
+
+    c = GithubClient(token="t")
+    _install_fake_gh_ext(c, graphql_responses=[{"repository": {"pullRequest": None}}])
+    with pytest.raises(GithubNotFoundError):
+        await c.request_copilot_review("o/n", 84)
+
+
+@pytest.mark.asyncio
+async def test_request_copilot_review_wraps_lookup_failure():
+    c = GithubClient(token="t")
+    _install_fake_gh_ext(c, graphql_raise_on_call={1: RuntimeError("boom")})
+    with pytest.raises(GithubClientError, match="lookup failed"):
+        await c.request_copilot_review("o/n", 84)

@@ -935,6 +935,42 @@ class DeveloperAgent(BaseAgent):
                                   "description": "comma-separated Name <email> list"},
                    "set_upstream": {"type": "boolean", "default": False}},
                   since="0.16.0"),
+            # PR-iteration composites (fr_developer_35fe69af): the three
+            # self-contained pieces of "push → request review → watch →
+            # merge" that don't need scheduler/event-subscription infra.
+            # See developer/pr_review_loop.py for scoping notes on the
+            # deferred schedule_pr_review_loop / dispatch_fix_subagent.
+            Skill("request_copilot_review",
+                  "Idempotent GraphQL requestReviews wrapper targeting "
+                  "Copilot's bot id. No-op if already requested.",
+                  {"repo": {"type": "string", "required": True,
+                             "description": "GitHub repo in owner/name form"},
+                   "pr_number": {"type": "integer", "required": True}},
+                  since="0.21.0"),
+            Skill("maybe_update_pr",
+                  "Single-call sync: stage+commit uncommitted changes, "
+                  "push, create the PR if none exists, request Copilot "
+                  "review when code materially changed.",
+                  {"cwd": {"type": "string", "required": True},
+                   "branch": {"type": "string", "required": True},
+                   "commit_message": {"type": "string", "default": "",
+                                       "description": "used for both the commit "
+                                       "message (if committing) and the PR "
+                                       "title (if creating); a default is "
+                                       "generated when omitted"},
+                   "auto_request_review": {"type": "boolean", "default": True},
+                   "remote": {"type": "string", "default": "origin"},
+                   "base": {"type": "string", "default": "main"},
+                   "pr_body": {"type": "string", "default": ""}},
+                  since="0.21.0"),
+            Skill("merge_pr",
+                  "Squash-merge a PR, delete its branch, and record the "
+                  "merge via the same FR auto-completion hook the PR "
+                  "watcher uses.",
+                  {"pr_url": {"type": "string", "required": True},
+                   "delete_branch": {"type": "boolean", "default": True},
+                   "merge_method": {"type": "string", "default": "squash"}},
+                  since="0.21.0"),
             Skill("git_show", "Resolve and summarize a commit",
                   {"cwd": {"type": "string", "required": True},
                    "ref": {"type": "string", "required": True}},
@@ -3858,6 +3894,69 @@ class DeveloperAgent(BaseAgent):
             )
         except GitClientError as e:
             await self._safe_report_gap("git_pr_commit_push", str(e))
+            return {"error": str(e)}
+        return result
+
+    @handler("request_copilot_review")
+    async def handle_request_copilot_review(self, args):
+        from developer.github_client import GithubClient, GithubClientError
+
+        repo = args.get("repo", "")
+        try:
+            pr_number = int(args.get("pr_number", 0))
+        except (TypeError, ValueError):
+            return {"error": "pr_number must be an integer"}
+        if not repo or pr_number < 1:
+            return {"error": "repo and pr_number are required"}
+        try:
+            result = await GithubClient().request_copilot_review(repo, pr_number)
+        except GithubClientError as e:
+            await self._safe_report_gap("request_copilot_review", str(e))
+            return {"error": str(e)}
+        return result
+
+    @handler("maybe_update_pr")
+    async def handle_maybe_update_pr(self, args):
+        from developer.git_client import GitClientError
+        from developer.github_client import GithubClientError
+        from developer.pr_review_loop import PrReviewLoopError, maybe_update_pr
+
+        cwd = args.get("cwd", "")
+        branch = args.get("branch", "")
+        if not cwd or not branch:
+            return {"error": "cwd and branch are required"}
+        try:
+            result = await maybe_update_pr(
+                cwd,
+                branch,
+                commit_message=str(args.get("commit_message", "") or ""),
+                auto_request_review=_bool_arg(args, "auto_request_review", default=True),
+                remote=args.get("remote") or "origin",
+                base=args.get("base") or "main",
+                pr_body=str(args.get("pr_body", "") or ""),
+            )
+        except (GitClientError, GithubClientError, PrReviewLoopError) as e:
+            await self._safe_report_gap("maybe_update_pr", str(e))
+            return {"error": str(e)}
+        return result
+
+    @handler("merge_pr")
+    async def handle_merge_pr(self, args):
+        from developer.github_client import GithubClientError
+        from developer.pr_review_loop import PrReviewLoopError, merge_pr_and_sync
+
+        pr_url = args.get("pr_url", "")
+        if not pr_url:
+            return {"error": "pr_url is required"}
+        try:
+            result = await merge_pr_and_sync(
+                pr_url,
+                delete_branch=_bool_arg(args, "delete_branch", default=True),
+                merge_method=args.get("merge_method") or "squash",
+                on_merged=self._sync_fr_status_on_merge,
+            )
+        except (GithubClientError, PrReviewLoopError) as e:
+            await self._safe_report_gap("merge_pr", str(e))
             return {"error": str(e)}
         return result
 
