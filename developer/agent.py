@@ -440,6 +440,22 @@ class DeveloperAgent(BaseAgent):
                    "include_live": {"type": "boolean", "default": True,
                                     "description": "overlay live-agent state from /v1/services"}},
                   since="0.18.0"),
+            # Cold-start entry skill (fr_developer_41d50a99). Composes
+            # developer-local FR/spec/milestone/repo context into one
+            # briefing so an ephemeral external LLM makes one call
+            # instead of scanning the codebase or corpus stores itself.
+            Skill("compose_extension_briefing",
+                  "Compose a single briefing (related FRs/specs/milestones, "
+                  "repo context) for a natural-language feature-extension "
+                  "request — a cold-start entry point so callers stop "
+                  "researching and start acting.",
+                  {"request": {"type": "string", "required": True,
+                               "description": "natural-language feature-extension ask"},
+                   "project": {"type": "string", "default": "",
+                               "description": "project slug; empty = cross-project FR/milestone view"},
+                   "detail": {"type": "string", "default": "brief",
+                              "description": "compact / brief / full"}},
+                  since="0.21.0"),
             # Project lifecycle (fr_developer_5d0a8711 Phase 2). Thin
             # wrappers over ProjectStore; cross-store migration (adding
             # `project` dimension to FR / milestone / spec / bug / dogfood)
@@ -1592,6 +1608,274 @@ class DeveloperAgent(BaseAgent):
             services_payload=services_payload,
         )
         return view.to_dict(detail=detail)
+
+    @handler("compose_extension_briefing")
+    async def handle_compose_extension_briefing(self, args):
+        """Cold-start entry skill: compose one briefing for a feature-extension ask.
+
+        fr_developer_41d50a99. Goal: an ephemeral external LLM (Claude/
+        Copilot/Codex/GPT) makes ONE call here instead of scanning the
+        codebase or researcher/librarian stores itself. This handler is
+        pure COMPOSITION over developer-local stores already owned by
+        this repo (FR store, milestone store, spec reader, repo
+        introspection) — it deliberately does not re-implement corpus
+        search and does not make a live bus call into researcher/
+        librarian for cross-agent context; that gap is surfaced via
+        ``research_corpus_context`` + ``gaps`` for a follow-up FR to wire.
+        """
+        allowed_detail = {"compact", "brief", "full"}
+        detail = str(args.get("detail") or "brief").strip().lower()
+        if detail not in allowed_detail:
+            detail = "brief"
+
+        request = str(args.get("request") or "").strip()
+        if not request:
+            return {"error": "request is required"}
+
+        project_raw = str(args.get("project") or "").strip()
+        # None = cross-project view for FR/milestone stores (matches
+        # list_frs_local / list_milestones semantics elsewhere in this
+        # file). Specs need a concrete project (SpecReader.list_specs
+        # keys off config.projects), so that lookup resolves separately
+        # below with a fallback to the first configured project.
+        fr_project = project_raw or None
+
+        keywords = _extract_briefing_keywords(request)
+        gaps: list[str] = []
+
+        try:
+            # include_all=True: a request extending an already-shipped
+            # feature needs its completed/archived FR to surface too —
+            # this skill's whole promise is "stop researching, here's
+            # everything," so terminal-status FRs must not be dropped
+            # pre-fetch. Keyword ranking (with its score-based cap)
+            # naturally deprioritizes stale noise without excluding it
+            # outright (Codex review finding on PR #86).
+            frs = self.pipeline.frs.list(
+                status=None, include_all=True, project=fr_project,
+            )
+        except Exception as e:
+            await self.report_gap("compose_extension_briefing", f"FR lookup failed: {e}")
+            frs = []
+        related_frs = _rank_briefing_items(
+            frs,
+            keywords,
+            text_fn=lambda f: f"{f.title} {f.description}",
+            to_dict=lambda f, score: {
+                "id": f.id,
+                "title": f.title,
+                "status": f.status,
+                "priority": f.priority,
+                "target": f.target,
+                "project": f.project,
+                "score": score,
+            },
+        )
+
+        try:
+            # include_archived=True mirrors the FR fix above: an
+            # abandoned/archived milestone for the same feature is
+            # exactly the prior planning context an "extend existing
+            # work" request needs (Codex review round 2 on PR #86).
+            milestones = self.pipeline.milestones.list(
+                project=fr_project, include_archived=True,
+            )
+        except Exception as e:
+            await self.report_gap("compose_extension_briefing", f"milestone lookup failed: {e}")
+            milestones = []
+        related_milestones = _rank_briefing_items(
+            milestones,
+            keywords,
+            text_fn=lambda m: f"{m.title} {m.summary}",
+            to_dict=lambda m, score: {
+                "id": m.id,
+                "title": m.title,
+                "status": m.status,
+                "target": m.target,
+                "project": m.project,
+                "score": score,
+            },
+        )
+
+        # SpecReader.list_specs needs a project key that exists in
+        # config.projects (repo + specs_dir), which is a different
+        # namespace than the FR/milestone `project` field. When the
+        # caller scoped to one project, look at only that project's
+        # specs_dir. When the caller left `project` empty (an
+        # explicitly cross-project briefing, per fr_project=None
+        # above), spec discovery must cover every configured project
+        # too — restricting to just the first one silently drops specs
+        # under any other project (Codex review finding on PR #86).
+        configured_projects = getattr(self.pipeline.config, "projects", {}) or {}
+        if project_raw:
+            if project_raw in configured_projects:
+                spec_projects = [project_raw]
+            else:
+                # Unknown project slug (typo, or an FR-only project with
+                # no specs_dir configured) — do NOT substitute an
+                # arbitrary configured project. That would silently mix
+                # an unrelated repo's specs/repo_context into a briefing
+                # that still echoes the caller's requested project,
+                # pointing an external LLM at the wrong codebase (Codex
+                # review round 2 on PR #86). Return no specs and say so.
+                spec_projects = []
+                gaps.append(
+                    f"project '{project_raw}' has no configured specs_dir; "
+                    "spec search skipped (not substituting an unrelated project)"
+                )
+        else:
+            spec_projects = list(configured_projects)
+            # A cross-project briefing fetched FRs/milestones for EVERY
+            # project in the store, including FR-only projects that
+            # never got a config.projects entry (no specs_dir/repo).
+            # Those still contribute to related_frs/related_milestones
+            # above but are invisible to spec/repo_context — surface
+            # that gap explicitly rather than letting the response look
+            # complete (Codex review round 4 on PR #86).
+            # Scope this to items that actually matched the request
+            # (related_frs/related_milestones), not every FR/milestone
+            # in the store — otherwise an unrelated stray project in
+            # the database pollutes every cross-project briefing with
+            # a spurious "missing context" gap (Codex review round 7
+            # on PR #86).
+            fr_and_milestone_projects = {
+                f.get("project") for f in related_frs
+            } | {
+                m.get("project") for m in related_milestones
+            }
+            unconfigured = sorted(
+                p for p in fr_and_milestone_projects
+                if p and p not in configured_projects
+            )
+            if unconfigured:
+                gaps.append(
+                    f"FRs/milestones exist for project(s) {unconfigured} "
+                    "with no configured specs_dir; spec/repo context "
+                    "skipped for them"
+                )
+
+        specs: list = []
+        for proj_key in spec_projects:
+            try:
+                specs.extend(self.pipeline.specs.list_specs(proj_key))
+            except Exception as e:
+                await self.report_gap(
+                    "compose_extension_briefing", f"spec lookup failed for {proj_key}: {e}",
+                )
+        related_specs = _rank_briefing_items(
+            specs,
+            keywords,
+            text_fn=lambda s: f"{s.title} {s.fr}",
+            to_dict=lambda s, score: {
+                "path": s.path,
+                "title": s.title,
+                "fr": s.fr,
+                "status": s.status,
+                "score": score,
+            },
+        )
+
+        # Repo context: reuse project_ecosystem's heuristic discovery,
+        # no live-agent overlay (no bus call from inside this skill —
+        # keeps this handler's cost bounded to local filesystem reads).
+        #
+        # Must stay honest about which repo(s) it describes (Codex
+        # review round 3 on PR #86):
+        #   - unconfigured project (spec_projects empty because the
+        #     caller's project slug isn't in config.projects): do NOT
+        #     fall back to cwd — that silently describes an unrelated
+        #     repo while echoing the caller's requested project.
+        #   - single scoped project: describe exactly that repo.
+        #   - cross-project (0 or 1 project alone can't represent an
+        #     N-project view): describe every configured project,
+        #     tagged, rather than picking the first one arbitrarily.
+        repo_context: dict[str, Any]
+        if detail == "compact":
+            # The compact response shape never includes repo_context
+            # (see the compact-projection block below) — building it
+            # anyway forces a filesystem scan of every configured repo
+            # for the cheapest, most latency-sensitive detail level,
+            # for output nobody sees (Codex review round 7 on PR #86).
+            repo_context = {}
+        elif project_raw and not spec_projects:
+            repo_context = {
+                "available": False,
+                "note": f"project '{project_raw}' is not configured; repo context skipped",
+            }
+        elif len(spec_projects) == 1:
+            try:
+                proj_cfg = configured_projects.get(spec_projects[0])
+                repo = getattr(proj_cfg, "repo", None)
+                start_dir = Path(repo) if repo else Path.cwd()
+                view = _project_ecosystem.build_view(start_dir, domain="generic")
+                # Thread the caller's requested `detail` through, not a
+                # hardcoded "compact" — a brief/full request was
+                # silently getting compact ecosystem data regardless of
+                # what it asked for (Codex review round 6 on PR #86).
+                repo_context = view.to_dict(detail=detail)
+            except Exception as e:
+                await self.report_gap("compose_extension_briefing", f"repo context failed: {e}")
+                repo_context = {"error": str(e)}
+        else:
+            # Cross-project briefing: no single repo speaks for the
+            # whole response, so describe each configured project
+            # instead of arbitrarily anchoring on the first one.
+            by_project: dict[str, Any] = {}
+            for proj_key in spec_projects:
+                try:
+                    proj_cfg = configured_projects.get(proj_key)
+                    repo = getattr(proj_cfg, "repo", None)
+                    start_dir = Path(repo) if repo else Path.cwd()
+                    view = _project_ecosystem.build_view(start_dir, domain="generic")
+                    by_project[proj_key] = view.to_dict(detail=detail)
+                except Exception as e:
+                    await self.report_gap(
+                        "compose_extension_briefing", f"repo context failed for {proj_key}: {e}",
+                    )
+                    by_project[proj_key] = {"error": str(e)}
+            repo_context = {"cross_project": True, "projects": by_project}
+
+        # Cross-agent corpus context (researcher's KnowledgeStore/concept
+        # graph, librarian's classification/neighborhoods) is explicitly
+        # OUT of scope for this FR — composition stays developer-local.
+        # This is the documented placeholder a future FR wires a bus call
+        # into, per fr_developer_41d50a99's stated scope boundary.
+        research_corpus_context = {
+            "available": False,
+            "note": (
+                "researcher/librarian corpus context not wired into this "
+                "skill yet (fr_developer_41d50a99 scoped this to "
+                "developer-local stores only); a follow-up FR should add "
+                "a bus call for cross-agent evidence."
+            ),
+        }
+        gaps.append(
+            "no live researcher/librarian corpus lookup — see "
+            "research_corpus_context"
+        )
+
+        result = {
+            "request": request,
+            "project": project_raw or fr_project or "",
+            "related_frs": related_frs,
+            "related_specs": related_specs,
+            "related_milestones": related_milestones,
+            "repo_context": repo_context,
+            "research_corpus_context": research_corpus_context,
+            "gaps": gaps,
+            "detail": detail,
+        }
+        if detail == "compact":
+            result = {
+                "request": request,
+                "project": result["project"],
+                "related_fr_ids": [f["id"] for f in related_frs],
+                "related_spec_paths": [s["path"] for s in related_specs],
+                "related_milestone_ids": [m["id"] for m in related_milestones],
+                "gap_count": len(gaps),
+                "detail": detail,
+            }
+        return result
 
     # -- researcher evidence/concept skills (via bus-lib self.request) --
 
@@ -5029,6 +5313,62 @@ def _bool_arg(args: dict, name: str, default: bool = False) -> bool:
     if isinstance(raw, str):
         return raw.strip().lower() not in {"", "0", "false", "no", "off"}
     return bool(raw)
+
+
+_BRIEFING_STOPWORDS = frozenset({
+    "the", "a", "an", "to", "of", "for", "and", "or", "in", "on", "with",
+    "is", "are", "be", "add", "make", "this", "that", "it", "as", "at",
+    "by", "from", "into", "so", "we", "our", "please", "want", "need",
+    "if", "up", "no", "us", "my", "do", "go", "am", "me", "he", "it's",
+})
+
+
+def _extract_briefing_keywords(request: str) -> set[str]:
+    """Lowercase word tokens from a free-form request, minus stopwords.
+
+    Minimum length is 2, not 3 — short engineering acronyms (``CI``,
+    ``PR``, ``UI``, ``DB``) are exactly the kind of high-signal term a
+    request like "update PR UI" hinges on; dropping them made those
+    requests return empty related_* lists even when FR/spec/milestone
+    titles contained the same acronym (Codex review round 4 on PR #86).
+    The stopword list is widened correspondingly so common 2-letter
+    English words don't turn into false-positive noise.
+
+    Deliberately simple otherwise (no stemming, no embeddings) — this
+    skill composes developer-local data, it doesn't run relevance
+    scoring; the FR scopes real semantic matching out (see
+    ``research_corpus_context`` gap).
+    """
+    tokens = re.findall(r"[a-z0-9_]+", request.lower())
+    return {t for t in tokens if len(t) >= 2 and t not in _BRIEFING_STOPWORDS}
+
+
+def _rank_briefing_items(items, keywords: set[str], *, text_fn, to_dict, limit: int = 8):
+    """Score items by keyword overlap against ``text_fn(item)``, descending.
+
+    Only items with at least one keyword hit are returned — an empty
+    ``keywords`` set (e.g. a request that's all stopwords) yields an empty
+    list rather than an arbitrary unranked slice, so callers can tell
+    "nothing matched" from "nothing scored."
+
+    Matches on whole tokens, not substrings: the candidate text is
+    tokenized with the same word pattern ``_extract_briefing_keywords``
+    uses, then scored via set intersection. A naive ``kw in text``
+    substring check would let a 2-char acronym keyword like "pr" match
+    inside unrelated words ("improve", "pretty"), polluting results —
+    exactly the false-positive risk the shorter min-length keyword cutoff
+    introduced (Codex review round 5 on PR #86).
+    """
+    if not keywords:
+        return []
+    scored = []
+    for item in items:
+        text_tokens = set(re.findall(r"[a-z0-9_]+", text_fn(item).lower()))
+        score = len(keywords & text_tokens)
+        if score > 0:
+            scored.append((score, item))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [to_dict(item, score) for score, item in scored[:limit]]
 
 
 def _is_timeout_error(err: object) -> bool:

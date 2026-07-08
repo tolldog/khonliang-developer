@@ -4077,3 +4077,305 @@ async def test_audit_repo_hygiene_all_caches_disposition(harness, git_repo):
     fetched = await harness.call("dev_repos_get", {"project": "developer"})
     assert fetched["repo"]["last_hygiene_audit_at"] > 0
     assert fetched["repo"]["last_hygiene_disposition"]
+
+# -- compose_extension_briefing (fr_developer_41d50a99) --
+
+def test_compose_extension_briefing_skill_registered(harness):
+    harness.assert_skill_exists("compose_extension_briefing", description="briefing")
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_requires_request(harness):
+    result = await harness.call("compose_extension_briefing", {})
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_finds_related_fr(harness):
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Add rate limiting to pr_watcher",
+        description="Throttle GitHub polling to avoid hitting API limits",
+        priority="high",
+        concept="pr_watcher",
+        project="developer",
+    )
+    # A distractor FR that shares no keywords with the request.
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Refactor spec reader glob logic",
+        description="Cleanup path handling in the doc walker",
+        priority="low",
+        concept="specs",
+        project="developer",
+    )
+
+    result = await harness.call("compose_extension_briefing", {
+        "request": "add rate limiting to the pr_watcher",
+        "project": "developer",
+    })
+
+    assert result["request"] == "add rate limiting to the pr_watcher"
+    assert result["project"] == "developer"
+    ids = [f["id"] for f in result["related_frs"]]
+    assert any("rate" in f["title"].lower() for f in result["related_frs"])
+    assert len(ids) == 1  # the distractor scores 0 and is excluded
+    assert "repo_context" in result
+    assert result["research_corpus_context"]["available"] is False
+    assert result["gaps"]  # documents the researcher/librarian gap
+    assert result["detail"] == "brief"
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_compact_detail(harness):
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Add rate limiting to webhook installer",
+        description="Throttle webhook installs",
+        priority="medium",
+        concept="webhook",
+        project="developer",
+    )
+
+    result = await harness.call("compose_extension_briefing", {
+        "request": "add rate limiting to webhook installer",
+        "project": "developer",
+        "detail": "compact",
+    })
+
+    assert set(result.keys()) == {
+        "request", "project", "related_fr_ids", "related_spec_paths",
+        "related_milestone_ids", "gap_count", "detail",
+    }
+    assert len(result["related_fr_ids"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_no_matches_returns_empty_lists(harness):
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Completely unrelated topic",
+        description="Nothing to do with the ask",
+        priority="low",
+        concept="unrelated",
+        project="developer",
+    )
+
+    result = await harness.call("compose_extension_briefing", {
+        "request": "zzz qqq nonexistent keyword combination",
+        "project": "developer",
+    })
+
+    assert result["related_frs"] == []
+    assert result["related_specs"] == []
+    assert result["related_milestones"] == []
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_surfaces_completed_fr(harness):
+    """A shipped feature's completed FR must still surface (Codex review, PR #86).
+
+    include_all=False would strip terminal-status FRs before keyword
+    ranking, so a request extending already-shipped work would report
+    "nothing found" and lose the prior implementation context this skill
+    exists to preserve.
+    """
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Add rate limiting to webhook installer",
+        description="Throttle webhook installs to avoid API limits",
+        priority="high",
+        concept="webhook",
+        project="developer",
+    )
+    harness.agent.pipeline.frs.update_status(fr.id, "planned")
+    harness.agent.pipeline.frs.update_status(fr.id, "in_progress")
+    harness.agent.pipeline.frs.update_status(fr.id, "completed")
+
+    result = await harness.call("compose_extension_briefing", {
+        "request": "extend the rate limiting on webhook installer",
+        "project": "developer",
+    })
+
+    ids = [f["id"] for f in result["related_frs"]]
+    assert fr.id in ids
+    completed = next(f for f in result["related_frs"] if f["id"] == fr.id)
+    assert completed["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_cross_project_finds_specs_in_all_projects(
+    temp_config_file, tmp_path,
+):
+    """A cross-project briefing (project="") must search every configured project's specs_dir.
+
+    Restricting to only the first configured project (Codex review, PR
+    #86) silently drops specs that live under any other project.
+    """
+    second_repo = tmp_path / "second_repo"
+    (second_repo / "specs" / "widget").mkdir(parents=True)
+    (second_repo / "specs" / "widget" / "spec.md").write_text(
+        "# Widget rate limiting\n\n**FR:** `fr_second_00000000`\n"
+    )
+
+    config_path = temp_config_file({
+        "projects": {
+            "second": {"repo": str(second_repo), "specs_dir": "specs"},
+        },
+    })
+    harness2 = AgentTestHarness(DeveloperAgent, config_path=str(config_path))
+
+    result = await harness2.call("compose_extension_briefing", {
+        "request": "widget rate limiting",
+        # project omitted -> cross-project briefing
+    })
+
+    paths = [s["path"] for s in result["related_specs"]]
+    assert any("second_repo" in p for p in paths)
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_unknown_project_does_not_substitute_specs(harness):
+    """An unconfigured project slug must not silently pull another project's specs.
+
+    Codex review round 2 on PR #86: falling back to
+    ``list(configured_projects)[:1]`` mixed an unrelated repo's specs
+    into a response that still echoed the caller's (wrong) requested
+    project. Must return no specs and note the gap instead.
+    """
+    result = await harness.call("compose_extension_briefing", {
+        "request": "add rate limiting somewhere",
+        "project": "totally-unknown-project-slug",
+    })
+
+    assert result["related_specs"] == []
+    assert any("totally-unknown-project-slug" in g for g in result["gaps"])
+    # repo_context must not silently describe an unrelated (e.g. cwd)
+    # repo while echoing the caller's unconfigured project (Codex
+    # review round 3 on PR #86).
+    assert result["repo_context"]["available"] is False
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_cross_project_repo_context_not_arbitrary(
+    temp_config_file, tmp_path,
+):
+    """Cross-project repo_context must describe every configured project, not just the first.
+
+    Codex review round 3 on PR #86: anchoring repo_context on
+    ``spec_projects[0]`` makes the briefing internally inconsistent
+    when matched FRs/specs come from a different configured project.
+    """
+    second_repo = tmp_path / "second_repo"
+    (second_repo / "specs").mkdir(parents=True)
+    config_path = temp_config_file({
+        "projects": {
+            "second": {"repo": str(second_repo), "specs_dir": "specs"},
+        },
+    })
+    harness2 = AgentTestHarness(DeveloperAgent, config_path=str(config_path))
+
+    result = await harness2.call("compose_extension_briefing", {
+        "request": "anything",
+        # project omitted -> cross-project briefing across "developer" + "second"
+    })
+
+    assert result["repo_context"]["cross_project"] is True
+    assert set(result["repo_context"]["projects"].keys()) == {"developer", "second"}
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_matches_short_acronym_keywords(harness):
+    """Two-letter engineering acronyms must not be filtered out of keywords.
+
+    Codex review round 4 on PR #86: the old length>=3 cutoff dropped
+    'ci'/'pr'/'ui'/'db' entirely, so a request like "update PR UI"
+    matched nothing even when an FR title used the same acronym.
+    """
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Fix PR UI rendering glitch",
+        description="Cosmetic fix in the review UI",
+        priority="low",
+        concept="ui",
+        project="developer",
+    )
+
+    result = await harness.call("compose_extension_briefing", {
+        "request": "update PR UI",
+        "project": "developer",
+    })
+
+    assert len(result["related_frs"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_surfaces_unconfigured_fr_project_gap(harness):
+    """Cross-project briefings must flag FR-only projects with no configured specs_dir.
+
+    Codex review round 4 on PR #86: FRs for a project outside
+    config.projects still show up in related_frs (cross-project FR
+    lookup has no config dependency), but spec/repo_context silently
+    skip that project — the gap must say so instead of looking complete.
+    """
+    harness.agent.pipeline.frs.promote(
+        target="ghost",
+        title="Ghost project rate limiting",
+        description="An FR for a project with no config.projects entry",
+        priority="medium",
+        concept="ghost",
+        project="ghost-project",
+    )
+
+    result = await harness.call("compose_extension_briefing", {
+        "request": "ghost project rate limiting",
+        # project omitted -> cross-project briefing
+    })
+
+    assert any("ghost-project" in g for g in result["gaps"])
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_keyword_match_is_whole_token_not_substring(harness):
+    """Short keywords must not match as substrings inside unrelated words.
+
+    Codex review round 5 on PR #86: after lowering the keyword min
+    length to 2 for acronym support, a naive ``kw in text`` substring
+    check let "pr" match inside "improve" / "ui" match inside
+    "guideline" — polluting related_frs with unrelated results.
+    """
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Improve build guideline documentation",
+        description="Cleanup unrelated formatting fixes",
+        priority="low",
+        concept="docs",
+        project="developer",
+    )
+
+    result = await harness.call("compose_extension_briefing", {
+        "request": "update PR UI",
+        "project": "developer",
+    })
+
+    assert result["related_frs"] == []
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_repo_context_honors_requested_detail(harness):
+    """repo_context must reflect the caller's requested detail, not a hardcoded compact.
+
+    Codex review round 6 on PR #86: repo_context always called
+    view.to_dict(detail="compact") regardless of the skill's own
+    `detail` arg, so a brief/full request silently got compact
+    ecosystem data (missing domain/agents/health_summary).
+    """
+    result = await harness.call("compose_extension_briefing", {
+        "request": "anything",
+        "project": "developer",
+        "detail": "full",
+    })
+
+    # "domain" only appears in brief/full EcosystemView.to_dict output,
+    # not compact — its presence proves detail was threaded through.
+    assert "domain" in result["repo_context"]
