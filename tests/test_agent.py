@@ -3939,3 +3939,141 @@ async def test_sync_fr_status_on_merge_is_idempotent_on_already_completed_fr(har
     after = harness.agent.pipeline.frs.get(fr.id)
     assert after.status == "completed"
     assert len(after.notes_history) == history_len_before
+
+
+# -- dev-repo registry (fr_developer_5f3dc62e) --------------------------
+
+
+def test_dev_repos_skills_registered(harness):
+    harness.assert_skill_exists("dev_repos_register", description="Idempotent upsert")
+    harness.assert_skill_exists("dev_repos_list", description="List registered")
+    harness.assert_skill_exists("dev_repos_get", description="Fetch a single")
+    harness.assert_skill_exists("dev_repos_resolve_target", description="Resolve")
+    harness.assert_skill_exists("git_status_all", description="Aggregate")
+    harness.assert_skill_exists("audit_repo_hygiene_all", description="Run audit_repo_hygiene")
+
+
+@pytest.mark.asyncio
+async def test_dev_repos_register_and_get(harness, git_repo):
+    registered = await harness.call("dev_repos_register", {
+        "project": "developer",
+        "repo_path": str(git_repo),
+        "test_command": "pytest -q",
+        "owning_agents": "developer-primary,claude",
+    })
+    assert registered["repo"]["project"] == "developer"
+    assert registered["repo"]["repo_path"] == str(git_repo)
+    assert registered["repo"]["test_command"] == "pytest -q"
+    assert registered["repo"]["owning_agents"] == ["developer-primary", "claude"]
+
+    fetched = await harness.call("dev_repos_get", {"project": "developer"})
+    assert fetched["repo"]["repo_path"] == str(git_repo)
+
+
+@pytest.mark.asyncio
+async def test_dev_repos_register_requires_project_and_repo_path(harness):
+    missing_project = await harness.call("dev_repos_register", {"repo_path": "/x"})
+    assert "error" in missing_project
+
+    missing_path = await harness.call("dev_repos_register", {"project": "developer"})
+    assert "error" in missing_path
+
+
+@pytest.mark.asyncio
+async def test_dev_repos_register_is_idempotent_upsert(harness, git_repo):
+    first = await harness.call("dev_repos_register", {
+        "project": "developer", "repo_path": str(git_repo),
+    })
+    second = await harness.call("dev_repos_register", {
+        "project": "developer", "repo_path": str(git_repo), "default_branch": "trunk",
+    })
+    assert first["repo"]["repo_path"] == second["repo"]["repo_path"]
+    assert second["repo"]["default_branch"] == "trunk"
+
+    listing = await harness.call("dev_repos_list", {})
+    assert listing["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_dev_repos_get_unknown_returns_none(harness):
+    result = await harness.call("dev_repos_get", {"project": "nope"})
+    assert result["repo"] is None
+
+
+@pytest.mark.asyncio
+async def test_dev_repos_list_scope_filters(harness, git_repo):
+    await harness.call("dev_repos_register", {"project": "alpha", "repo_path": str(git_repo)})
+    await harness.call("dev_repos_register", {"project": "beta", "repo_path": str(git_repo)})
+
+    scoped = await harness.call("dev_repos_list", {"scope": "alpha"})
+    assert scoped["count"] == 1
+    assert scoped["repos"][0]["project"] == "alpha"
+
+    unscoped = await harness.call("dev_repos_list", {})
+    assert unscoped["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_dev_repos_resolve_target_unregistered(harness):
+    fr = harness.agent.pipeline.frs.promote(
+        target="some-other-app", title="Unrelated", description="d",
+    )
+    result = await harness.call("dev_repos_resolve_target", {"fr_id": fr.id})
+    assert result["resolved"] is False
+    assert result["reason"] == "target not registered in dev_repos"
+
+
+@pytest.mark.asyncio
+async def test_dev_repos_resolve_target_resolves(harness, git_repo):
+    await harness.call("dev_repos_register", {"project": "developer", "repo_path": str(git_repo)})
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Registered target", description="d",
+    )
+    result = await harness.call("dev_repos_resolve_target", {"fr_id": fr.id})
+    assert result["resolved"] is True
+    assert result["repo"]["repo_path"] == str(git_repo)
+
+
+@pytest.mark.asyncio
+async def test_dev_repos_resolve_target_unknown_fr(harness):
+    result = await harness.call("dev_repos_resolve_target", {"fr_id": "fr_developer_deadbeef"})
+    assert result["resolved"] is False
+    assert result["reason"] == "unknown fr id"
+
+
+@pytest.mark.asyncio
+async def test_git_status_all_aggregates_registered_repos(harness, git_repo):
+    await harness.call("dev_repos_register", {"project": "developer", "repo_path": str(git_repo)})
+
+    result = await harness.call("git_status_all", {})
+    assert result["count"] == 1
+    row = result["repos"][0]
+    assert row["project"] == "developer"
+    assert row["branch"] == "main"
+    assert row["is_dirty"] is False
+
+
+@pytest.mark.asyncio
+async def test_git_status_all_reports_error_for_broken_repo(harness, tmp_path):
+    broken = tmp_path / "not_a_repo"
+    broken.mkdir()
+    await harness.call("dev_repos_register", {"project": "broken", "repo_path": str(broken)})
+
+    result = await harness.call("git_status_all", {})
+    assert result["count"] == 1
+    assert "error" in result["repos"][0]
+
+
+@pytest.mark.asyncio
+async def test_audit_repo_hygiene_all_caches_disposition(harness, git_repo):
+    await harness.call("dev_repos_register", {"project": "developer", "repo_path": str(git_repo)})
+
+    result = await harness.call("audit_repo_hygiene_all", {})
+    assert result["count"] == 1
+    row = result["audits"][0]
+    assert row["project"] == "developer"
+    assert row["audit"]["schema"] == "repo-hygiene/v1"
+
+    fetched = await harness.call("dev_repos_get", {"project": "developer"})
+    assert fetched["repo"]["last_hygiene_audit_at"] > 0
+    assert fetched["repo"]["last_hygiene_disposition"]
