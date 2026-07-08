@@ -194,8 +194,102 @@ class DeveloperAgent(BaseAgent):
             store = PRWatcherStore(str(self.pipeline.config.db_path))
             self._pr_watcher_registry = PRWatcherRegistry(
                 store=store, publish=self.publish,
+                on_merged=self._sync_fr_status_on_merge,
             )
         return self._pr_watcher_registry
+
+    async def _sync_fr_status_on_merge(
+        self, repo: str, pr_number: int, title: str,
+    ) -> None:
+        """Auto-advance any FR named in a merged PR's title to 'completed'.
+
+        fr_developer_c7d5f22b: the FR store previously had no way to
+        learn a PR merged, so callers repeatedly picked up FRs that
+        were already-shipped ("open" in the store, merged on GitHub).
+        Fired by :class:`PRWatcherRegistry` exactly once per merge
+        (dedupe lives in the watcher). Best-effort — an illegal
+        transition (FR already terminal, unknown id, typo'd id) is
+        reported as a gap rather than raised, since this runs off the
+        background poll loop, not a caller-facing handler.
+
+        Uses 'completed', not 'merged' (Copilot review on PR #84):
+        FR_STATUS_MERGED is the FR-to-FR merge/redirect terminal state
+        — FRStore._record_capability maps it to an "abandoned"
+        capability and dependents never unblock (only 'completed'
+        does). A PR shipping means the work exists, so 'completed' is
+        the correct terminal state.
+        """
+        from developer.pr_watcher import extract_fr_ids
+        from developer.fr_store import FRError
+
+        notes = f"auto-synced: {repo}#{pr_number} merged"
+        for fr_id in extract_fr_ids(title):
+            try:
+                self._advance_fr_to_completed(fr_id, notes)
+            except FRError as e:
+                await self._safe_report_gap(
+                    "pr_watcher.on_merged", f"{fr_id} ({repo}#{pr_number}): {e}",
+                )
+
+    def _advance_fr_to_completed(self, fr_id: str, notes: str) -> None:
+        """Move ``fr_id`` to 'completed', hopping through 'in_progress'
+        first if needed.
+
+        'completed' is only reachable from 'in_progress' (see
+        ALLOWED_TRANSITIONS in fr_store.py) — an FR merged straight
+        from 'open'/'planned' (never explicitly marked in_progress)
+        needs the intermediate hop. Branches on the FR's current status
+        rather than catch-and-retry (Copilot review on PR #84): a
+        blanket ``except FRError`` around the first attempt would also
+        swallow "unknown fr id" / already-terminal errors and retry
+        with 'in_progress', reporting a confusing "archived ->
+        in_progress" failure for what's really an "archived ->
+        completed" refusal. Only open/planned get the hop; every other
+        status (in_progress, already-completed, or any terminal state)
+        attempts 'completed' directly, so a refusal names the real
+        target status.
+
+        ``follow_redirect=False`` deliberately (Codex review on PR #84):
+        a PR title can still name an FR id that was later merged into a
+        larger consolidated FR via ``merge_frs``. Following the
+        redirect here would let one source FR's completion mark the
+        WHOLE merged target as 'completed' — potentially unblocking
+        dependents even though the target's combined scope hasn't
+        actually shipped. A non-merged FR's record is identical either
+        way (``get`` only redirects when status is already
+        FR_STATUS_MERGED), so this changes nothing for the normal path.
+        """
+        from developer.fr_store import (
+            FR_STATUS_COMPLETED,
+            FR_STATUS_IN_PROGRESS,
+            FR_STATUS_MERGED,
+            FR_STATUS_OPEN,
+            FR_STATUS_PLANNED,
+            FRError,
+        )
+
+        fr = self.pipeline.frs.get(fr_id, follow_redirect=False)
+        if fr is None:
+            raise FRError(f"unknown fr id: {fr_id}")
+        if fr.status == FR_STATUS_MERGED:
+            raise FRError(
+                f"{fr_id} was merged into {fr.merged_into!r} — refusing to "
+                "complete the merge target on behalf of one redirected "
+                "source FR"
+            )
+        if fr.status == FR_STATUS_COMPLETED:
+            # Codex review on PR #84: a crash-retry (the watcher died
+            # after this call completed the FR but before
+            # pr_watcher_merge_sync.synced_at got marked) would
+            # otherwise reach update_status(COMPLETED) again.
+            # FRStore.update_status appends a notes_history entry even
+            # for a same-status call, so an unconditional retry would
+            # spam a duplicate audit line every time the crash-retry
+            # fires. Already done — nothing left to do.
+            return
+        if fr.status in (FR_STATUS_OPEN, FR_STATUS_PLANNED):
+            self.pipeline.frs.update_status(fr_id, FR_STATUS_IN_PROGRESS, notes=notes)
+        self.pipeline.frs.update_status(fr_id, FR_STATUS_COMPLETED, notes=notes)
 
     async def start(self):
         """Rehydrate persisted PR watchers, then run the normal agent loop.

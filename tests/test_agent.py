@@ -3782,3 +3782,160 @@ def test_main_install_dispatches_through_subclass(monkeypatch):
     assert installed.module_name == "developer.agent"
     assert installed.agent_type == "developer"
     assert installed.agent_id == "developer-test"
+
+
+# -- FR-status auto-sync on PR merge (fr_developer_c7d5f22b) --
+
+@pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_advances_matching_fr(harness):
+    """'completed', not 'merged' — Copilot review on PR #84: FR_STATUS_MERGED
+    is the FR-to-FR merge/redirect terminal state (capability tracking
+    treats it as 'abandoned'); a shipped PR means the work exists, i.e.
+    'completed'. FR starts 'open' (never explicitly marked in_progress),
+    exercising the in_progress hop in _advance_fr_to_completed.
+    """
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Auto-synced FR", description="d",
+    )
+    assert fr.status == "open"
+
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 82,
+        f"fix(config): register reviewer ({fr.id})",
+    )
+
+    updated = harness.agent.pipeline.frs.get(fr.id)
+    assert updated.status == "completed"
+    assert any(
+        "tolldog/khonliang-developer#82" in n.get("notes", "")
+        for n in updated.notes_history
+    )
+
+
+@pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_completes_in_progress_fr_without_hop(harness):
+    """An FR already 'in_progress' completes directly — no redundant
+    intermediate transition recorded.
+    """
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Already in progress", description="d",
+    )
+    harness.agent.pipeline.frs.update_status(fr.id, "in_progress")
+
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 82, f"fix: ship it ({fr.id})",
+    )
+
+    updated = harness.agent.pipeline.frs.get(fr.id)
+    assert updated.status == "completed"
+    # promote (open) + in_progress + completed = 3 entries; no redundant hop.
+    assert [n["status"] for n in updated.notes_history] == [
+        "open", "in_progress", "completed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_ignores_title_without_fr_id(harness):
+    """No fr_<target>_<hex> in the title — no-op, no crash."""
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 99, "chore: bump deps",
+    )
+
+
+@pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_reports_gap_on_illegal_transition(harness):
+    """A terminal FR (already merged/archived) named in a second PR's
+    title must not raise out of the background poll loop — the illegal
+    transition is reported as a gap instead.
+    """
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Already terminal", description="d",
+    )
+    harness.agent.pipeline.frs.update_status(fr.id, "archived")
+
+    gaps: list[str] = []
+
+    async def fake_report_gap(operation, reason):
+        gaps.append(reason)
+
+    harness.agent._safe_report_gap = fake_report_gap
+
+    # Must not raise even though archived->completed is illegal.
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 100, f"fix: whatever ({fr.id})",
+    )
+
+    unchanged = harness.agent.pipeline.frs.get(fr.id)
+    assert unchanged.status == "archived"
+    # Copilot review on PR #84: the gap message must name the real
+    # target status ("-> completed"), not an artifact of a blanket
+    # catch-and-retry-via-in_progress implementation.
+    assert len(gaps) == 1
+    assert "archived" in gaps[0] and "completed" in gaps[0]
+    assert "in_progress" not in gaps[0]
+
+
+@pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_refuses_completing_a_merge_target(harness):
+    """Codex review on PR #84: a PR title can name an FR id that was
+    later merged/redirected into a larger consolidated FR. Following
+    the redirect would let one source FR's merge complete the WHOLE
+    target FR, potentially unblocking dependents before the target's
+    combined scope actually shipped. Must refuse and report a gap
+    instead, leaving the target's status untouched.
+    """
+    source = harness.agent.pipeline.frs.promote(
+        target="developer", title="Source FR", description="d",
+    )
+    other_source = harness.agent.pipeline.frs.promote(
+        target="developer", title="Other source FR", description="d",
+    )
+    merged = harness.agent.pipeline.frs.merge(
+        source_ids=[source.id, other_source.id],
+        title="Consolidated FR", description="d",
+    )
+
+    gaps: list[str] = []
+
+    async def fake_report_gap(operation, reason):
+        gaps.append(reason)
+
+    harness.agent._safe_report_gap = fake_report_gap
+
+    # A PR title naming the OLD (now-redirected) source FR id.
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 101, f"fix: old scope ({source.id})",
+    )
+
+    unchanged = harness.agent.pipeline.frs.get(merged.id)
+    assert unchanged.status == "open"
+    assert len(gaps) == 1
+    assert source.id in gaps[0]
+    assert merged.id in gaps[0]
+
+
+@pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_is_idempotent_on_already_completed_fr(harness):
+    """Codex review on PR #84: a crash-retry (the watcher died after
+    _sync_fr_status_on_merge completed the FR but before
+    pr_watcher_merge_sync.synced_at was marked) reaches this method
+    again with the FR already 'completed'. update_status appends a
+    notes_history entry even for a same-status call, so an
+    unconditional retry would spam a duplicate audit line on every
+    crash-retry. Must be a no-op once already completed.
+    """
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Already completed", description="d",
+    )
+    harness.agent.pipeline.frs.update_status(fr.id, "in_progress")
+    harness.agent.pipeline.frs.update_status(fr.id, "completed")
+    before = harness.agent.pipeline.frs.get(fr.id)
+    history_len_before = len(before.notes_history)
+
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 102, f"fix: retry ({fr.id})",
+    )
+
+    after = harness.agent.pipeline.frs.get(fr.id)
+    assert after.status == "completed"
+    assert len(after.notes_history) == history_len_before

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import sqlite3
 import time
 import uuid
@@ -280,6 +281,46 @@ CREATE TABLE IF NOT EXISTS pr_watcher_dedupe (
     emitted_at REAL NOT NULL,
     PRIMARY KEY (watcher_id, repo, pr_number, transition_kind, dedupe_id)
 );
+
+-- fr_developer_c7d5f22b, crash-safety pass: the previous-cycle open
+-- set and the disappeared-but-not-yet-terminally-fetched set both
+-- have to survive a process restart, or a watcher that comes back up
+-- mid-tracking silently forgets a PR merged while it was down. Both
+-- tables are written together in one transaction
+-- (replace_open_set_and_add_pending) so a crash between the two
+-- writes can't happen.
+CREATE TABLE IF NOT EXISTS pr_watcher_open_set (
+    watcher_id TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    PRIMARY KEY (watcher_id, repo, pr_number)
+);
+
+CREATE TABLE IF NOT EXISTS pr_watcher_pending_terminal (
+    watcher_id TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    PRIMARY KEY (watcher_id, repo, pr_number)
+);
+
+-- Durable marker for "has the FR-completion side effect (on_merged)
+-- actually succeeded for this merged PR" — independent of
+-- pr_watcher_dedupe, which persists BEFORE publishing (by design, so
+-- a publish failure doesn't cause a duplicate bus event). Gating a
+-- state-mutating side effect on that same dedupe row would mean a
+-- crash between the dedupe commit and on_merged completing
+-- permanently loses the FR completion. synced_at IS NULL means
+-- pending (never succeeded, or a prior attempt crashed/raised); a
+-- non-NULL timestamp means done, don't retry. Applies to both watch
+-- modes — explicit pr_numbers PRs get re-fetched indefinitely too.
+CREATE TABLE IF NOT EXISTS pr_watcher_merge_sync (
+    watcher_id TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    synced_at REAL,
+    PRIMARY KEY (watcher_id, repo, pr_number)
+);
 """
 
 
@@ -346,20 +387,20 @@ class PRWatcherStore:
             )
 
     def remove_watcher(self, watcher_id: str) -> None:
-        """Remove a watcher + all its dedupe entries.
+        """Remove a watcher + all its dedupe/tracking entries.
 
-        Called on ``stop_pr_watcher``. Keeps the table from growing
+        Called on ``stop_pr_watcher``. Keeps the tables from growing
         unboundedly when callers cycle watchers.
         """
         with closing(self._conn()) as conn, conn:
-            conn.execute(
-                "DELETE FROM pr_watcher_registry WHERE watcher_id = ?",
-                (watcher_id,),
-            )
-            conn.execute(
-                "DELETE FROM pr_watcher_dedupe WHERE watcher_id = ?",
-                (watcher_id,),
-            )
+            for table in (
+                "pr_watcher_registry",
+                "pr_watcher_dedupe",
+                "pr_watcher_open_set",
+                "pr_watcher_pending_terminal",
+                "pr_watcher_merge_sync",
+            ):
+                conn.execute(f"DELETE FROM {table} WHERE watcher_id = ?", (watcher_id,))
 
     def list_watchers(self) -> list[dict]:
         with closing(self._conn()) as conn, conn:
@@ -433,6 +474,113 @@ class PRWatcherStore:
             )
             return cur.rowcount > 0
 
+    # -- open-set / pending-terminal (all-open mode PR retention,
+    # fr_developer_c7d5f22b crash-safety pass) --
+
+    def load_open_sets(self, watcher_id: str) -> dict[str, set[int]]:
+        """All-repo open-PR-number sets as of the last completed cycle."""
+        with closing(self._conn()) as conn, conn:
+            rows = conn.execute(
+                "SELECT repo, pr_number FROM pr_watcher_open_set WHERE watcher_id = ?",
+                (watcher_id,),
+            ).fetchall()
+        result: dict[str, set[int]] = {}
+        for r in rows:
+            result.setdefault(r["repo"], set()).add(int(r["pr_number"]))
+        return result
+
+    def load_pending_terminal(self, watcher_id: str) -> dict[str, set[int]]:
+        """PRs still owed a terminal fetch, per repo."""
+        with closing(self._conn()) as conn, conn:
+            rows = conn.execute(
+                "SELECT repo, pr_number FROM pr_watcher_pending_terminal WHERE watcher_id = ?",
+                (watcher_id,),
+            ).fetchall()
+        result: dict[str, set[int]] = {}
+        for r in rows:
+            result.setdefault(r["repo"], set()).add(int(r["pr_number"]))
+        return result
+
+    def replace_open_set_and_add_pending(
+        self,
+        watcher_id: str,
+        repo: str,
+        open_numbers: set[int],
+        newly_pending: set[int],
+    ) -> None:
+        """Atomically replace the tracked open set and add newly-
+        disappeared PRs to the pending-terminal set.
+
+        Combined into one transaction so a crash between the two
+        writes can't happen — the new open-set snapshot and the
+        disappearance it implies must land together or not at all,
+        else a restart could load an open set that already excludes a
+        PR whose disappearance was never recorded as pending, silently
+        losing it.
+        """
+        with closing(self._conn()) as conn, conn:
+            conn.execute(
+                "DELETE FROM pr_watcher_open_set WHERE watcher_id = ? AND repo = ?",
+                (watcher_id, repo),
+            )
+            conn.executemany(
+                "INSERT INTO pr_watcher_open_set (watcher_id, repo, pr_number) "
+                "VALUES (?, ?, ?)",
+                [(watcher_id, repo, int(n)) for n in open_numbers],
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO pr_watcher_pending_terminal "
+                "(watcher_id, repo, pr_number) VALUES (?, ?, ?)",
+                [(watcher_id, repo, int(n)) for n in newly_pending],
+            )
+
+    def clear_pending_terminal(self, watcher_id: str, repo: str, pr_number: int) -> None:
+        with closing(self._conn()) as conn, conn:
+            conn.execute(
+                "DELETE FROM pr_watcher_pending_terminal "
+                "WHERE watcher_id = ? AND repo = ? AND pr_number = ?",
+                (watcher_id, repo, int(pr_number)),
+            )
+
+    # -- merge-sync (on_merged durability, both watch modes,
+    # fr_developer_c7d5f22b crash-safety pass) --
+
+    def record_merge_observed(
+        self, watcher_id: str, repo: str, pr_number: int, title: str,
+    ) -> None:
+        """Durable record that this PR was seen merged, written BEFORE
+        attempting the on_merged side effect. ``INSERT OR IGNORE`` —
+        idempotent across repeated observations of the same still-
+        merged PR; if it already succeeded (``synced_at`` set), a
+        re-observation must never reset it back to pending.
+        """
+        with closing(self._conn()) as conn, conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO pr_watcher_merge_sync
+                    (watcher_id, repo, pr_number, title, synced_at)
+                VALUES (?, ?, ?, ?, NULL)
+                """,
+                (watcher_id, repo, int(pr_number), title),
+            )
+
+    def is_merge_synced(self, watcher_id: str, repo: str, pr_number: int) -> bool:
+        with closing(self._conn()) as conn, conn:
+            row = conn.execute(
+                "SELECT synced_at FROM pr_watcher_merge_sync "
+                "WHERE watcher_id = ? AND repo = ? AND pr_number = ?",
+                (watcher_id, repo, int(pr_number)),
+            ).fetchone()
+        return row is not None and row["synced_at"] is not None
+
+    def mark_merge_synced(self, watcher_id: str, repo: str, pr_number: int, at: float) -> None:
+        with closing(self._conn()) as conn, conn:
+            conn.execute(
+                "UPDATE pr_watcher_merge_sync SET synced_at = ? "
+                "WHERE watcher_id = ? AND repo = ? AND pr_number = ?",
+                (float(at), watcher_id, repo, int(pr_number)),
+            )
+
 
 def _split_csv(value: str) -> list[str]:
     if not value:
@@ -485,6 +633,7 @@ class PRSnapshot:
     repo: str
     pr_number: int
     head_sha: str
+    title: str = ""
     state: str = "open"           # open | closed
     merged: bool = False
     merged_at: str = ""
@@ -549,6 +698,14 @@ class PRSnapshot:
 # without monkey-patching the module-level async calls.
 FetchSnapshotFn = Callable[[str, int], Awaitable[PRSnapshot]]
 ListOpenPRsFn = Callable[[str], Awaitable[list[int]]]
+# Called from poll_once for every fetch whose snapshot reports
+# merged=True, gated on the durable pr_watcher_merge_sync marker (NOT
+# on the TOPIC_MERGED bus-dedupe) so a crash between "observed merged"
+# and this hook completing always retries on the next successful
+# fetch, in either watch mode — see poll_once for the full reasoning.
+# (repo, pr_number, title) -> None. Optional — None disables FR-status
+# auto-sync entirely (fr_developer_c7d5f22b).
+OnMergedFn = Callable[[str, int, str], Awaitable[None]]
 
 
 @dataclass
@@ -587,6 +744,7 @@ class PRFleetWatcher:
         fetch_snapshot: FetchSnapshotFn,
         list_open_prs: ListOpenPRsFn,
         now_fn: Callable[[], float] = time.time,
+        on_merged: Optional[OnMergedFn] = None,
     ):
         self.config = config
         self.store = store
@@ -594,6 +752,7 @@ class PRFleetWatcher:
         self._fetch_snapshot = fetch_snapshot
         self._list_open_prs = list_open_prs
         self._now = now_fn
+        self._on_merged = on_merged
         self._pr_count: int = 0
         # Explicit-mode pairs dropped after a 404 (deleted / never-existed
         # PR). In-memory only: a restart re-discovers each dead pair at
@@ -639,6 +798,42 @@ class PRFleetWatcher:
         # ``fr_developer_fafb36f1``. Pruned together with the seen-id
         # caches so closed/merged PRs don't linger in memory.
         self._latest_snapshots: dict[tuple[str, int], PRSnapshot] = {}
+        # "Watch all open PRs" mode only: the open PR numbers observed
+        # on the PREVIOUS cycle, per repo. Used by ``_resolve_pr_set``
+        # to detect PRs that just left the open set (merged or closed)
+        # — without this, a PR that merges between polls vanishes from
+        # ``list_open_prs`` before its merge is ever observed, so
+        # ``pr.merged`` (and this PR's FR auto-sync hook) never fires
+        # for the "watch everything open" default mode (Codex review on
+        # PR #84).
+        # Loaded from the store, not initialized empty: Codex found that
+        # an in-memory-only ``_recently_open`` loses a PR's disappearance
+        # entirely across a process restart — the agent comes back up,
+        # re-enumerates, and a PR that merged while it was down was
+        # never "recently open" in the fresh process's memory, so it's
+        # never detected as having disappeared at all.
+        self._recently_open: dict[str, set[int]] = store.load_open_sets(config.watcher_id)
+        # PRs that left the open set and are owed a terminal fetch,
+        # per repo. Entries persist across cycles AND restarts (loaded
+        # from the store below) — added the moment a PR disappears,
+        # removed only once a fetch for that pair actually SUCCEEDS
+        # (see the fetch loop in ``poll_once``), not merely attempted.
+        # An earlier design dropped a disappeared PR after exactly one
+        # poll regardless of outcome; Codex found three separate ways
+        # that lost the retry (an enumeration-phase abort on a later
+        # repo, a fetch-phase failure on the very pair being retried,
+        # and a process restart losing all in-memory tracking) —
+        # "retry until it actually lands, and remember across restarts"
+        # removes the whole class rather than patching each new failure
+        # point. ``_pair_backoff`` (shared with explicit ``pr_numbers``
+        # mode) bounds a persistently-404ing entry so this can't hammer
+        # a truly-deleted PR forever; ``_pair_backoff`` itself stays
+        # in-memory-only (see its own comment) since a lost backoff
+        # window after a restart just costs one extra 404, not a
+        # permanently-missed transition.
+        self._pending_terminal: dict[str, set[int]] = store.load_pending_terminal(
+            config.watcher_id,
+        )
         # Per-cycle transition buffer for :data:`TOPIC_FLEET_DIGEST`.
         # Reset at the top of each :meth:`poll_once`. Keys are the same
         # ``(repo, pr_number)`` tuples as the caches above; values are
@@ -688,6 +883,20 @@ class PRFleetWatcher:
                         continue
                     pairs.append((repo, pr_number))
             return pairs
+        # Deferred: only committed (in memory AND to the store, together)
+        # if the loop runs to completion without a rate-limit abort. A
+        # rate limit on a LATER repo discards this whole cycle's pairs
+        # (poll_once's _cycle_aborted check) — if an EARLIER repo's
+        # disappearance had already been committed before the abort,
+        # both in-memory tracking and the persisted row would say
+        # "already looked at" for a fetch that never actually happened
+        # this cycle, permanently losing it. Computed against the
+        # CURRENT (not-yet-updated) ``_recently_open``/``_pending_terminal``
+        # so this cycle's ``pairs`` still include every already-pending
+        # entry from prior cycles regardless of how this cycle ends.
+        pending_open_sets: dict[str, set[int]] = {}
+        pending_new_disappeared: dict[str, set[int]] = {}
+        now = self._now()
         for repo in self.config.repos:
             try:
                 open_numbers = await self._list_open_prs(repo)
@@ -720,8 +929,32 @@ class PRFleetWatcher:
             except Exception as e:
                 await self._emit_poll_error(repo, pr_number=0, reason=str(e))
                 continue
+            open_set = set(open_numbers)
             for n in open_numbers:
                 pairs.append((repo, n))
+            # PRs open last cycle but not this one: merged or closed in
+            # between. Owed a terminal fetch. Include every already-
+            # pending entry (from prior cycles) plus this cycle's fresh
+            # disappearances, respecting the same backoff explicit
+            # ``pr_numbers`` mode uses so a truly-deleted PR can't be
+            # hammered forever.
+            disappeared = self._recently_open.get(repo, set()) - open_set
+            combined_pending = self._pending_terminal.get(repo, set()) | disappeared
+            for n in combined_pending:
+                backoff = self._pair_backoff.get((repo, n))
+                if backoff is not None and now < backoff[1]:
+                    continue
+                pairs.append((repo, n))
+            pending_open_sets[repo] = open_set
+            pending_new_disappeared[repo] = disappeared
+        if not self._cycle_aborted:
+            for repo, open_set in pending_open_sets.items():
+                disappeared = pending_new_disappeared[repo]
+                self._recently_open[repo] = open_set
+                self._pending_terminal.setdefault(repo, set()).update(disappeared)
+                self.store.replace_open_set_and_add_pending(
+                    self.config.watcher_id, repo, open_set, disappeared,
+                )
         return pairs
 
     async def poll_once(self) -> int:
@@ -753,7 +986,9 @@ class PRFleetWatcher:
         # off pair is still WATCHED (its cached snapshot must survive in
         # pr_fleet_status and pr_count must not dip), it just isn't
         # FETCHED this cycle. In all-open mode the resolved list is the
-        # set: closed/merged PRs drop out and their caches with them.
+        # set, PLUS every still-pending-terminal PR even if backed off
+        # this cycle — same reasoning: a pending PR waiting out a
+        # backoff window is still watched, just not fetched yet.
         if self.config.pr_numbers:
             active_keys = {
                 (repo, pr_number)
@@ -762,6 +997,11 @@ class PRFleetWatcher:
             }
         else:
             active_keys = {(repo, pr_number) for repo, pr_number in pairs}
+            active_keys |= {
+                (repo, n)
+                for repo, ns in self._pending_terminal.items()
+                for n in ns
+            }
         self._pr_count = len(active_keys)
         # Prune in-memory seen caches for PRs that have dropped out of
         # the watched set (closed / merged PRs in "watch all open PRs"
@@ -785,16 +1025,18 @@ class PRFleetWatcher:
                 # swallow cooperative shutdown mid-poll.
                 raise
             except GithubNotFoundError as e:
-                if self.config.pr_numbers:
-                    # Explicit watch set: back the pair off (deleted PRs
-                    # 404 forever, but so do valid PRs during a
-                    # visibility incident — backoff serves both without
-                    # ever discarding a watch).
+                if self.config.pr_numbers or pr_number in self._pending_terminal.get(repo, ()):
+                    # Explicit watch set, OR an all-open-mode PR we're
+                    # retrying a terminal fetch for (fr_developer_c7d5f22b):
+                    # back the pair off. Deleted PRs 404 forever; a
+                    # visibility incident 404s transiently — backoff
+                    # serves both without ever discarding a watch, and
+                    # without hammering a truly-gone PR on every cycle.
                     await self._back_off_pair(repo, pr_number, reason=str(e))
                 else:
-                    # All-open mode: a 404 here is a PR that closed
-                    # between the list call and the fetch — transient,
-                    # next resolve simply won't include it.
+                    # All-open mode, currently-open PR: a 404 here is one
+                    # that closed between the list call and the fetch —
+                    # transient, next resolve simply won't include it.
                     await self._emit_poll_error(repo, pr_number, reason=str(e))
                 continue
             except GithubRateLimitError as e:
@@ -840,6 +1082,53 @@ class PRFleetWatcher:
             # current PR state through the snapshot skill.
             self._latest_snapshots[(snapshot.repo, snapshot.pr_number)] = snapshot
             emitted += await self._emit_transitions(snapshot)
+            # fr_developer_c7d5f22b: FR auto-sync, decoupled from the
+            # pr.merged bus-dedupe above on purpose (see the comment in
+            # _emit_transitions). record_merge_observed writes BEFORE
+            # attempting on_merged so a crash mid-call, or a raise from
+            # on_merged itself, leaves a durable "still pending" row.
+            # Applies to BOTH watch modes: explicit pr_numbers keeps
+            # re-fetching a merged PR indefinitely too, so it needs the
+            # same already-synced check to avoid reprocessing it forever.
+            merge_sync_pending = False
+            if snapshot.merged and self._on_merged is not None:
+                watcher_id = self.config.watcher_id
+                if not self.store.is_merge_synced(watcher_id, repo, pr_number):
+                    self.store.record_merge_observed(
+                        watcher_id, repo, pr_number, snapshot.title,
+                    )
+                    try:
+                        await self._on_merged(repo, pr_number, snapshot.title)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.warning(
+                            "on_merged hook failed for %s#%d",
+                            repo, pr_number, exc_info=True,
+                        )
+                        merge_sync_pending = True
+                    else:
+                        self.store.mark_merge_synced(
+                            watcher_id, repo, pr_number, self._now(),
+                        )
+            # Only NOW clear the pending-terminal retry marker — after
+            # on_merged has had its chance and either succeeded or
+            # wasn't needed (Codex review, second round on this exact
+            # mechanism: clearing it BEFORE this point orphans the
+            # retry entirely for all-open mode. Once cleared, the PR is
+            # neither in the open set nor pending, so nothing ever
+            # triggers another fetch of it — even though the durable
+            # merge_sync row still says "pending," nothing acts on it
+            # again). If on_merged failed, leave the PR pending so the
+            # next cycle's _resolve_pr_set includes it again, re-fetches
+            # it, and retries on_merged too. A crash mid on_merged call
+            # never reaches this line at all, which is the safe default:
+            # the persisted pending_terminal row survives untouched.
+            if not merge_sync_pending and pr_number in self._pending_terminal.get(repo, ()):
+                self._pending_terminal[repo].discard(pr_number)
+                self.store.clear_pending_terminal(
+                    self.config.watcher_id, repo, pr_number,
+                )
         self.store.touch_last_poll(self.config.watcher_id, self._now())
         # Emit the aggregate digest only when at least one transition
         # fired this cycle. Silent windows cost zero digest events —
@@ -1039,22 +1328,44 @@ class PRFleetWatcher:
                 })
             seen_inline.add(id_str)
 
-        # 3. Merged. dedupe_id = merged_at timestamp (stable once set).
-        if snapshot.merged and snapshot.merged_at:
+        # 3. Merged. dedupe_id is the stable literal "merged", NOT
+        # merged_at (Copilot + Codex, second review round on PR #84):
+        # keying dedupe on merged_at let the transition fire twice if a
+        # poll ever observed merged=True before merged_at was
+        # populated — the first poll would dedupe on the earlier
+        # fallback literal, a later poll on the real timestamp, and the
+        # mismatch would re-trigger on_merged and double-apply its
+        # FR-status mutation. A PR can only merge once, so a single
+        # fixed key is correct regardless of what merged_at looks like;
+        # merged_at is still carried in the payload, informationally.
+        if snapshot.merged:
             if await self._emit(
                 TOPIC_MERGED,
                 repo=snapshot.repo,
                 pr_number=snapshot.pr_number,
                 transition_kind="merged",
-                dedupe_id=snapshot.merged_at,
+                dedupe_id="merged",
                 payload={
                     "repo": snapshot.repo,
                     "pr_number": snapshot.pr_number,
                     "merged_at": snapshot.merged_at,
+                    "title": snapshot.title,
                 },
             ):
                 emitted += 1
                 _record_digest({"kind": "merged"})
+            # fr_developer_c7d5f22b: the FR auto-sync side effect
+            # (self._on_merged) is deliberately NOT fired here — see
+            # poll_once, which gates it on the separate, durable
+            # pr_watcher_merge_sync marker rather than this method's
+            # bus-dedupe return value. _emit() persists its dedupe row
+            # BEFORE publishing (so a publish failure can't cause a
+            # duplicate bus event); gating a state-mutating side effect
+            # on that same row would mean a crash between the dedupe
+            # commit and on_merged completing permanently loses the FR
+            # completion, since the dedupe row already says "done" and
+            # this branch would never run again for this PR.
+            #
             # A merged PR is also terminal; don't emit merge_ready after
             # the fact and don't emit closed_without_merge.
             return emitted
@@ -1273,9 +1584,11 @@ class PRWatcherRegistry:
         store: PRWatcherStore,
         publish: PublishFn,
         factory: Optional[Callable[[PRWatcherConfig], PRFleetWatcher]] = None,
+        on_merged: Optional[OnMergedFn] = None,
     ):
         self.store = store
         self._publish = publish
+        self._on_merged = on_merged
         self._factory = factory or self._default_factory
         self._watchers: dict[str, _LiveWatcher] = {}
         # Guard against concurrent start/stop calls mutating the dict
@@ -1549,6 +1862,7 @@ class PRWatcherRegistry:
             publish=self._publish,
             fetch_snapshot=fetch_snapshot,
             list_open_prs=list_open_prs,
+            on_merged=self._on_merged,
         )
 
 
@@ -1646,6 +1960,7 @@ async def _snapshot_from_github(
         repo=repo,
         pr_number=pr_number,
         head_sha=str(pr.get("head_sha") or ""),
+        title=str(pr.get("title") or ""),
         state=str(pr.get("state") or "open"),
         merged=merged,
         merged_at=merged_at,
@@ -1739,6 +2054,32 @@ def parse_repos_arg(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(v).strip() for v in value if str(v).strip()]
     return [v.strip() for v in str(value).split(",") if v.strip()]
+
+
+# fr_developer_c7d5f22b: matches FR ids like fr_developer_b297ef26 or
+# fr_khonliang-bus-lib_70c50040 — `fr_<target>_<8hex>`, target being
+# whatever slug the FR store was promoted under. slug_target() in
+# project_store.py only strips leading/trailing "-", not "_", so a
+# target like "_foo" slugs to "_foo" and produces fr__foo_<hash> — the
+# leading char class here includes "_" too (Codex review on PR #84) so
+# that shape still matches.
+_FR_ID_RE = re.compile(r"\bfr_[a-z0-9_][a-z0-9_-]*_[0-9a-f]{8}\b")
+
+
+def extract_fr_ids(text: str) -> list[str]:
+    """Pull ``fr_<target>_<8hex>`` ids out of free text, de-duplicated,
+    first-occurrence order preserved.
+
+    Used to auto-sync FR status from merged-PR titles
+    (fr_developer_c7d5f22b). Title-only for this first cut — PR bodies
+    and commit messages (where "Closes fr_x" more commonly lives) are a
+    known gap; extend here if dogfooding shows title-only misses too
+    much real traffic.
+    """
+    seen: dict[str, None] = {}
+    for match in _FR_ID_RE.finditer(text.lower()):
+        seen.setdefault(match.group(0), None)
+    return list(seen)
 
 
 def parse_pr_numbers_arg(value: Any) -> list[int]:
