@@ -45,6 +45,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from khonliang.knowledge.store import (
@@ -240,6 +241,14 @@ class DevRepoStore:
         repo_path = str(repo_path or "").strip()
         if not repo_path:
             raise DevRepoError("repo_path is required")
+        # Normalize to an absolute path at registration time. Storing a
+        # relative path (".", "../repo") verbatim makes the record
+        # unstable — git_status_all / audit_repo_hygiene_all reopen the
+        # repo relative to whatever the agent's cwd happens to be at
+        # call time, so the same record can resolve to the wrong repo
+        # or fail entirely after a restart or cwd change. codex review
+        # on PR #87.
+        repo_path = str(Path(repo_path).expanduser().resolve())
 
         now = time.time()
         existing = self.get(project)
@@ -367,7 +376,12 @@ def resolve_fr_target(fr_store: Any, dev_repos: DevRepoStore, fr_id: str) -> dic
             "repo": None,
         }
 
-    target = getattr(fr, "target", "") or ""
+    # FRStore tolerates padded targets elsewhere (an FR created with
+    # target=" developer " behaves normally in other FR query paths),
+    # so strip here too — otherwise this resolver would report "not
+    # registered" for a padded target even when the stripped slug is
+    # registered. codex review on PR #87.
+    target = str(getattr(fr, "target", "") or "").strip()
     if not target:
         return {
             "fr_id": fr_id,

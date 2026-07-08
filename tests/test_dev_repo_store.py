@@ -77,6 +77,21 @@ class TestRegister:
         with pytest.raises(DevRepoError):
             store.register("developer", "")
 
+    def test_relative_repo_path_is_normalized_to_absolute(self, store, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        r = store.register("developer", "./sub/../sub")
+        assert r.repo_path == str((tmp_path / "sub").resolve())
+
+    def test_dot_repo_path_resolves_to_cwd(self, store, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        r = store.register("developer", ".")
+        assert r.repo_path == str(tmp_path.resolve())
+
+    def test_home_relative_repo_path_is_expanded(self, store, monkeypatch, tmp_path):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        r = store.register("developer", "~/checkout")
+        assert r.repo_path == str((tmp_path / "checkout").resolve())
+
     @pytest.mark.parametrize("project", ["", "UPPER", "has space", "slash/bad", "-leading"])
     def test_rejects_invalid_project(self, store, project):
         with pytest.raises(DevRepoError):
@@ -261,3 +276,15 @@ class TestResolveFrTarget:
         result = resolve_fr_target(frs, store, "fr_x_1")
         assert result["resolved"] is False
         assert result["reason"] == "target not registered in dev_repos"
+
+    def test_fr_padded_target_still_resolves(self, store):
+        # FRStore tolerates padded targets elsewhere in the codebase (an
+        # FR created with target=" developer " behaves normally in other
+        # FR query paths) — this resolver must strip before lookup too.
+        # codex review on PR #87.
+        store.register("developer", "/abs/developer")
+        frs = _FakeFRStore({"fr_x_1": _FakeFR(target=" developer ")})
+        result = resolve_fr_target(frs, store, "fr_x_1")
+        assert result["resolved"] is True
+        assert result["target"] == "developer"
+        assert result["repo"]["repo_path"] == "/abs/developer"
