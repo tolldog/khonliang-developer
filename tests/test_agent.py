@@ -4359,3 +4359,23 @@ async def test_compose_extension_briefing_keyword_match_is_whole_token_not_subst
     })
 
     assert result["related_frs"] == []
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_repo_context_honors_requested_detail(harness):
+    """repo_context must reflect the caller's requested detail, not a hardcoded compact.
+
+    Codex review round 6 on PR #86: repo_context always called
+    view.to_dict(detail="compact") regardless of the skill's own
+    `detail` arg, so a brief/full request silently got compact
+    ecosystem data (missing domain/agents/health_summary).
+    """
+    result = await harness.call("compose_extension_briefing", {
+        "request": "anything",
+        "project": "developer",
+        "detail": "full",
+    })
+
+    # "domain" only appears in brief/full EcosystemView.to_dict output,
+    # not compact — its presence proves detail was threaded through.
+    assert "domain" in result["repo_context"]

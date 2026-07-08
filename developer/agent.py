@@ -1795,7 +1795,11 @@ class DeveloperAgent(BaseAgent):
                 repo = getattr(proj_cfg, "repo", None)
                 start_dir = Path(repo) if repo else Path.cwd()
                 view = _project_ecosystem.build_view(start_dir, domain="generic")
-                repo_context = view.to_dict(detail="compact")
+                # Thread the caller's requested `detail` through, not a
+                # hardcoded "compact" — a brief/full request was
+                # silently getting compact ecosystem data regardless of
+                # what it asked for (Codex review round 6 on PR #86).
+                repo_context = view.to_dict(detail=detail)
             except Exception as e:
                 await self.report_gap("compose_extension_briefing", f"repo context failed: {e}")
                 repo_context = {"error": str(e)}
@@ -1810,7 +1814,7 @@ class DeveloperAgent(BaseAgent):
                     repo = getattr(proj_cfg, "repo", None)
                     start_dir = Path(repo) if repo else Path.cwd()
                     view = _project_ecosystem.build_view(start_dir, domain="generic")
-                    by_project[proj_key] = view.to_dict(detail="compact")
+                    by_project[proj_key] = view.to_dict(detail=detail)
                 except Exception as e:
                     await self.report_gap(
                         "compose_extension_briefing", f"repo context failed for {proj_key}: {e}",
