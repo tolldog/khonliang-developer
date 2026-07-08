@@ -4282,3 +4282,54 @@ async def test_compose_extension_briefing_cross_project_repo_context_not_arbitra
 
     assert result["repo_context"]["cross_project"] is True
     assert set(result["repo_context"]["projects"].keys()) == {"developer", "second"}
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_matches_short_acronym_keywords(harness):
+    """Two-letter engineering acronyms must not be filtered out of keywords.
+
+    Codex review round 4 on PR #86: the old length>=3 cutoff dropped
+    'ci'/'pr'/'ui'/'db' entirely, so a request like "update PR UI"
+    matched nothing even when an FR title used the same acronym.
+    """
+    harness.agent.pipeline.frs.promote(
+        target="developer",
+        title="Fix PR UI rendering glitch",
+        description="Cosmetic fix in the review UI",
+        priority="low",
+        concept="ui",
+        project="developer",
+    )
+
+    result = await harness.call("compose_extension_briefing", {
+        "request": "update PR UI",
+        "project": "developer",
+    })
+
+    assert len(result["related_frs"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_surfaces_unconfigured_fr_project_gap(harness):
+    """Cross-project briefings must flag FR-only projects with no configured specs_dir.
+
+    Codex review round 4 on PR #86: FRs for a project outside
+    config.projects still show up in related_frs (cross-project FR
+    lookup has no config dependency), but spec/repo_context silently
+    skip that project — the gap must say so instead of looking complete.
+    """
+    harness.agent.pipeline.frs.promote(
+        target="ghost",
+        title="Ghost project rate limiting",
+        description="An FR for a project with no config.projects entry",
+        priority="medium",
+        concept="ghost",
+        project="ghost-project",
+    )
+
+    result = await harness.call("compose_extension_briefing", {
+        "request": "ghost project rate limiting",
+        # project omitted -> cross-project briefing
+    })
+
+    assert any("ghost-project" in g for g in result["gaps"])

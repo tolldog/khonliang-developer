@@ -1725,6 +1725,28 @@ class DeveloperAgent(BaseAgent):
                 )
         else:
             spec_projects = list(configured_projects)
+            # A cross-project briefing fetched FRs/milestones for EVERY
+            # project in the store, including FR-only projects that
+            # never got a config.projects entry (no specs_dir/repo).
+            # Those still contribute to related_frs/related_milestones
+            # above but are invisible to spec/repo_context — surface
+            # that gap explicitly rather than letting the response look
+            # complete (Codex review round 4 on PR #86).
+            fr_and_milestone_projects = {
+                getattr(f, "project", None) for f in frs
+            } | {
+                getattr(m, "project", None) for m in milestones
+            }
+            unconfigured = sorted(
+                p for p in fr_and_milestone_projects
+                if p and p not in configured_projects
+            )
+            if unconfigured:
+                gaps.append(
+                    f"FRs/milestones exist for project(s) {unconfigured} "
+                    "with no configured specs_dir; spec/repo context "
+                    "skipped for them"
+                )
 
         specs: list = []
         for proj_key in spec_projects:
@@ -5280,18 +5302,28 @@ _BRIEFING_STOPWORDS = frozenset({
     "the", "a", "an", "to", "of", "for", "and", "or", "in", "on", "with",
     "is", "are", "be", "add", "make", "this", "that", "it", "as", "at",
     "by", "from", "into", "so", "we", "our", "please", "want", "need",
+    "if", "up", "no", "us", "my", "do", "go", "am", "me", "he", "it's",
 })
 
 
 def _extract_briefing_keywords(request: str) -> set[str]:
-    """Lowercase word tokens from a free-form request, minus stopwords/short words.
+    """Lowercase word tokens from a free-form request, minus stopwords.
 
-    Deliberately simple (no stemming, no embeddings) — this skill composes
-    developer-local data, it doesn't run relevance scoring; the FR scopes
-    real semantic matching out (see ``research_corpus_context`` gap).
+    Minimum length is 2, not 3 — short engineering acronyms (``CI``,
+    ``PR``, ``UI``, ``DB``) are exactly the kind of high-signal term a
+    request like "update PR UI" hinges on; dropping them made those
+    requests return empty related_* lists even when FR/spec/milestone
+    titles contained the same acronym (Codex review round 4 on PR #86).
+    The stopword list is widened correspondingly so common 2-letter
+    English words don't turn into false-positive noise.
+
+    Deliberately simple otherwise (no stemming, no embeddings) — this
+    skill composes developer-local data, it doesn't run relevance
+    scoring; the FR scopes real semantic matching out (see
+    ``research_corpus_context`` gap).
     """
     tokens = re.findall(r"[a-z0-9_]+", request.lower())
-    return {t for t in tokens if len(t) >= 3 and t not in _BRIEFING_STOPWORDS}
+    return {t for t in tokens if len(t) >= 2 and t not in _BRIEFING_STOPWORDS}
 
 
 def _rank_briefing_items(items, keywords: set[str], *, text_fn, to_dict, limit: int = 8):
