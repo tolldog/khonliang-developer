@@ -205,7 +205,22 @@ async def maybe_update_pr(
     # ``git_pr_commit_push``) but never pushed also count as "local work
     # not yet in the PR" — captured before the push below so it reflects
     # what was ahead walking in, not the (always zero) state after.
-    had_unpushed_commits = status.ahead > 0
+    #
+    # ``status.ahead`` is 0 whenever the branch has no configured
+    # tracking ref (e.g. a fresh worktree checked out with
+    # ``--no-track``, or upstream tracking that was never set up) even
+    # though there are genuinely unpushed local commits — silently
+    # skipping the review request for those commits (Codex R5 on PR
+    # #88). Ground-truth against the actual remote (``ls-remote``, not
+    # a local remote-tracking ref that may be stale or never fetched)
+    # instead: a missing remote branch means it's brand new (handled by
+    # ``created`` below), so treat that as "nothing to compare, not
+    # ahead" rather than guessing.
+    local_head = git.rev_parse("HEAD")
+    remote_head = git.remote_branch_sha(remote, branch)
+    had_unpushed_commits = status.ahead > 0 or (
+        remote_head is not None and local_head != remote_head
+    )
 
     # Push is idempotent — "Everything up-to-date" is a normal outcome,
     # not an error, when this call finds nothing new to send.

@@ -129,6 +129,16 @@ def no_op_push(monkeypatch):
         return ""
 
     monkeypatch.setattr(_GitCmd, "push", fake_push, raising=False)
+
+    # remote_branch_sha() does a real ls-remote round-trip against the
+    # actual remote — tests use a real (but unreachable in CI) origin
+    # url, so stub it too. Default: branch not found on the remote
+    # (the common "brand new / never pushed" case); tests exercising
+    # the ahead-detection path override this via monkeypatch directly.
+    def fake_ls_remote(self_git, *args, **kwargs):
+        return ""
+
+    monkeypatch.setattr(_GitCmd, "ls_remote", fake_ls_remote, raising=False)
     return calls
 
 
@@ -292,6 +302,46 @@ async def test_maybe_update_pr_requests_review_for_unpushed_prior_commit(
 
     from developer.git_client import GitClient
     assert GitClient(str(git_repo)).status().ahead == 1  # sanity-check the fixture
+
+    fake_gh = _FakeGithubClient(
+        existing_pr={"number": 55, "html_url": "https://github.com/o/n/pull/55"},
+    )
+
+    result = await maybe_update_pr(str(git_repo), "feat/x", github_client=fake_gh)
+
+    assert result["committed"] is False
+    assert result["review_requested"] is True
+
+
+@pytest.mark.asyncio
+async def test_maybe_update_pr_requests_review_for_unpushed_commit_without_tracking(
+    git_repo, no_op_push, monkeypatch,
+):
+    """Codex R5 on PR #88: status.ahead is 0 whenever the branch has no
+    configured tracking ref (e.g. a fresh worktree checked out with
+    ``--no-track``) even though there's a genuinely unpushed local
+    commit — the old ahead-only check silently skipped the review
+    request for it. No local tracking ref is set up at all here;
+    ground truth comes from ``remote_branch_sha`` (ls-remote), stubbed
+    to report the pre-commit sha as the remote's current tip.
+    """
+    from git.cmd import Git as _GitCmd
+
+    head_sha = _sub.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(git_repo), check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    def fake_ls_remote(self_git, *args, **kwargs):
+        return f"{head_sha}	refs/heads/feat/x"
+
+    monkeypatch.setattr(_GitCmd, "ls_remote", fake_ls_remote, raising=False)
+
+    _sub.run(["git", "commit", "--allow-empty", "-m", "pending"],
+              cwd=str(git_repo), check=True, stdout=_sub.DEVNULL, stderr=_sub.DEVNULL)
+
+    from developer.git_client import GitClient
+    assert GitClient(str(git_repo)).status().ahead == 0  # sanity: no tracking configured
 
     fake_gh = _FakeGithubClient(
         existing_pr={"number": 55, "html_url": "https://github.com/o/n/pull/55"},

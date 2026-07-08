@@ -268,6 +268,37 @@ def test_rev_parse_unknown_ref_raises_not_found(client):
         client.rev_parse("totally-not-a-ref")
 
 
+def test_remote_branch_sha_returns_sha(client, monkeypatch):
+    from git.cmd import Git as _GitCmd
+
+    def fake_ls_remote(self_git, *args, **kwargs):
+        return "abc123def456\trefs/heads/feat/x"
+
+    monkeypatch.setattr(_GitCmd, "ls_remote", fake_ls_remote, raising=False)
+    assert client.remote_branch_sha("origin", "feat/x") == "abc123def456"
+
+
+def test_remote_branch_sha_returns_none_when_branch_missing(client, monkeypatch):
+    from git.cmd import Git as _GitCmd
+
+    def fake_ls_remote(self_git, *args, **kwargs):
+        return ""
+
+    monkeypatch.setattr(_GitCmd, "ls_remote", fake_ls_remote, raising=False)
+    assert client.remote_branch_sha("origin", "never-pushed") is None
+
+
+def test_remote_branch_sha_raises_client_error_on_failure(client, monkeypatch):
+    from git.cmd import Git as _GitCmd
+
+    def fake_ls_remote(self_git, *args, **kwargs):
+        raise RuntimeError("could not resolve host")
+
+    monkeypatch.setattr(_GitCmd, "ls_remote", fake_ls_remote, raising=False)
+    with pytest.raises(GitClientError, match="ls-remote failed"):
+        client.remote_branch_sha("origin", "feat/x")
+
+
 def test_diff_working_tree_vs_head(client, repo_path):
     (repo_path / "a.txt").write_text("changed\n")
     diff = client.diff("HEAD")

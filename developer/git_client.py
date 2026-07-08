@@ -433,6 +433,30 @@ class GitClient:
         except Exception as e:
             raise GitNotFoundError(f"unknown ref: {ref}") from e
 
+    def remote_branch_sha(self, remote: str, branch: str) -> Optional[str]:
+        """Return the actual current tip sha of ``branch`` on ``remote``.
+
+        A real network round-trip (``git ls-remote``) rather than a
+        local remote-tracking ref lookup — the local ref is only as
+        fresh as the last fetch and may not even exist if the branch
+        was never fetched/tracked locally, which would otherwise make
+        "is there anything to push" unanswerable (Codex R5 on PR #88's
+        maybe_update_pr fix depends on this being authoritative, not
+        best-effort-local).
+
+        Returns ``None`` if the branch doesn't exist on the remote yet
+        (a brand-new branch never pushed before) rather than raising —
+        that's an expected, common state, not an error.
+        """
+        repo = self._get_repo()
+        try:
+            output = repo.git.ls_remote(remote, f"refs/heads/{branch}")
+        except Exception as e:
+            raise GitClientError(f"ls-remote failed: {e}") from e
+        if not output.strip():
+            return None
+        return output.split()[0]
+
     def diff(
         self, ref_a: str = "HEAD", ref_b: Optional[str] = None,
         *, paths: Optional[list[str]] = None,
