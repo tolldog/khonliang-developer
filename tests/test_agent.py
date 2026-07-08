@@ -4250,3 +4250,35 @@ async def test_compose_extension_briefing_unknown_project_does_not_substitute_sp
 
     assert result["related_specs"] == []
     assert any("totally-unknown-project-slug" in g for g in result["gaps"])
+    # repo_context must not silently describe an unrelated (e.g. cwd)
+    # repo while echoing the caller's unconfigured project (Codex
+    # review round 3 on PR #86).
+    assert result["repo_context"]["available"] is False
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_cross_project_repo_context_not_arbitrary(
+    temp_config_file, tmp_path,
+):
+    """Cross-project repo_context must describe every configured project, not just the first.
+
+    Codex review round 3 on PR #86: anchoring repo_context on
+    ``spec_projects[0]`` makes the briefing internally inconsistent
+    when matched FRs/specs come from a different configured project.
+    """
+    second_repo = tmp_path / "second_repo"
+    (second_repo / "specs").mkdir(parents=True)
+    config_path = temp_config_file({
+        "projects": {
+            "second": {"repo": str(second_repo), "specs_dir": "specs"},
+        },
+    })
+    harness2 = AgentTestHarness(DeveloperAgent, config_path=str(config_path))
+
+    result = await harness2.call("compose_extension_briefing", {
+        "request": "anything",
+        # project omitted -> cross-project briefing across "developer" + "second"
+    })
+
+    assert result["repo_context"]["cross_project"] is True
+    assert set(result["repo_context"]["projects"].keys()) == {"developer", "second"}

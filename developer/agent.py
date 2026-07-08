@@ -1750,24 +1750,51 @@ class DeveloperAgent(BaseAgent):
         # Repo context: reuse project_ecosystem's heuristic discovery,
         # no live-agent overlay (no bus call from inside this skill —
         # keeps this handler's cost bounded to local filesystem reads).
-        # Anchors on the first spec-scoped project (single project when
-        # scoped; first configured one when cross-project) — repo intro
-        # is inherently single-repo-shaped, unlike spec discovery above.
-        repo_context: dict[str, Any] = {}
-        try:
-            start_dir = None
-            repo_anchor_project = spec_projects[0] if spec_projects else ""
-            proj_cfg = configured_projects.get(repo_anchor_project) if repo_anchor_project else None
-            repo = getattr(proj_cfg, "repo", None)
-            if repo:
-                start_dir = Path(repo)
-            if start_dir is None:
-                start_dir = Path.cwd()
-            view = _project_ecosystem.build_view(start_dir, domain="generic")
-            repo_context = view.to_dict(detail="compact")
-        except Exception as e:
-            await self.report_gap("compose_extension_briefing", f"repo context failed: {e}")
-            repo_context = {"error": str(e)}
+        #
+        # Must stay honest about which repo(s) it describes (Codex
+        # review round 3 on PR #86):
+        #   - unconfigured project (spec_projects empty because the
+        #     caller's project slug isn't in config.projects): do NOT
+        #     fall back to cwd — that silently describes an unrelated
+        #     repo while echoing the caller's requested project.
+        #   - single scoped project: describe exactly that repo.
+        #   - cross-project (0 or 1 project alone can't represent an
+        #     N-project view): describe every configured project,
+        #     tagged, rather than picking the first one arbitrarily.
+        repo_context: dict[str, Any]
+        if project_raw and not spec_projects:
+            repo_context = {
+                "available": False,
+                "note": f"project '{project_raw}' is not configured; repo context skipped",
+            }
+        elif len(spec_projects) == 1:
+            try:
+                proj_cfg = configured_projects.get(spec_projects[0])
+                repo = getattr(proj_cfg, "repo", None)
+                start_dir = Path(repo) if repo else Path.cwd()
+                view = _project_ecosystem.build_view(start_dir, domain="generic")
+                repo_context = view.to_dict(detail="compact")
+            except Exception as e:
+                await self.report_gap("compose_extension_briefing", f"repo context failed: {e}")
+                repo_context = {"error": str(e)}
+        else:
+            # Cross-project briefing: no single repo speaks for the
+            # whole response, so describe each configured project
+            # instead of arbitrarily anchoring on the first one.
+            by_project: dict[str, Any] = {}
+            for proj_key in spec_projects:
+                try:
+                    proj_cfg = configured_projects.get(proj_key)
+                    repo = getattr(proj_cfg, "repo", None)
+                    start_dir = Path(repo) if repo else Path.cwd()
+                    view = _project_ecosystem.build_view(start_dir, domain="generic")
+                    by_project[proj_key] = view.to_dict(detail="compact")
+                except Exception as e:
+                    await self.report_gap(
+                        "compose_extension_briefing", f"repo context failed for {proj_key}: {e}",
+                    )
+                    by_project[proj_key] = {"error": str(e)}
+            repo_context = {"cross_project": True, "projects": by_project}
 
         # Cross-agent corpus context (researcher's KnowledgeStore/concept
         # graph, librarian's classification/neighborhoods) is explicitly
