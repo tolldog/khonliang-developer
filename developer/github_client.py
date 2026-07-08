@@ -53,6 +53,20 @@ def _as_iso(value: Any) -> str:
     return str(value)
 
 
+def _pr_side_repo_full_name(side: Any) -> str:
+    """Best-effort ``"owner/name"`` for a PR's ``head``/``base`` side.
+
+    githubkit's ``repo`` sub-object can legitimately be ``None`` (the
+    source fork/branch was deleted) — return ``""`` rather than raising
+    so :meth:`GithubClient.get_pr` stays a plain read even for that
+    edge case.
+    """
+    repo_obj = getattr(side, "repo", None)
+    if repo_obj is None:
+        return ""
+    return str(getattr(repo_obj, "full_name", "") or "")
+
+
 @dataclass
 class GithubReview:
     """Normalized shape of a PR review for downstream consumers.
@@ -403,7 +417,17 @@ class GithubClient:
 
         Surfaced fields: ``number``, ``title``, ``state``, ``draft``,
         ``mergeable``, ``mergeable_state``, ``author``, ``head``,
-        ``head_sha``, ``base``, ``html_url``, ``merged``, ``merged_at``.
+        ``head_sha``, ``head_repo``, ``base``, ``base_repo``,
+        ``html_url``, ``merged``, ``merged_at``.
+
+        ``head_repo`` / ``base_repo`` are ``"owner/name"`` strings for
+        the repo each side lives in (fr_developer_35fe69af Codex R1
+        follow-up: fork PRs have a head repo that differs from base —
+        callers that mutate the head branch, e.g. deleting it after
+        merge, need to know when it lives somewhere other than the base
+        repo they're already talking to). ``head_repo`` is ``""`` when
+        GitHub reports no head repo at all (the source fork/branch was
+        deleted before this fetch — a real, if rare, GitHub state).
 
         The ``merged`` / ``merged_at`` pair lets downstream consumers
         (notably :func:`developer.pr_watcher._snapshot_from_github`)
@@ -446,7 +470,9 @@ class GithubClient:
             "author": pr.user.login if pr.user else "unknown",
             "head": pr.head.ref,
             "head_sha": getattr(pr.head, "sha", ""),
+            "head_repo": _pr_side_repo_full_name(pr.head),
             "base": pr.base.ref,
+            "base_repo": _pr_side_repo_full_name(pr.base),
             "html_url": pr.html_url,
             "merged": bool(getattr(pr, "merged", False)),
             "merged_at": merged_at,

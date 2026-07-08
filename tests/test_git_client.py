@@ -195,6 +195,24 @@ def test_origin_url_returns_none_without_origin(client):
     assert client.origin_url() is None
 
 
+def test_remote_url_resolves_arbitrary_remote_name(client, repo_path):
+    _run("remote", "add", "origin", "git@github.com:owner/repo.git", cwd=repo_path)
+    _run("remote", "add", "upstream", "git@github.com:someone-else/repo.git", cwd=repo_path)
+
+    assert client.remote_url("origin") == "git@github.com:owner/repo.git"
+    assert client.remote_url("upstream") == "git@github.com:someone-else/repo.git"
+
+
+def test_remote_url_returns_none_for_unconfigured_remote(client, repo_path):
+    _run("remote", "add", "origin", "git@github.com:owner/repo.git", cwd=repo_path)
+    assert client.remote_url("upstream") is None
+
+
+def test_remote_url_defaults_to_origin(client, repo_path):
+    _run("remote", "add", "origin", "git@github.com:owner/repo.git", cwd=repo_path)
+    assert client.remote_url() == client.origin_url()
+
+
 # ---------------------------------------------------------------------------
 # list_branches + log + show + rev_parse + diff
 # ---------------------------------------------------------------------------

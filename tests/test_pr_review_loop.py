@@ -244,13 +244,44 @@ async def test_maybe_update_pr_skips_review_when_auto_request_review_false(
     assert fake_gh.request_calls == []
 
 
+@pytest.mark.asyncio
+async def test_maybe_update_pr_resolves_repo_from_pushed_remote_not_origin(
+    git_repo, no_op_push,
+):
+    """Codex R1 on PR #88: passing remote='upstream' must resolve the
+    target repo from *upstream*'s URL, not silently fall back to
+    origin's. A caller with a second configured remote previously got
+    the PR opened/reviewed against the wrong repo.
+    """
+    _sub.run(
+        ["git", "remote", "add", "upstream",
+         "git@github.com:someone-else/khonliang-developer.git"],
+        cwd=str(git_repo), check=True, stdout=_sub.DEVNULL, stderr=_sub.DEVNULL,
+    )
+    (git_repo / "a.txt").write_text("fourth\n")
+    fake_gh = _FakeGithubClient(existing_pr=None)
+
+    result = await maybe_update_pr(
+        str(git_repo), "feat/x", github_client=fake_gh, remote="upstream",
+    )
+
+    assert result["repo"] == "someone-else/khonliang-developer"
+    assert fake_gh.find_calls == [("someone-else/khonliang-developer", "feat/x")]
+    assert fake_gh.create_calls[0]["repo"] == "someone-else/khonliang-developer"
+
+
 # -- merge_pr_and_sync --
 
 
 class _FakeGithubClientForMerge:
     def __init__(self, *, title="fr_developer_1234abcd: thing", head="feat/x",
-                 merged=True, sha="abc123"):
-        self._pr = {"title": title, "head": head}
+                 merged=True, sha="abc123",
+                 head_repo="tolldog/khonliang-developer",
+                 base_repo="tolldog/khonliang-developer"):
+        self._pr = {
+            "title": title, "head": head,
+            "head_repo": head_repo, "base_repo": base_repo,
+        }
         self._merge_result = {"merged": merged, "sha": sha}
         self.merge_calls: list[tuple] = []
         self.delete_calls: list[tuple] = []
@@ -284,8 +315,45 @@ async def test_merge_pr_and_sync_happy_path_deletes_branch_and_fires_hook():
     assert result["merged"] is True
     assert result["branch"] == "feat/x"
     assert result["branch_deleted"] is True
+    assert result["note"] == ""
     assert fake_gh.merge_calls == [("tolldog/khonliang-developer", 84, "squash")]
     assert fake_gh.delete_calls == [("tolldog/khonliang-developer", "feat/x")]
+    assert on_merged_calls == [
+        ("tolldog/khonliang-developer", 84, "fr_developer_1234abcd: thing")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_merge_pr_and_sync_skips_branch_delete_for_fork_pr():
+    """Codex R1 on PR #88: a fork-shaped PR (head repo != base repo)
+    must not have its head branch deleted against the base repo — that
+    branch lives in the fork, so deleting the same-named branch in the
+    base repo would either no-op or delete something unrelated. This
+    repo doesn't support fork PRs; the safe behavior is to skip the
+    delete and say so, not merge normally then silently mishandle it.
+    """
+    fake_gh = _FakeGithubClientForMerge(
+        head_repo="someone-else/khonliang-developer",
+        base_repo="tolldog/khonliang-developer",
+    )
+    on_merged_calls = []
+
+    async def fake_on_merged(repo, pr_number, title):
+        on_merged_calls.append((repo, pr_number, title))
+
+    result = await merge_pr_and_sync(
+        "https://github.com/tolldog/khonliang-developer/pull/84",
+        github_client=fake_gh, on_merged=fake_on_merged,
+    )
+
+    # Merge itself still happens — only branch deletion is skipped.
+    assert result["merged"] is True
+    assert fake_gh.merge_calls == [("tolldog/khonliang-developer", 84, "squash")]
+    assert result["branch_deleted"] is False
+    assert result["note"] == "fork_pr_unsupported"
+    assert fake_gh.delete_calls == []
+    # The FR auto-completion hook still fires — merge itself succeeded,
+    # only the branch-delete side effect is what's unsupported.
     assert on_merged_calls == [
         ("tolldog/khonliang-developer", 84, "fr_developer_1234abcd: thing")
     ]
