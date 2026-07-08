@@ -409,6 +409,47 @@ def test_stage_and_commit(client, repo_path):
     assert client.status().staged == []
 
 
+def test_stage_handles_unstaged_deletion(client, repo_path):
+    """A tracked file removed from disk but not yet `git rm`'d must
+    still be stageable — GitPython's index.add() errors on a path that
+    no longer exists, so stage() routes missing paths through
+    index.remove() instead (Codex R3 on PR #88).
+    """
+    (repo_path / "gone.txt").write_text("x\n")
+    client.stage(["gone.txt"])
+    client.commit("feat: add gone.txt")
+
+    (repo_path / "gone.txt").unlink()
+    client.stage(["gone.txt"])
+    s = client.status()
+    # RepoStatus.deleted covers both staged and unstaged deletions
+    # (see status()'s XY-code parsing) — the commit below is the real
+    # assertion that the deletion was actually staged, not left dirty.
+    assert "gone.txt" in s.deleted
+    commit = client.commit("chore: remove gone.txt")
+    assert commit.message == "chore: remove gone.txt"
+    assert not (repo_path / "gone.txt").exists()
+    assert client.status().is_dirty is False
+
+
+def test_stage_handles_dangling_symlink(client, repo_path):
+    """A tracked or newly-added dangling symlink is a real,
+    intentionally-versioned entry — Path.exists() follows symlinks and
+    reports False for a broken link, which would misroute it through
+    index.remove() as if it were a deletion. os.path.lexists checks the
+    link itself (Codex R6 on PR #88).
+    """
+    link = repo_path / "broken_link"
+    link.symlink_to("does-not-exist-target")
+    client.stage(["broken_link"])
+    s = client.status()
+    assert "broken_link" in s.staged
+
+    commit = client.commit("feat: add broken symlink")
+    assert commit.message == "feat: add broken symlink"
+    assert client.status().staged == []
+
+
 def test_unstage(client, repo_path):
     (repo_path / "s.txt").write_text("y\n")
     client.stage(["s.txt"])

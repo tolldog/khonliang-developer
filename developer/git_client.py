@@ -634,9 +634,15 @@ class GitClient:
         # a deletion mixed in with ordinary changes doesn't blow up the
         # whole call (surfaced via maybe_update_pr's unstaged-deletion
         # handling, Codex R3 on PR #88).
+        #
+        # ``Path.exists()`` follows symlinks, so a tracked or
+        # newly-added dangling/broken symlink (a real, intentionally
+        # versioned entry) would look "missing" and get routed through
+        # index.remove() instead of being added — use os.path.lexists,
+        # which checks the link itself (Codex R6 on PR #88).
         root = Path(repo.working_tree_dir)
-        existing = [p for p in paths if (root / p).exists()]
-        missing = [p for p in paths if not (root / p).exists()]
+        existing = [p for p in paths if os.path.lexists(root / p)]
+        missing = [p for p in paths if not os.path.lexists(root / p)]
         try:
             if existing:
                 repo.index.add(existing)

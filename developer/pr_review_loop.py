@@ -139,15 +139,21 @@ async def maybe_update_pr(
 ) -> dict:
     """Single-call "sync my branch to a PR" entry point.
 
-    1. Stage + commit any uncommitted changes — modified, untracked, or
-       already-staged paths all count (staging only happens for the
-       modified/untracked set; already-staged paths are committed as-is).
-       Deleted paths aren't auto-staged because :meth:`GitClient.stage`
-       is add-only; a working tree with only deletions pending is left
-       for the caller to commit explicitly.
+    1. Stage + commit any uncommitted changes — modified, untracked,
+       deleted, or already-staged paths all count (Codex R2/R3 on PR
+       #88: staged-but-uncommitted and unstaged deletions are both
+       "uncommitted" under this API's own contract).
     2. Push the branch (idempotent — a no-op push when nothing's new).
     3. Create a PR for the branch if none is open yet (conventional
-       body), else reuse the existing one.
+       body), else reuse the existing open PR for ``branch`` regardless
+       of its base. SCOPE NOTE (Codex R6 on PR #88): this repo only
+       ever opens PRs against ``main`` (no release-branch/backport
+       workflow — see this repo's CLAUDE.md), so a head branch is
+       assumed to map to at most one open PR. A caller reusing the same
+       head branch for parallel PRs against different bases (e.g.
+       ``base="release/x"``) is out of scope; ``find_open_pr_for_branch``
+       would need a ``base`` filter to support that, which isn't wired
+       up here.
     4. When ``auto_request_review`` and the code *materially changed*
        (a new commit was made here, the branch already had unpushed
        commits walking in — e.g. from a prior ``git_pr_commit_push`` —
