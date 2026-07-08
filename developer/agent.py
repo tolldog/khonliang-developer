@@ -1673,7 +1673,13 @@ class DeveloperAgent(BaseAgent):
         )
 
         try:
-            milestones = self.pipeline.milestones.list(project=fr_project)
+            # include_archived=True mirrors the FR fix above: an
+            # abandoned/archived milestone for the same feature is
+            # exactly the prior planning context an "extend existing
+            # work" request needs (Codex review round 2 on PR #86).
+            milestones = self.pipeline.milestones.list(
+                project=fr_project, include_archived=True,
+            )
         except Exception as e:
             await self.report_gap("compose_extension_briefing", f"milestone lookup failed: {e}")
             milestones = []
@@ -1705,12 +1711,18 @@ class DeveloperAgent(BaseAgent):
             if project_raw in configured_projects:
                 spec_projects = [project_raw]
             else:
-                spec_projects = list(configured_projects)[:1]
-                if spec_projects:
-                    gaps.append(
-                        f"project '{project_raw}' has no configured specs_dir; "
-                        f"spec search fell back to '{spec_projects[0]}'"
-                    )
+                # Unknown project slug (typo, or an FR-only project with
+                # no specs_dir configured) — do NOT substitute an
+                # arbitrary configured project. That would silently mix
+                # an unrelated repo's specs/repo_context into a briefing
+                # that still echoes the caller's requested project,
+                # pointing an external LLM at the wrong codebase (Codex
+                # review round 2 on PR #86). Return no specs and say so.
+                spec_projects = []
+                gaps.append(
+                    f"project '{project_raw}' has no configured specs_dir; "
+                    "spec search skipped (not substituting an unrelated project)"
+                )
         else:
             spec_projects = list(configured_projects)
 

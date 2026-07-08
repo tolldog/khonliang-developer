@@ -4232,3 +4232,21 @@ async def test_compose_extension_briefing_cross_project_finds_specs_in_all_proje
 
     paths = [s["path"] for s in result["related_specs"]]
     assert any("second_repo" in p for p in paths)
+
+
+@pytest.mark.asyncio
+async def test_compose_extension_briefing_unknown_project_does_not_substitute_specs(harness):
+    """An unconfigured project slug must not silently pull another project's specs.
+
+    Codex review round 2 on PR #86: falling back to
+    ``list(configured_projects)[:1]`` mixed an unrelated repo's specs
+    into a response that still echoed the caller's (wrong) requested
+    project. Must return no specs and note the gap instead.
+    """
+    result = await harness.call("compose_extension_briefing", {
+        "request": "add rate limiting somewhere",
+        "project": "totally-unknown-project-slug",
+    })
+
+    assert result["related_specs"] == []
+    assert any("totally-unknown-project-slug" in g for g in result["gaps"])
