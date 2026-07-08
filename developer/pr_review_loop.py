@@ -72,7 +72,8 @@ class PrReviewLoopError(RuntimeError):
 
 
 _ORIGIN_URL_RE = re.compile(
-    r"(?:git@github\.com:|https://(?:[^@/]+@)?github\.com/)"
+    r"(?:git@github\.com:|https://(?:[^@/]+@)?github\.com/"
+    r"|ssh://(?:[^@/]+@)?github\.com(?::\d+)?/)"
     r"(?P<owner>[^/]+)/(?P<name>[^/]+?)(?:\.git)?/?$"
 )
 
@@ -95,7 +96,11 @@ def parse_owner_repo_from_origin(url: Optional[str]) -> str:
     ``https://x-access-token:TOKEN@github.com/owner/repo.git`` or
     ``https://user@github.com/owner/repo.git``; the userinfo segment
     before ``@github.com`` is stripped before matching owner/repo,
-    rather than causing the whole URL to fail to match).
+    rather than causing the whole URL to fail to match) and the
+    ``ssh://git@github.com/owner/repo.git`` (optionally with a
+    ``:port``) SSH form alongside the ``git@github.com:owner/repo.git``
+    shorthand (Codex R3 on PR #88 — this repo's own origin uses the
+    shorthand form, but both are standard GitHub SSH remote shapes).
 
     Raises :class:`PrReviewLoopError` for an empty/unrecognized URL —
     ``maybe_update_pr`` needs a real ``owner/name`` before it can talk
@@ -181,7 +186,13 @@ async def maybe_update_pr(
     # squarely "uncommitted" (Codex R2 on PR #88: previously only
     # modified/untracked were checked, so pre-staged changes were
     # silently skipped — no commit, no push, no review request).
-    unstaged_paths = sorted(set(status.modified) | set(status.untracked))
+    # ``deleted`` covers a tracked file removed from disk but not yet
+    # ``git rm``'d — status.modified/.untracked alone miss it, so a
+    # local deletion silently never got committed/pushed (Codex R3 on
+    # PR #88).
+    unstaged_paths = sorted(
+        set(status.modified) | set(status.untracked) | set(status.deleted)
+    )
     already_staged = bool(status.staged)
     committed = False
     if unstaged_paths or already_staged:

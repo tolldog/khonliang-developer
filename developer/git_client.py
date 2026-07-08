@@ -604,8 +604,20 @@ class GitClient:
                 f"really want to capture every change in the working tree"
             )
         repo = self._get_repo()
+        # GitPython's index.add() stages new/modified content but
+        # errors on a path whose file no longer exists on disk (a
+        # tracked-file deletion not yet `git rm`'d) — split the batch so
+        # a deletion mixed in with ordinary changes doesn't blow up the
+        # whole call (surfaced via maybe_update_pr's unstaged-deletion
+        # handling, Codex R3 on PR #88).
+        root = Path(repo.working_tree_dir)
+        existing = [p for p in paths if (root / p).exists()]
+        missing = [p for p in paths if not (root / p).exists()]
         try:
-            repo.index.add(paths)
+            if existing:
+                repo.index.add(existing)
+            if missing:
+                repo.index.remove(missing)
         except Exception as e:
             raise GitClientError(f"stage failed: {e}") from e
         return list(paths)

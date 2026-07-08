@@ -59,6 +59,20 @@ def test_parse_owner_repo_from_origin_https_with_bare_username():
     ) == "tolldog/khonliang-developer"
 
 
+def test_parse_owner_repo_from_origin_ssh_url_form():
+    """Codex R3 on PR #88: the ``ssh://git@github.com/owner/repo.git``
+    form (optionally with a port) is a standard GitHub SSH remote shape
+    distinct from the ``git@github.com:owner/repo.git`` shorthand — both
+    must parse.
+    """
+    assert parse_owner_repo_from_origin(
+        "ssh://git@github.com/tolldog/khonliang-developer.git"
+    ) == "tolldog/khonliang-developer"
+    assert parse_owner_repo_from_origin(
+        "ssh://git@github.com:22/tolldog/khonliang-developer.git"
+    ) == "tolldog/khonliang-developer"
+
+
 def test_parse_owner_repo_from_origin_empty_raises():
     with pytest.raises(PrReviewLoopError, match="empty"):
         parse_owner_repo_from_origin("")
@@ -192,6 +206,31 @@ async def test_maybe_update_pr_commits_already_staged_changes(git_repo, no_op_pu
     log = _sub.run(["git", "log", "--oneline", "-1"], cwd=str(git_repo), check=True,
                     capture_output=True, text=True).stdout
     assert "sync feat/x" in log or "feat/x" in log  # default-generated commit message landed
+
+
+@pytest.mark.asyncio
+async def test_maybe_update_pr_commits_unstaged_deletion(git_repo, no_op_push):
+    """Codex R3 on PR #88: a tracked file removed from disk but not yet
+    `git rm`'d shows up only in status.deleted — status.modified and
+    status.untracked both stay empty, so the old unstaged_paths
+    computation silently skipped it: no commit, no push, no review
+    request, even though the working tree is genuinely dirty.
+    """
+    (git_repo / "a.txt").unlink()
+
+    from developer.git_client import GitClient
+    status = GitClient(str(git_repo)).status()
+    assert status.deleted == ["a.txt"]
+    assert status.modified == [] and status.untracked == []  # sanity: pure deletion case
+
+    fake_gh = _FakeGithubClient(existing_pr=None)
+    result = await maybe_update_pr(str(git_repo), "feat/x", github_client=fake_gh)
+
+    assert result["committed"] is True
+    assert result["review_requested"] is True
+    log = _sub.run(["git", "log", "--oneline", "-1"], cwd=str(git_repo), check=True,
+                    capture_output=True, text=True).stdout
+    assert "sync feat/x" in log or "feat/x" in log
 
 
 @pytest.mark.asyncio
