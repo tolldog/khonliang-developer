@@ -1,0 +1,116 @@
+// khonliang ecosystem — RUNTIME topology (as observed 2026-04-24)
+//
+// Compiled from:
+//   - bus.services (live agents + skill counts)
+//   - bus.flows (declared collaborations)
+//   - grep of `await self.request(agent_type=..., operation=...)` call sites
+//   - grep of `await self.publish("<event>", ...)` sites
+//
+// Deliberately complementary to the import graphs:
+// compile-time shows what each app *pulls in as library code* (dense);
+// runtime shows what each agent *actually calls over the bus* (sparse).
+// If an edge appears in one graph but not the other, that's signal
+// about whether a coupling is library reuse or genuine agent traffic.
+//
+// Edge classes:
+//   request   — solid blue, directed: `await self.request()` skill invocation
+//   event     — dashed green, directed from publisher: `await self.publish("<event>", …)`
+//   collab    — dotted purple: declared `Collaboration` registered with bus
+//   absent    — the edges we might have expected but grep found NOTHING for
+//               (e.g. researcher→anyone, reviewer→anyone, librarian subs)
+
+digraph khonliang_runtime {
+  rankdir=LR;
+  graph [fontname="Helvetica", fontsize=11, splines=true, nodesep=0.6, ranksep=1.0];
+  node  [fontname="Helvetica", fontsize=10, style=filled, shape=box];
+  edge  [fontname="Helvetica", fontsize=9];
+
+  // ============ LIVE AGENTS ============
+  // Node labels carry live metadata: version + skill count.
+  developer [label="developer-primary\nv0.2.0 · 69 skills\n(agent_type: developer)", fillcolor="#d5e8d4"];
+  researcher [label="researcher-primary\nv0.1.0 · 57 skills\n(agent_type: researcher)", fillcolor="#d5e8d4"];
+  librarian [label="librarian-primary\nv0.2.0 · 8 skills\n(agent_type: librarian)", fillcolor="#d5e8d4"];
+  reviewer [label="reviewer-primary\nv0.3.0 · 5 skills\n(agent_type: reviewer)", fillcolor="#d5e8d4"];
+
+  // ============ DEFINED-BUT-NOT-RUNNING ============
+  // DeveloperResearcher is defined in developer/researcher_agent.py but
+  // not currently registered on the bus (no developer-researcher entry
+  // in bus.services). Either stopped between sessions or never started.
+  dev_researcher [label="developer-researcher\n(defined in developer/\nresearcher_agent.py)\nNOT CURRENTLY RUNNING", fillcolor="#f0f0f0", style="filled,dashed", color="#999999"];
+
+  // ============ EXTERNAL BUS CONSUMERS ============
+  // Claude Code session + any MCP client subscribes to bus events for
+  // wait_for_event, pr_fleet_status polling, etc.
+  mcp_consumer [label="MCP client\n(Claude Code, tests,\nwait_for_event callers)", fillcolor="#fff2cc", shape=ellipse];
+
+  // ============ BUS CORE ============
+  // Drawn explicitly so event flow is legible. This is the routing
+  // substrate; every arrow below goes *through* it.
+  bus [label="khonliang-bus\n(service — routing core)", fillcolor="#f8cecc"];
+
+  // ============ SYNCHRONOUS REQUESTS (self.request) ============
+  // Grep of `await self.request(agent_type=..., operation=...)` across
+  // all agent repos. Only TWO real call sites found today; both in
+  // developer/agent.py:
+  //   line 802: → researcher.paper_context
+  //   line 831: → researcher.synergize_concepts
+  // researcher, reviewer, librarian currently make no outbound requests
+  // of their own. They only respond.
+  edge [style=solid, color="#1976d2", penwidth=1.5, arrowhead=vee];
+  developer -> researcher [label="paper_context\nsynergize_concepts", tooltip="developer/agent.py:802, :831"];
+
+  // ============ EVENT PUBLICATIONS (self.publish) ============
+  // Events flow publisher → bus → (any subscribers).
+  edge [style=dashed, color="#2e7d32", arrowhead=normal, penwidth=1.1];
+  developer -> bus [label="pr.opened · pr.review_added\npr.merged · pr.fleet_digest\npr.comment_posted\npr.inline_finding", fontcolor="#2e7d32"];
+  researcher -> bus [label="ingest.queued\ningest.completed", fontcolor="#2e7d32"];
+  librarian -> bus [label="library.gap_identified", fontcolor="#2e7d32"];
+  reviewer -> bus [label="reviewer.usage", fontcolor="#2e7d32"];
+
+  // Known external consumer of events: MCP callers that wait_for_event
+  // (tests, Claude Code session polling, pr_fleet_status aggregators).
+  bus -> mcp_consumer [label="wait_for_event\n(any topic)", style=dotted, color="#2e7d32"];
+
+  // ============ DECLARED COLLABORATIONS (bus.flows) ============
+  // From `bus.flows` output: exactly ONE collaboration is declared
+  // today: `evaluate_spec_against_corpus` on researcher (>=0.1.0).
+  // Declared collaborations are metadata — they describe *intent*
+  // independent of whether anyone calls them. Dotted to distinguish
+  // from the grep-confirmed call sites above.
+  edge [style=dotted, color="#5e35b1", arrowhead=open];
+  developer -> researcher [label="evaluate_spec_against_corpus\n(declared Collaboration)", fontcolor="#5e35b1"];
+
+  // ============ NOTABLE ABSENCES ============
+  // The following edges are *present* at compile time in the import
+  // graphs but *absent* at runtime — they're library-reuse only and
+  // not agent-to-agent traffic:
+  //   developer → researcher-lib (LocalDocReader, DocContent,
+  //     BaseResearchAgent, DomainConfig)        — library code
+  //   developer → ollama-khonliang (KnowledgeStore etc.)  — persistence
+  //   researcher → ollama-khonliang (KnowledgeStore, MCP)  — persistence
+  //
+  // And the following agent→agent edges one might *expect* but the
+  // bus does not currently see:
+  //   reviewer ← developer for review_pr / review_diff — no bus traffic
+  //     observed from developer to reviewer; review_pr is currently
+  //     invoked directly by the user / MCP, not from developer's own
+  //     skills.
+  //   librarian ← researcher — researcher does not currently consume
+  //     library.gap_identified (librarian’s output event), nor does
+  //     anyone subscribe to it inside the agent repos.
+
+  // ============ LEGEND ============
+  subgraph cluster_legend {
+    label="legend";
+    style=solid; color="#aaaaaa"; fontsize=10;
+    node [shape=plaintext, fillcolor=white, style=""];
+    legend [label=<
+      <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="2">
+        <TR><TD ALIGN="LEFT"><FONT COLOR="#1976d2">—— solid blue</FONT></TD><TD ALIGN="LEFT">synchronous <B>self.request()</B> call</TD></TR>
+        <TR><TD ALIGN="LEFT"><FONT COLOR="#2e7d32">- - dashed green</FONT></TD><TD ALIGN="LEFT">event publication (<B>self.publish()</B>)</TD></TR>
+        <TR><TD ALIGN="LEFT"><FONT COLOR="#5e35b1">· · dotted purple</FONT></TD><TD ALIGN="LEFT">declared <B>Collaboration</B> (metadata)</TD></TR>
+        <TR><TD ALIGN="LEFT"><FONT COLOR="#999999">dashed grey node</FONT></TD><TD ALIGN="LEFT">defined but not currently running</TD></TR>
+      </TABLE>
+    >];
+  }
+}
