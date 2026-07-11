@@ -10,6 +10,11 @@
 # refuses to start if any store opens a different DB.
 
 db_path: data/developer.db
+# SelfCatalog federation sidecar (fr_developer_cadd38f3) — deliberately a
+# SEPARATE sqlite file from db_path (never shares a handle with the
+# KnowledgeStore/TripleStore/DigestStore isolation guard in pipeline.py).
+# Defaults to a file alongside db_path when omitted.
+catalog_db_path: data/developer_catalog.db
 workspace_root: /path/to/dev
 prompts_dir: prompts
 

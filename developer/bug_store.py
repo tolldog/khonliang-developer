@@ -43,6 +43,7 @@ no-ops because the empty check finds the seed rows.
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
@@ -53,8 +54,11 @@ from khonliang.knowledge.store import (
     KnowledgeStore,
     Tier,
 )
+from librarian_lib import IndexRecord, Link, SelfCatalog
 
 from developer.project_store import DEFAULT_PROJECT, normalize_project, slug_target
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -180,8 +184,19 @@ class BugStore:
     ``bug``-tagged entries. Idempotent across restarts.
     """
 
-    def __init__(self, knowledge: KnowledgeStore, *, seed: bool = True):
+    def __init__(
+        self,
+        knowledge: KnowledgeStore,
+        *,
+        seed: bool = True,
+        catalog: Optional[SelfCatalog] = None,
+    ):
         self.knowledge = knowledge
+        # SelfCatalog federation sidecar (fr_developer_cadd38f3). Optional;
+        # defaults to None so existing call sites keep working unchanged.
+        # See FRStore._store for the failure-isolation contract this
+        # store's ``_store`` mirrors.
+        self.catalog = catalog
         if seed:
             self._seed_if_empty()
 
@@ -551,6 +566,12 @@ class BugStore:
     # ------------------------------------------------------------------
 
     def _store(self, bug: Bug) -> None:
+        # Catalog contract (fr_developer_cadd38f3): build + validate the
+        # IndexRecord before the KnowledgeStore write (fails loud on a
+        # malformed record, before anything persists); catalog.upsert
+        # itself runs after the write in its own try/except so a
+        # catalog-layer failure never fails the bug write that landed.
+        record = _bug_catalog_record(bug) if self.catalog is not None else None
         entry = KnowledgeEntry(
             id=bug.id,
             tier=Tier.DERIVED,
@@ -584,6 +605,15 @@ class BugStore:
         if stored is not None:
             bug.created_at = stored.created_at
             bug.updated_at = stored.updated_at
+
+        if self.catalog is not None and record is not None:
+            try:
+                self.catalog.upsert(record)
+            except Exception:
+                logger.warning(
+                    "catalog upsert failed for bug %s (write already landed)",
+                    bug.id, exc_info=True,
+                )
 
     # ------------------------------------------------------------------
     # fr_developer_1c5178d2 — project-dimension migration helper
@@ -672,6 +702,38 @@ class BugStore:
 # ---------------------------------------------------------------------------
 # Module helpers
 # ---------------------------------------------------------------------------
+
+
+def _bug_catalog_record(bug: Bug) -> IndexRecord:
+    """Build the SelfCatalog :class:`IndexRecord` for a bug.
+
+    Link mapping (fr_developer_cadd38f3): ``linked_frs`` -> one
+    ``Link(rel="fixes", ...)`` per entry. ``duplicate_of`` and
+    ``linked_pr`` are NOT mapped (no clean vocab fit; automatic
+    mention-extraction over ``text`` gives loose textual coverage — an
+    accepted, documented gap for this FR).
+
+    ``facets["priority"]`` carries ``bug.severity`` — bugs have no
+    literal ``priority`` field, but severity is the priority-equivalent
+    axis for a bug, and reusing the core facet key lets callers filter
+    fr/bug records on one uniform key.
+    """
+    links: list[Link] = [
+        Link(rel="fixes", target_source="developer", target_id=fr_id)
+        for fr_id in bug.linked_frs
+    ]
+    return IndexRecord(
+        project=bug.project or DEFAULT_PROJECT,
+        source="developer",
+        record_id=bug.id,
+        schema_version=1,
+        kind="bug",
+        updated_at=bug.updated_at,
+        facets={"status": bug.status, "target": bug.target, "priority": bug.severity},
+        text=f"{bug.title} {bug.description}",
+        links=links,
+        ref={"skill": "get_bug", "args": {"bug_id": bug.id}},
+    )
 
 
 def _bug_from_entry(entry: KnowledgeEntry) -> Bug:

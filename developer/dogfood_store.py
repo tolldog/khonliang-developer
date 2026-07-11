@@ -41,6 +41,7 @@ body. Idempotent across restarts.
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
@@ -52,6 +53,9 @@ from khonliang.knowledge.store import (
     KnowledgeStore,
     Tier,
 )
+from librarian_lib import IndexRecord, SelfCatalog
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -169,8 +173,19 @@ class DogfoodStore:
     contains zero ``dogfood``-tagged entries. Idempotent across restarts.
     """
 
-    def __init__(self, knowledge: KnowledgeStore, *, seed: bool = True):
+    def __init__(
+        self,
+        knowledge: KnowledgeStore,
+        *,
+        seed: bool = True,
+        catalog: Optional[SelfCatalog] = None,
+    ):
         self.knowledge = knowledge
+        # SelfCatalog federation sidecar (fr_developer_cadd38f3). Optional;
+        # defaults to None so existing call sites keep working unchanged.
+        # See FRStore._store for the failure-isolation contract this
+        # store's ``_store`` mirrors.
+        self.catalog = catalog
         if seed:
             self._seed_if_empty()
 
@@ -489,6 +504,13 @@ class DogfoodStore:
     # ------------------------------------------------------------------
 
     def _store(self, dog: Dogfood) -> None:
+        # Catalog contract (fr_developer_cadd38f3): build + validate the
+        # IndexRecord before the KnowledgeStore write (fails loud on a
+        # malformed record, before anything persists); catalog.upsert
+        # itself runs after the write in its own try/except so a
+        # catalog-layer failure never fails the dogfood write that
+        # landed.
+        record = _dogfood_catalog_record(dog) if self.catalog is not None else None
         entry = KnowledgeEntry(
             id=dog.id,
             tier=Tier.DERIVED,
@@ -521,6 +543,15 @@ class DogfoodStore:
         if stored is not None:
             dog.created_at = stored.created_at
             dog.updated_at = stored.updated_at
+
+        if self.catalog is not None and record is not None:
+            try:
+                self.catalog.upsert(record)
+            except Exception:
+                logger.warning(
+                    "catalog upsert failed for dogfood %s (write already landed)",
+                    dog.id, exc_info=True,
+                )
 
     # ------------------------------------------------------------------
     # fr_developer_1c5178d2 — project-dimension migration helper
@@ -644,6 +675,29 @@ class DogfoodStore:
 # ---------------------------------------------------------------------------
 # Module helpers
 # ---------------------------------------------------------------------------
+
+
+def _dogfood_catalog_record(dog: Dogfood) -> IndexRecord:
+    """Build the SelfCatalog :class:`IndexRecord` for a dogfood observation.
+
+    No structured links (fr_developer_cadd38f3): ``promoted_to`` has no
+    clean vocab fit and the PR-record store it would partly target
+    doesn't exist yet — automatic mention-extraction over ``text`` gives
+    loose textual coverage, an accepted documented gap. No ``priority``
+    facet either — dogfood has no priority-equivalent field. ``text`` is
+    the observation alone (dogfood has no separate title).
+    """
+    return IndexRecord(
+        project=dog.project or DEFAULT_PROJECT,
+        source="developer",
+        record_id=dog.id,
+        schema_version=1,
+        kind="dogfood",
+        updated_at=dog.updated_at,
+        facets={"status": dog.status, "target": dog.target},
+        text=dog.observation,
+        ref={"skill": "get_dogfood", "args": {"dog_id": dog.id}},
+    )
 
 
 def _dogfood_from_entry(entry: KnowledgeEntry) -> Dogfood:
