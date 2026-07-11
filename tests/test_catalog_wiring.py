@@ -128,6 +128,39 @@ class TestFRCataloging:
         assert link.target_source == "researcher"
         assert link.target_id == "paper_123"
 
+    def test_catalog_record_updated_at_matches_synced_value_not_stale(
+        self, fr_store, catalog, monkeypatch,
+    ):
+        """Codex R1 on PR #91: KnowledgeStore.add() unconditionally
+        overwrites entry.updated_at with time.time() AT WRITE TIME, which
+        is later than whatever the FR object held when the IndexRecord
+        was first built — a record built before the write (or built once
+        and never refreshed) would upsert with a stale updated_at,
+        breaking list_since()/updated_after cursors on the catalog side.
+        Control time.time() to make the pre-write and write-time values
+        provably distinct, then assert the catalog record reflects the
+        LATER (synced) value, not the earlier one.
+        """
+        import itertools
+        import time as time_mod
+
+        # Strictly increasing, so every time.time() call in the write path
+        # returns a distinct, later value than the one before it — no need
+        # to know or predict the exact call count.
+        counter = itertools.count(1_000.0, 1.0)
+        monkeypatch.setattr(time_mod, "time", lambda: next(counter))
+
+        fr = fr_store.promote(target="developer", title="t", description="d")
+        rec = catalog.get(fr.project, fr.id)
+
+        # This is the regression check: before the fix, rec.updated_at held
+        # whatever fr.updated_at was AT RECORD-CONSTRUCTION TIME (before
+        # KnowledgeStore.add()'s own time.time() call), which — under a
+        # strictly increasing clock — is provably earlier than fr.updated_at
+        # AFTER the post-write sync. Equality here can only hold if the
+        # record was built (or refreshed) using the post-sync value.
+        assert rec.updated_at == fr.updated_at
+
     def test_catalog_none_is_backward_compatible(self, knowledge):
         store = FRStore(knowledge=knowledge)  # no catalog arg
         fr = store.promote(target="developer", title="t", description="d")

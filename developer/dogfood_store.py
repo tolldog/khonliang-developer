@@ -544,6 +544,18 @@ class DogfoodStore:
             dog.created_at = stored.created_at
             dog.updated_at = stored.updated_at
 
+        # Refresh the pre-built record's updated_at from the
+        # now-synced value (Codex R1 on PR #91): KnowledgeStore.add()
+        # overwrites updated_at with its own monotonic clock, so the
+        # record built (and validated) before that write would
+        # otherwise upsert with a stale updated_at, breaking
+        # list_since()/updated_after cursors on the catalog side.
+        # Reassigning (not rebuilding) keeps the fail-loud-before-
+        # persist validation contract intact -- only the timestamp
+        # changes here, nothing that could newly fail validation.
+        if record is not None:
+            record.updated_at = dog.updated_at
+
         if self.catalog is not None and record is not None:
             try:
                 self.catalog.upsert(record)
