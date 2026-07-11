@@ -9,6 +9,7 @@ serialized through a small domain object.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -20,8 +21,11 @@ from khonliang.knowledge.store import (
     KnowledgeStore,
     Tier,
 )
+from librarian_lib import IndexRecord, Link, SelfCatalog
 
 from developer.project_store import DEFAULT_PROJECT, normalize_project, slug_target
+
+logger = logging.getLogger(__name__)
 
 # The FR store is passed into :meth:`MilestoneStore.delete` as an
 # argument rather than imported here so milestone_store stays free of
@@ -184,8 +188,13 @@ class Milestone:
 class MilestoneStore:
     """Store milestones in developer.db via KnowledgeStore."""
 
-    def __init__(self, knowledge: KnowledgeStore):
+    def __init__(self, knowledge: KnowledgeStore, *, catalog: Optional[SelfCatalog] = None):
         self.knowledge = knowledge
+        # SelfCatalog federation sidecar (fr_developer_cadd38f3). Optional;
+        # defaults to None so existing call sites keep working unchanged.
+        # See FRStore._store for the failure-isolation contract this
+        # store's ``_store``/``delete`` mirror.
+        self.catalog = catalog
 
     def get(self, milestone_id: str) -> Optional[Milestone]:
         entry = self.knowledge.get(milestone_id)
@@ -871,6 +880,20 @@ class MilestoneStore:
                 )
 
         removed = self.knowledge.remove(milestone_id)
+        # Hard-delete is the ONE case that maps to catalog.delete() rather
+        # than upsert (fr_developer_cadd38f3) — every other terminal
+        # transition across FR/bug/milestone/dogfood is still an upsert
+        # with an updated status facet. Same failure-isolation contract as
+        # `_store`: a catalog-layer failure never fails the delete that
+        # already landed.
+        if removed and self.catalog is not None:
+            try:
+                self.catalog.delete(milestone.project or DEFAULT_PROJECT, milestone_id)
+            except Exception:
+                logger.warning(
+                    "catalog delete failed for milestone %s (delete already landed)",
+                    milestone_id, exc_info=True,
+                )
         return {
             "milestone_id": milestone_id,
             "removed": bool(removed),
@@ -898,6 +921,13 @@ class MilestoneStore:
         )
 
     def _store(self, milestone: Milestone) -> None:
+        # Catalog contract (fr_developer_cadd38f3): build + validate the
+        # IndexRecord before the KnowledgeStore write (fails loud on a
+        # malformed record, before anything persists); catalog.upsert
+        # itself runs after the write in its own try/except so a
+        # catalog-layer failure never fails the milestone write that
+        # landed.
+        record = _milestone_catalog_record(milestone) if self.catalog is not None else None
         entry = KnowledgeEntry(
             id=milestone.id,
             tier=Tier.DERIVED,
@@ -929,6 +959,27 @@ class MilestoneStore:
         if stored is not None:
             milestone.created_at = stored.created_at
             milestone.updated_at = stored.updated_at
+
+        # Refresh the pre-built record's updated_at from the
+        # now-synced value (Codex R1 on PR #91): KnowledgeStore.add()
+        # overwrites updated_at with its own monotonic clock, so the
+        # record built (and validated) before that write would
+        # otherwise upsert with a stale updated_at, breaking
+        # list_since()/updated_after cursors on the catalog side.
+        # Reassigning (not rebuilding) keeps the fail-loud-before-
+        # persist validation contract intact -- only the timestamp
+        # changes here, nothing that could newly fail validation.
+        if record is not None:
+            record.updated_at = milestone.updated_at
+
+        if self.catalog is not None and record is not None:
+            try:
+                self.catalog.upsert(record)
+            except Exception:
+                logger.warning(
+                    "catalog upsert failed for milestone %s (write already landed)",
+                    milestone.id, exc_info=True,
+                )
 
     # ------------------------------------------------------------------
     # fr_developer_1c5178d2 — project-dimension migration helper
@@ -967,6 +1018,35 @@ class MilestoneStore:
             self.knowledge.add(patched)
             rewritten += 1
         return rewritten
+
+
+def _milestone_catalog_record(milestone: Milestone) -> IndexRecord:
+    """Build the SelfCatalog :class:`IndexRecord` for a milestone.
+
+    Link mapping (fr_developer_cadd38f3): ``fr_ids`` -> one
+    ``Link(rel="bundles", ...)`` per entry. ``superseded_by`` is NOT
+    mapped — no reverse field exists to declare it from the correct
+    directional side, and the vocab has no ``superseded_by`` word (a gap
+    for a future vocab extension, not this FR's job).
+
+    No ``priority`` facet — milestones have no priority-equivalent field.
+    """
+    links: list[Link] = [
+        Link(rel="bundles", target_source="developer", target_id=fr_id)
+        for fr_id in milestone.fr_ids
+    ]
+    return IndexRecord(
+        project=milestone.project or DEFAULT_PROJECT,
+        source="developer",
+        record_id=milestone.id,
+        schema_version=1,
+        kind="milestone",
+        updated_at=milestone.updated_at,
+        facets={"status": milestone.status, "target": milestone.target},
+        text=f"{milestone.title} {milestone.summary}",
+        links=links,
+        ref={"skill": "get_milestone", "args": {"milestone_id": milestone.id}},
+    )
 
 
 def _milestone_from_entry(entry: KnowledgeEntry) -> Milestone:

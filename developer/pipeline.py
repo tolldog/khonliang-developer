@@ -20,6 +20,7 @@ from khonliang.digest.store import DigestStore
 from khonliang.knowledge.store import KnowledgeStore
 from khonliang.knowledge.triples import TripleStore
 from khonliang_researcher.doc_reader import LocalDocReader
+from librarian_lib import SelfCatalog
 
 from developer.bug_store import BugStore
 from developer.config import Config
@@ -59,6 +60,7 @@ class Pipeline:
     dogfood: DogfoodStore
     projects: ProjectStore
     dev_repos: DevRepoStore
+    catalog: SelfCatalog
 
     @classmethod
     def from_config(cls, config: Config) -> "Pipeline":
@@ -89,11 +91,27 @@ class Pipeline:
             expected=db_path, knowledge=knowledge, triples=triples, digest=digest
         )
 
+        # SelfCatalog federation sidecar (fr_developer_cadd38f3). A
+        # deliberately SEPARATE sqlite file from db_path — exempt from
+        # the `_assert_stores_isolated` guard above by design (that guard
+        # is about KnowledgeStore/TripleStore/DigestStore sharing one
+        # developer.db; the catalog is its own file entirely). Every FR /
+        # bug / milestone / dogfood mutator hooks this in its own `_store`
+        # choke point so newly-written records are cataloged going
+        # forward; backfill of pre-existing records is a separate FR.
+        # Constructed before FRStore/etc. below so it can be threaded into
+        # every store's constructor.
+        catalog = SelfCatalog(
+            db_path=config.catalog_db_path,
+            source="developer",
+            owner_agent="developer-primary",
+        )
+
         # FR_ID_PATTERN is imported from specs and applied to LocalDocReader so that
         # reference extraction doesn't pick up python identifiers like ``fr_status``
         # from prose. It matches only ``fr_<target>_<8 hex chars>``.
         reader = LocalDocReader(reference_pattern=FR_ID_PATTERN)
-        frs = FRStore(knowledge=knowledge)
+        frs = FRStore(knowledge=knowledge, catalog=catalog)
         # ResearcherClient remains only for evidence/context calls. FR
         # lifecycle and FR-id resolution are developer-owned.
         researcher = ResearcherClient(bus_url=config.bus.url or "http://localhost:8787")
@@ -105,13 +123,13 @@ class Pipeline:
 
         guide_text = _load_developer_guide(config.prompts_dir)
 
-        milestones = MilestoneStore(knowledge=knowledge)
+        milestones = MilestoneStore(knowledge=knowledge, catalog=catalog)
 
         # Tracking-infrastructure stores (Phase 1: CRUD-only slice).
         # Seed-on-construction writes curated entries from the FR bodies
         # on a fresh DB; subsequent inits are no-ops once the rows exist.
-        bugs = BugStore(knowledge=knowledge)
-        dogfood = DogfoodStore(knowledge=knowledge)
+        bugs = BugStore(knowledge=knowledge, catalog=catalog)
+        dogfood = DogfoodStore(knowledge=knowledge, catalog=catalog)
 
         # Project store (fr_developer_5d0a8711 Phase 2). Landed empty; the
         # multi-project productization path populates it via project_init
@@ -141,6 +159,7 @@ class Pipeline:
             dogfood=dogfood,
             projects=projects,
             dev_repos=dev_repos,
+            catalog=catalog,
         )
 
 

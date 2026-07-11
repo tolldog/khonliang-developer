@@ -91,6 +91,7 @@ class Config:
 
     config_path: Path
     db_path: Path
+    catalog_db_path: Path
     workspace_root: Path
     prompts_dir: Path
     projects: dict[str, ProjectConfig]
@@ -127,12 +128,24 @@ class Config:
 
         # --- path resolution -------------------------------------------------
         db_path = _resolve_path(data, "db_path", "data/developer.db", config_dir)
+        # SelfCatalog sidecar (fr_developer_cadd38f3): a deliberately
+        # SEPARATE sqlite file from db_path, never sharing a handle with
+        # KnowledgeStore/TripleStore/DigestStore. Default derived from
+        # db_path's own directory so a fresh checkout gets a sensible
+        # location without extra config.
+        catalog_db_path = _resolve_path(
+            data,
+            "catalog_db_path",
+            str(Path(db_path).parent / "developer_catalog.db"),
+            config_dir,
+        )
         workspace_root = _resolve_path(
             data, "workspace_root", str(config_dir.parent), config_dir
         )
         prompts_dir = _resolve_path(data, "prompts_dir", "prompts", config_dir)
 
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(catalog_db_path).parent.mkdir(parents=True, exist_ok=True)
 
         # --- projects --------------------------------------------------------
         projects_raw = data.get("projects") or {}
@@ -169,6 +182,7 @@ class Config:
         return cls(
             config_path=config_path,
             db_path=Path(db_path),
+            catalog_db_path=Path(catalog_db_path),
             workspace_root=Path(workspace_root),
             prompts_dir=Path(prompts_dir),
             projects=projects,

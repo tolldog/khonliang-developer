@@ -33,6 +33,7 @@ For PR 1, the store:
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
@@ -43,8 +44,11 @@ from khonliang.knowledge.store import (
     Tier,
     EntryStatus,
 )
+from librarian_lib import IndexRecord, Link, SelfCatalog
 
 from developer.project_store import DEFAULT_PROJECT, normalize_project, slug_target
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -181,8 +185,15 @@ class FRStore:
     the developer implementation must not replicate that bug.
     """
 
-    def __init__(self, knowledge: KnowledgeStore):
+    def __init__(self, knowledge: KnowledgeStore, *, catalog: Optional[SelfCatalog] = None):
         self.knowledge = knowledge
+        # SelfCatalog federation sidecar (fr_developer_cadd38f3). Optional
+        # and defaults to None so existing direct-instantiation call sites
+        # and tests keep working unchanged. When wired, every write path
+        # that lands through :meth:`_store` also indexes the FR into the
+        # catalog — see `_store` for the failure-isolation contract (a
+        # catalog-layer failure must never fail the underlying write).
+        self.catalog = catalog
 
     # ------------------------------------------------------------------
     # Read paths
@@ -1060,7 +1071,16 @@ class FRStore:
         and sync it onto the caller's ``fr`` so the returned object
         matches what's persisted — otherwise an in-memory idempotent
         compare (e.g. ``update(no-change)``) would see stale times.
+
+        Catalog contract (fr_developer_cadd38f3): the :class:`IndexRecord`
+        is built and pydantic-validated *before* the KnowledgeStore write
+        below — a malformed record fails loud and fails the whole write,
+        since "records are born structured" is the acceptance bar. Once
+        the KnowledgeStore write has succeeded, ``catalog.upsert`` runs in
+        its own try/except so a catalog-layer failure (sidecar db locked,
+        etc.) never rolls back or fails the FR write that already landed.
         """
+        record = _fr_catalog_record(fr) if self.catalog is not None else None
         entry = KnowledgeEntry(
             id=fr.id,
             tier=Tier.DERIVED,
@@ -1096,6 +1116,27 @@ class FRStore:
         if stored is not None:
             fr.created_at = stored.created_at
             fr.updated_at = stored.updated_at
+
+        # Refresh the pre-built record's updated_at from the
+        # now-synced value (Codex R1 on PR #91): KnowledgeStore.add()
+        # overwrites updated_at with its own monotonic clock, so the
+        # record built (and validated) before that write would
+        # otherwise upsert with a stale updated_at, breaking
+        # list_since()/updated_after cursors on the catalog side.
+        # Reassigning (not rebuilding) keeps the fail-loud-before-
+        # persist validation contract intact -- only the timestamp
+        # changes here, nothing that could newly fail validation.
+        if record is not None:
+            record.updated_at = fr.updated_at
+
+        if self.catalog is not None and record is not None:
+            try:
+                self.catalog.upsert(record)
+            except Exception:
+                logger.warning(
+                    "catalog upsert failed for fr %s (write already landed)",
+                    fr.id, exc_info=True,
+                )
 
     def _record_capability(self, fr: FR) -> None:
         """Write/update the capability entry for an FR's current status.
@@ -1291,6 +1332,40 @@ class FRStore:
 # ---------------------------------------------------------------------------
 # Module helpers
 # ---------------------------------------------------------------------------
+
+
+def _fr_catalog_record(fr: FR) -> IndexRecord:
+    """Build the SelfCatalog :class:`IndexRecord` for an FR.
+
+    Link mapping (fr_developer_cadd38f3, do not re-litigate):
+      - ``depends_on``   -> one ``Link(rel="depends_on", ...)`` per entry.
+      - ``merged_from``  -> one ``Link(rel="supersedes", ...)`` per entry
+        (this FR supersedes each merged-in source; ``merged_into`` is NOT
+        separately emitted — the successor's own ``merged_from`` already
+        covers the relationship from the correct directional side).
+      - ``backing_papers`` -> one ``Link(rel="backed_by", ...)`` per entry,
+        targeting ``source="researcher"`` (backing papers live in
+        researcher's corpus, not developer's own catalog).
+    """
+    links: list[Link] = []
+    for dep_id in fr.depends_on:
+        links.append(Link(rel="depends_on", target_source="developer", target_id=dep_id))
+    for old_id in fr.merged_from:
+        links.append(Link(rel="supersedes", target_source="developer", target_id=old_id))
+    for paper_id in fr.backing_papers:
+        links.append(Link(rel="backed_by", target_source="researcher", target_id=paper_id))
+    return IndexRecord(
+        project=fr.project or DEFAULT_PROJECT,
+        source="developer",
+        record_id=fr.id,
+        schema_version=1,
+        kind="fr",
+        updated_at=fr.updated_at,
+        facets={"status": fr.status, "target": fr.target, "priority": fr.priority},
+        text=f"{fr.title} {fr.description}",
+        links=links,
+        ref={"skill": "get_fr_local", "args": {"fr_id": fr.id}},
+    )
 
 
 def _fr_from_entry(entry: KnowledgeEntry) -> FR:

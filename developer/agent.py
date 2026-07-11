@@ -158,6 +158,7 @@ class DeveloperAgent(BaseAgent):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._pipeline = None  # lazy init
+        self._catalog_skills = None  # lazy init — see `catalog_skills` property
         # Lazy-initialized PR watcher registry (see pr_watcher.py). Kept
         # lazy so agents that never call watch_pr_fleet don't pay the
         # SQLite-schema-init cost, and so tests that replace the
@@ -177,6 +178,22 @@ class DeveloperAgent(BaseAgent):
             config = Config.load(self.config_path)
             self._pipeline = Pipeline.from_config(config)
         return self._pipeline
+
+    @property
+    def catalog_skills(self):
+        """Lazily construct the :class:`librarian_lib.CatalogSkills` wrapper.
+
+        Mirrors :attr:`pipeline`'s own lazy-init pattern rather than
+        multiple-inheriting ``CatalogSkills`` directly: ``CatalogSkills.
+        __init__`` needs the pipeline's ``SelfCatalog`` instance, which
+        isn't constructed until first ``self.pipeline`` access (config
+        load + store wiring). A plain composed property sidesteps any
+        ``__init__``-ordering fight with ``BaseAgent``'s own constructor.
+        """
+        if self._catalog_skills is None:
+            from librarian_lib import CatalogSkills
+            self._catalog_skills = CatalogSkills(catalog=self.pipeline.catalog)
+        return self._catalog_skills
 
     @property
     def pr_watcher_registry(self):
@@ -1186,6 +1203,54 @@ class DeveloperAgent(BaseAgent):
                    "include_text_scan": {"type": "boolean", "default": True},
                    "max_text_files": {"type": "integer", "default": 120}},
                   since="0.17.0"),
+            # SelfCatalog federation read surface (fr_developer_cadd38f3).
+            # Thin wrappers over librarian_lib.CatalogSkills, delegating to
+            # `self.catalog_skills` (lazy — mirrors `self.pipeline`) rather
+            # than multiple-inheriting CatalogSkills directly, since
+            # CatalogSkills.__init__ needs the pipeline's catalog which
+            # isn't available until first pipeline access.
+            Skill("catalog_query",
+                  "Structured query over developer's own SelfCatalog index cards "
+                  "(FR/bug/milestone/dogfood). Project-scoped by default.",
+                  {"project": {"type": "string", "required": True},
+                   "filters": {"type": "object", "default": None,
+                               "description": "column filters (kind, record_id, "
+                                              "schema_version, embedding_status), "
+                                              "date bounds (updated_after / "
+                                              "updated_before), or facet key matches"},
+                   "jmespath_expr": {"type": "string", "default": "",
+                                      "description": "optional jmespath expression "
+                                                      "over the row dicts"},
+                   "fields": {"type": "array", "default": None,
+                              "description": "optional projection of row keys"},
+                   "limit": {"type": "integer", "default": 100},
+                   "scope": {"type": "string", "default": "project",
+                             "description": "'project' (default) or 'all_projects'"}},
+                  since="0.22.0"),
+            Skill("catalog_search",
+                  "Similarity search over developer's own SelfCatalog index-card "
+                  "text (LIKE fallback unless embeddings are populated).",
+                  {"project": {"type": "string", "required": True},
+                   "query_text": {"type": "string", "default": ""},
+                   "limit": {"type": "integer", "default": 20},
+                   "query_vector": {"type": "string", "default": "",
+                                     "description": "base64-encoded raw float32 "
+                                                     "vector bytes; omit for "
+                                                     "text fallback"}},
+                  since="0.22.0"),
+            Skill("catalog_stats",
+                  "SelfCatalog health counters (by kind/status, spec versions, "
+                  "embedding backlog).",
+                  {"project": {"type": "string", "default": "",
+                               "description": "empty = across every project"}},
+                  since="0.22.0"),
+            Skill("list_since",
+                  "SelfCatalog records updated after a cutoff timestamp, oldest "
+                  "first — librarian resync primitive.",
+                  {"project": {"type": "string", "required": True},
+                   "since_ts": {"type": "number", "required": True},
+                   "limit": {"type": "integer", "default": 100}},
+                  since="0.22.0"),
         ]
 
     def register_collaborations(self):
@@ -5245,6 +5310,48 @@ class DeveloperAgent(BaseAgent):
 
         bus_ack["bug_id"] = filed.id
         return bus_ack
+
+    # ------------------------------------------------------------------
+    # SelfCatalog federation read surface (fr_developer_cadd38f3)
+    # ------------------------------------------------------------------
+    #
+    # Thin delegating wrappers over librarian_lib.CatalogSkills — the
+    # methods there are plain (non-async, non-@handler-decorated), so
+    # this is where the bus-handler-shape adaptation happens. The mixin
+    # class isn't inherited directly (see `catalog_skills` property);
+    # these wrappers call into it instead.
+
+    @handler("catalog_query")
+    async def handle_catalog_query(self, args):
+        return self.catalog_skills.catalog_query(
+            args.get("project", ""),
+            filters=args.get("filters") or None,
+            jmespath_expr=args.get("jmespath_expr") or None,
+            fields=args.get("fields") or None,
+            limit=_int_arg(args, "limit", default=100),
+            scope=args.get("scope") or "project",
+        )
+
+    @handler("catalog_search")
+    async def handle_catalog_search(self, args):
+        return self.catalog_skills.catalog_search(
+            args.get("project", ""),
+            args.get("query_text") or None,
+            limit=_int_arg(args, "limit", default=20),
+            query_vector=args.get("query_vector") or None,
+        )
+
+    @handler("catalog_stats")
+    async def handle_catalog_stats(self, args):
+        return self.catalog_skills.catalog_stats(project=args.get("project") or None)
+
+    @handler("list_since")
+    async def handle_list_since(self, args):
+        return self.catalog_skills.list_since(
+            args.get("project", ""),
+            _float_arg(args, "since_ts", default=0.0),
+            limit=_int_arg(args, "limit", default=100),
+        )
 
 
 # ---------------------------------------------------------------------------
