@@ -128,8 +128,8 @@ def test_list_specs_prunes_stale_linked_spec_when_fr_reference_retargeted(pipeli
     retargeted from FR A to FR B must have its rescan prune the now-
     stale entry off FR A — otherwise the same spec looks linked from
     two FRs forever even though only one **FR:** line exists."""
-    fr_a = pipeline.frs.promote(target="proj", title="Stale A", description="d")
-    fr_b = pipeline.frs.promote(target="proj", title="Stale B", description="d")
+    fr_a = pipeline.frs.promote(target="developer", title="Stale A", description="d")
+    fr_b = pipeline.frs.promote(target="developer", title="Stale B", description="d")
     reader, specs_dir = _spec_reader_over(tmp_path, pipeline.frs)
     spec_path = specs_dir / "spec.md"
     spec_path.write_text(f"# MS-01\n\n**FR:** `{fr_a.id}`\n")
@@ -148,8 +148,56 @@ def test_list_specs_prunes_stale_linked_spec_when_fr_reference_retargeted(pipeli
     ]
 
 
+def test_list_specs_does_not_flag_redirected_spec_as_stale(pipeline, tmp_path):
+    """Codex R6 on PR #93: add_linked_spec writes through
+    follow_redirect=True, so a spec naming a since-merged-away FR id
+    lands on the TERMINAL fr. Reconciliation must compare against that
+    same terminal id (not the raw scanned id) or it would immediately
+    prune the link it just wrote, on every single rescan."""
+    source = pipeline.frs.promote(target="developer", title="Redirect source", description="d")
+    other = pipeline.frs.promote(target="developer", title="Redirect other", description="d")
+    terminal = pipeline.frs.merge(
+        source_ids=[source.id, other.id], title="Redirect target", description="d",
+    )
+    reader, specs_dir = _spec_reader_over(tmp_path, pipeline.frs)
+    spec_path = specs_dir / "spec.md"
+    spec_path.write_text(f"# MS-01\n\n**FR:** `{source.id}`\n")
+
+    reader.list_specs("proj")
+    reader.list_specs("proj")  # second rescan must not undo the first
+
+    assert pipeline.frs.get(terminal.id).linked_specs == [
+        {
+            "project": "proj", "path": str(spec_path), "section": "MS-01",
+            "redirected_from": source.id,
+        },
+    ]
+
+
+def test_list_specs_prunes_stale_entry_on_section_rename_same_path(pipeline, tmp_path):
+    """Codex R6 on PR #93: the same file, same FR, but a changed
+    heading/title must replace the old {path, section} entry, not
+    accumulate a second one alongside it."""
+    fr = pipeline.frs.promote(target="developer", title="Section rename test", description="d")
+    reader, specs_dir = _spec_reader_over(tmp_path, pipeline.frs)
+    spec_path = specs_dir / "spec.md"
+    spec_path.write_text(f"# Old Title\n\n**FR:** `{fr.id}`\n")
+
+    reader.list_specs("proj")
+    assert pipeline.frs.get(fr.id).linked_specs == [
+        {"project": "proj", "path": str(spec_path), "section": "Old Title"},
+    ]
+
+    spec_path.write_text(f"# New Title\n\n**FR:** `{fr.id}`\n")
+    reader.list_specs("proj")
+
+    assert pipeline.frs.get(fr.id).linked_specs == [
+        {"project": "proj", "path": str(spec_path), "section": "New Title"},
+    ]
+
+
 def test_list_specs_prunes_stale_linked_spec_when_file_deleted(pipeline, tmp_path):
-    fr = pipeline.frs.promote(target="proj", title="Deleted spec test", description="d")
+    fr = pipeline.frs.promote(target="developer", title="Deleted spec test", description="d")
     reader, specs_dir = _spec_reader_over(tmp_path, pipeline.frs)
     spec_path = specs_dir / "spec.md"
     spec_path.write_text(f"# MS-01\n\n**FR:** `{fr.id}`\n")

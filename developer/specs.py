@@ -227,14 +227,28 @@ class SpecReader:
         with a resolvable ``**FR:**`` id, mirrors ``{project, path,
         section=title}`` onto that FR's terminal ``linked_specs`` via
         ``FRStore.add_linked_spec``, then reconciles: any
-        ``linked_specs`` entry recorded for THIS project whose path no
-        longer maps back to that FR (the spec was retargeted to a
-        different FR, its section changed, or the file moved/was
-        deleted) is removed via ``FRStore.remove_linked_specs`` — the
-        add step alone is append-only and would otherwise leave stale
-        cross-links forever (Codex R5 on PR #93). Only runs when this
-        reader was constructed with an ``fr_store``; a failure for one
-        spec/FR is logged and does not stop the scan or fail the call.
+        ``linked_specs`` entry recorded for THIS project whose
+        ``(path, section)`` no longer maps back to that FR (the spec
+        was retargeted to a different FR, its section/title changed,
+        or the file moved/was deleted) is removed via
+        ``FRStore.remove_linked_specs`` — the add step alone is
+        append-only and would otherwise leave stale cross-links
+        forever (Codex R5/R6 on PR #93).
+
+        Reconciliation scans every FR in the store (not filtered by
+        ``target``, which is a DIFFERENT dimension from this
+        ``project`` slug and cannot be assumed to match it — Codex R6
+        finding) and matches purely on the ``project`` field each
+        ``linked_specs`` entry already carries; comparisons resolve
+        each scanned spec's raw ``**FR:**`` id through
+        ``FRStore.resolve_id`` first, since ``add_linked_spec`` writes
+        through ``follow_redirect=True`` and a naive raw-id comparison
+        would flag every redirected spec as stale on the very call
+        that just wrote it.
+
+        Only runs when this reader was constructed with an
+        ``fr_store``; a failure for one spec/FR is logged and does not
+        stop the scan or fail the call.
         """
         proj = self._projects.get(project)
         if proj is None:
@@ -245,28 +259,36 @@ class SpecReader:
         paths = self._reader.glob_docs(str(root), pattern="**/spec.md")
         summaries = [self.summarize(p) for p in paths]
         if self._fr_store is not None:
-            # Authoritative path -> current fr id, from THIS scan.
-            path_to_fr: dict[str, str] = {s.path: s.fr for s in summaries if s.fr}
-            for summary in summaries:
-                if not summary.fr:
+            # Authoritative path -> (terminal fr id, current section),
+            # from THIS scan. Resolve through redirects so a spec still
+            # naming a merged-away id compares against the SAME
+            # terminal add_linked_spec actually wrote to.
+            path_to_current: dict[str, tuple[str, str]] = {}
+            for s in summaries:
+                if not s.fr:
                     continue
                 try:
-                    self._fr_store.add_linked_spec(summary.fr, {
+                    terminal_id = self._fr_store.resolve_id(s.fr)
+                except Exception:
+                    terminal_id = s.fr
+                path_to_current[s.path] = (terminal_id, s.title)
+                try:
+                    self._fr_store.add_linked_spec(s.fr, {
                         "project": project,
-                        "path": summary.path,
-                        "section": summary.title,
+                        "path": s.path,
+                        "section": s.title,
                     })
                 except Exception:
                     logger.warning(
                         "linked_specs mirror failed for fr %s <- spec %s",
-                        summary.fr, summary.path, exc_info=True,
+                        s.fr, s.path, exc_info=True,
                     )
             try:
-                for fr in self._fr_store.list(target=project, include_all=True):
+                for fr in self._fr_store.list(include_all=True):
                     stale = [
                         sp for sp in fr.linked_specs
                         if sp.get("project") == project
-                        and path_to_fr.get(sp.get("path")) != fr.id
+                        and path_to_current.get(sp.get("path")) != (fr.id, sp.get("section"))
                     ]
                     if stale:
                         self._fr_store.remove_linked_specs(fr.id, stale)
