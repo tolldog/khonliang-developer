@@ -4166,6 +4166,76 @@ async def test_sync_fr_status_on_merge_links_pr_to_terminal_fr_after_redirect(ha
     assert source_after.linked_prs == []
 
 
+# -- milestone <-> FR mirror wiring at the bus-handler layer -------------
+# (Codex review on PR #93: the fr_store hook existed on the store methods
+# but the actual agent call sites never passed it through, so real MCP
+# traffic never populated linked_milestones at all.)
+
+
+@pytest.mark.asyncio
+async def test_propose_milestone_from_work_unit_handler_mirrors_linked_milestones(harness):
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Handler mirror test", description="d",
+    )
+    work_unit = json.dumps({
+        "name": "wu", "targets": ["developer"],
+        "frs": [{"fr_id": fr.id, "description": "x", "priority": "high"}],
+    })
+
+    result = await harness.call("propose_milestone_from_work_unit", {"work_unit": work_unit})
+
+    updated_fr = harness.agent.pipeline.frs.get(fr.id)
+    assert updated_fr.linked_milestones == [result["milestone"]["id"]]
+
+
+@pytest.mark.asyncio
+async def test_update_milestone_frs_handler_mirrors_linked_milestones(harness):
+    fr_a = harness.agent.pipeline.frs.promote(
+        target="developer", title="Update handler mirror A", description="d",
+    )
+    fr_b = harness.agent.pipeline.frs.promote(
+        target="developer", title="Update handler mirror B", description="d",
+    )
+    work_unit = json.dumps({
+        "name": "wu", "targets": ["developer"],
+        "frs": [{"fr_id": fr_a.id, "description": "x", "priority": "high"}],
+    })
+    proposed = await harness.call("propose_milestone_from_work_unit", {"work_unit": work_unit})
+    ms_id = proposed["milestone"]["id"]
+
+    await harness.call("update_milestone_frs", {
+        "milestone_id": ms_id, "add_fr_ids": fr_b.id,
+    })
+
+    assert harness.agent.pipeline.frs.get(fr_b.id).linked_milestones == [ms_id]
+
+
+@pytest.mark.asyncio
+async def test_milestone_linked_prs_backfilled_from_pre_existing_fr_linked_pr(harness):
+    """A PR already linked to an FR before it's bundled into a milestone
+    must show up in the milestone's linked_prs immediately, not only
+    after some later, unrelated PR merges (Codex review on PR #93)."""
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Backfill test", description="d",
+    )
+    harness.agent.pipeline.frs.add_linked_pr(fr.id, {
+        "repo": "tolldog/khonliang-developer", "number": 55,
+        "state": "merged", "merged_at": 1.0,
+    })
+    work_unit = json.dumps({
+        "name": "wu", "targets": ["developer"],
+        "frs": [{"fr_id": fr.id, "description": "x", "priority": "high"}],
+    })
+
+    result = await harness.call("propose_milestone_from_work_unit", {"work_unit": work_unit})
+
+    ms = harness.agent.pipeline.milestones.get(result["milestone"]["id"])
+    assert ms.linked_prs == [{
+        "repo": "tolldog/khonliang-developer", "number": 55,
+        "state": "merged", "merged_at": 1.0,
+    }]
+
+
 # -- audit_link_integrity / repair_link_integrity (fr_developer_cfe3001c) --
 
 

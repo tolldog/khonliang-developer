@@ -2853,6 +2853,7 @@ class DeveloperAgent(BaseAgent):
                 summary=args.get("summary", ""),
                 source=source,
                 project=project,
+                fr_store=self.pipeline.frs,
             )
         except (MilestoneError, ValueError, TypeError) as e:
             await self.report_gap("propose_milestone_from_work_unit", str(e))
@@ -3004,6 +3005,7 @@ class DeveloperAgent(BaseAgent):
                 add_fr_ids=add_fr_ids,
                 remove_fr_ids=remove_fr_ids,
                 notes=args.get("notes", ""),
+                fr_store=self.pipeline.frs,
             )
         except MilestoneError as e:
             await self._safe_report_gap("update_milestone_frs", str(e))
@@ -3172,6 +3174,7 @@ class DeveloperAgent(BaseAgent):
                     summary=args.get("summary", ""),
                     source=source,
                     project=handoff_project,
+                    fr_store=self.pipeline.frs,
                 )
 
             review = self.pipeline.milestones.review_scope(

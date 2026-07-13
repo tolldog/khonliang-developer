@@ -449,14 +449,25 @@ class MilestoneStore:
         self, fr_store: Any, milestone_id: str, fr_ids: Iterable[str],
     ) -> None:
         """Best-effort: mirror ``milestone_id`` onto each fr's terminal
-        ``linked_milestones`` (fr_developer_cfe3001c).
+        ``linked_milestones``, and backfill any of that fr's EXISTING
+        ``linked_prs`` onto this milestone (fr_developer_cfe3001c,
+        Codex review on PR #93).
+
+        The backfill matters because ``linked_prs`` is advertised as
+        "union of PRs touching any bundled FR" — without it, an FR
+        bundled into a milestone AFTER a PR already merged (or after
+        ``repair_link_integrity`` moved links onto its terminal FR)
+        would leave the milestone's union stale until some later,
+        unrelated PR merge happened to trigger a mirror.
 
         Never raises — a reverse-link failure must not fail the
         milestone mutation that's already landed.
         """
         for fr_id in fr_ids:
             try:
-                fr_store.add_linked_milestone(fr_id, milestone_id)
+                fr = fr_store.add_linked_milestone(fr_id, milestone_id)
+                for pr in fr.linked_prs:
+                    self.add_linked_pr(milestone_id, pr)
             except Exception:
                 logger.warning(
                     "linked_milestones mirror failed for fr %s <- milestone %s",
