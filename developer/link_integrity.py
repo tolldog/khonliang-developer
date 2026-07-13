@@ -140,19 +140,17 @@ def repair_link_integrity(
             if stale is None:
                 skipped.append({**mismatch, "reason": "stale fr no longer exists"})
                 continue
-            # Don't replay a PR the terminal FR already tracks (Codex
-            # R7 on PR #93): the terminal may have received a NEWER
-            # sync (e.g. merged_at/state updated) since the stale entry
-            # was written on the source — blindly re-adding the stale
-            # copy would downgrade the terminal's already-current data.
-            terminal_before = frs.get(terminal_id, follow_redirect=False)
-            existing_pr_keys = {
-                (p.get("repo"), p.get("number"))
-                for p in (terminal_before.linked_prs if terminal_before else [])
-            }
+            # Replay every stale PR through add_linked_pr unconditionally
+            # (Codex R10 on PR #93 — supersedes the R7 fix, which
+            # pre-filtered out any PR the terminal already had a
+            # {repo, number} entry for). That pre-filter was itself a
+            # downgrade bug: add_linked_pr now compares completeness
+            # (Codex R9) and safely no-ops on an already-current
+            # terminal entry OR upgrades it when the stale copy is
+            # actually the more complete one — skipping it here instead
+            # threw away real upgrades, the exact legacy-drift case
+            # repair exists to fix.
             for pr in stale.linked_prs:
-                if (pr.get("repo"), pr.get("number")) in existing_pr_keys:
-                    continue
                 frs.add_linked_pr(terminal_id, pr)
             for spec in stale.linked_specs:
                 frs.add_linked_spec(terminal_id, spec)

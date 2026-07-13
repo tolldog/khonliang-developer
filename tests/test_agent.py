@@ -4695,6 +4695,61 @@ async def test_repair_link_integrity_does_not_repopulate_historical_milestone(ha
     assert harness.agent.pipeline.milestones.get(ms.id).linked_prs == []
 
 
+@pytest.mark.asyncio
+async def test_repair_link_integrity_upgrades_terminal_with_more_complete_stale_data(harness):
+    """Codex R10 on PR #93: supersedes the R7 fix, which pre-filtered
+    out any stale PR whose {repo, number} already existed on the
+    terminal — that was itself a downgrade bug, since a stale record
+    can be MORE complete than the terminal's (e.g. terminal still has
+    a pre-merge open/None entry, the merged-away source has the
+    accurate merged/merged_at one). Repair must let add_linked_pr's
+    own completeness comparison decide, not skip the replay outright.
+    """
+    import time as _time
+
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+
+    target_fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Upgrade target", description="d",
+    )
+    # Terminal has an incomplete entry (recorded before the real merge synced).
+    harness.agent.pipeline.frs.add_linked_pr(target_fr.id, {
+        "repo": "r", "number": 1, "state": "open", "merged_at": None,
+    })
+    now = _time.time()
+    entry = KnowledgeEntry(
+        id="fr_developer_upgradesrc",
+        tier=Tier.DERIVED,
+        title="upgrade source",
+        content="d",
+        source="test",
+        scope="development",
+        tags=["fr", "target:developer", "app"],
+        status=EntryStatus.DISTILLED,
+        metadata={
+            "fr_status": "merged",
+            "priority": "medium",
+            "target": "developer",
+            "classification": "app",
+            "merged_into": target_fr.id,
+            # More complete than the terminal's current entry.
+            "linked_prs": [
+                {"repo": "r", "number": 1, "state": "merged", "merged_at": "2026-05-01T00:00:00Z"},
+            ],
+        },
+        created_at=now,
+        updated_at=now,
+    )
+    harness.agent.pipeline.frs.knowledge.add(entry)
+
+    await harness.call("repair_link_integrity", {"project": "khonliang", "dry_run": False})
+
+    terminal_after = harness.agent.pipeline.frs.get(target_fr.id, follow_redirect=False)
+    assert terminal_after.linked_prs == [
+        {"repo": "r", "number": 1, "state": "merged", "merged_at": "2026-05-01T00:00:00Z"},
+    ]
+
+
 # -- dev-repo registry (fr_developer_5f3dc62e) --------------------------
 
 
