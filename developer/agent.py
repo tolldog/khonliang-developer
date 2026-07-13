@@ -4615,8 +4615,11 @@ class DeveloperAgent(BaseAgent):
         unreachable / errors — persistence is secondary to the test run
         itself, so a store failure must never fail run_tests. Uses a
         short explicit timeout (not the bus client's 30s default) so a
-        down/slow store degrades run_tests's return time by seconds,
-        not tens of seconds (Codex review on PR #92).
+        down/slow store degrades run_tests's return time by a few
+        seconds, not tens of seconds. ``BaseAgent.request`` adds a fixed
+        5s read slack on top of whatever ``timeout`` it's given (Codex
+        round 2 on PR #92), so passing 2.0 here bounds the actual worst
+        case at ~7s, not the naively-expected 5s.
         """
         from developer.git_client import GitClient, GitClientError
 
@@ -4647,7 +4650,7 @@ class DeveloperAgent(BaseAgent):
                         "exceeds_read_cap": len(raw) > _STORE_READ_CAP_CHARS,
                     },
                 },
-                timeout=5.0,
+                timeout=2.0,
             )
         except Exception as exc:  # bus unreachable / transport error
             logger.warning(

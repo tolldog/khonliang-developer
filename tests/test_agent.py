@@ -4572,8 +4572,10 @@ async def test_run_tests_persists_pytest_output_as_store_artifact(harness, monke
     assert "digest" in result
     # Codex review on PR #92: bound with a short explicit timeout, not
     # the bus client's 30s default, so a down/slow store can't stall
-    # run_tests's return.
-    assert captured["timeout"] == 5.0
+    # run_tests's return. 2.0 (not 5.0) because BaseAgent.request adds
+    # a fixed 5s read slack on top — round 2 finding: 5.0 here would
+    # actually allow ~10s, not the intended ~5s worst case.
+    assert captured["timeout"] == 2.0
 
 
 @pytest.mark.asyncio
