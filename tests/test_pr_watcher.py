@@ -62,6 +62,7 @@ def _make_snapshot(
     pr_number: int = 1,
     head_sha: str = "sha1",
     title: str = "",
+    body: str = "",
     reviews: list[dict] | None = None,
     merged: bool = False,
     merged_at: str = "",
@@ -74,6 +75,7 @@ def _make_snapshot(
         pr_number=pr_number,
         head_sha=head_sha,
         title=title,
+        body=body,
         reviews=list(reviews or []),
         merged=merged,
         merged_at=merged_at,
@@ -303,7 +305,7 @@ async def test_merged_carries_title_and_fires_on_merged_hook_once(store):
     published: list[tuple[str, dict]] = []
     calls: list[tuple[str, int, str]] = []
 
-    async def on_merged(repo: str, pr_number: int, title: str) -> None:
+    async def on_merged(repo: str, pr_number: int, title: str, body: str = "") -> None:
         calls.append((repo, pr_number, title))
 
     watcher = _make_watcher(store, gh, published, on_merged=on_merged)
@@ -325,6 +327,78 @@ async def test_merged_carries_title_and_fires_on_merged_hook_once(store):
     assert calls == [("owner/repo", 1, "fix(agent): thing (fr_developer_deadbeef)")]
 
 
+async def test_on_merged_hook_receives_pr_body(store):
+    """fr_developer_cfe3001c: on_merged is called with the snapshot's
+    body so reverse-link population can scan it for FR ids too."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    received: dict = {}
+
+    async def on_merged(repo: str, pr_number: int, title: str, body: str = "") -> None:
+        received["body"] = body
+
+    watcher = _make_watcher(store, gh, published, on_merged=on_merged)
+
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(
+        head_sha="final", title="fix: thing", body="Closes fr_developer_deadbeef",
+        state="closed", merged=True, merged_at="2026-04-21T12:00:00Z",
+        mergeable=True, merge_state="clean",
+    )
+    await watcher.poll_once()
+
+    assert received["body"] == "Closes fr_developer_deadbeef"
+
+
+async def test_on_merged_hook_receives_merged_at(store):
+    """Codex R7 on PR #93: on_merged is called with the snapshot's real
+    merged_at so reverse links record GitHub's actual merge time, not
+    just whenever this hook happened to run."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    received: dict = {}
+
+    async def on_merged(
+        repo: str, pr_number: int, title: str, body: str = "", merged_at: str = "",
+    ) -> None:
+        received["merged_at"] = merged_at
+
+    watcher = _make_watcher(store, gh, published, on_merged=on_merged)
+
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(
+        head_sha="final", title="fix: thing",
+        state="closed", merged=True, merged_at="2026-04-21T12:00:00Z",
+        mergeable=True, merge_state="clean",
+    )
+    await watcher.poll_once()
+
+    assert received["merged_at"] == "2026-04-21T12:00:00Z"
+
+
+async def test_on_merged_hook_backward_compatible_with_bare_3_arg_signature(store):
+    """Codex R3 on PR #93: a pre-existing on_merged implementation with
+    the ORIGINAL bare (repo, pr_number, title) signature — no body
+    param at all — must still be called successfully, not TypeError.
+    A TypeError here would leave the merge un-synced and retried
+    forever every poll cycle."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    calls: list[tuple] = []
+
+    async def legacy_on_merged(repo: str, pr_number: int, title: str) -> None:
+        calls.append((repo, pr_number, title))
+
+    watcher = _make_watcher(store, gh, published, on_merged=legacy_on_merged)
+
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(
+        head_sha="final", title="fix: thing", body="some body",
+        state="closed", merged=True, merged_at="2026-04-21T12:00:00Z",
+        mergeable=True, merge_state="clean",
+    )
+    await watcher.poll_once()
+
+    assert calls == [("owner/repo", 1, "fix: thing")]
+
+
 async def test_on_merged_hook_failure_does_not_break_poll(store):
     """A raising on_merged hook must not crash the poll cycle or prevent
     the TOPIC_MERGED publish from having already landed.
@@ -332,7 +406,7 @@ async def test_on_merged_hook_failure_does_not_break_poll(store):
     gh = _FakeGithub()
     published: list[tuple[str, dict]] = []
 
-    async def on_merged(repo: str, pr_number: int, title: str) -> None:
+    async def on_merged(repo: str, pr_number: int, title: str, body: str = "") -> None:
         raise RuntimeError("boom")
 
     watcher = _make_watcher(store, gh, published, on_merged=on_merged)
@@ -359,7 +433,7 @@ async def test_merged_fires_even_when_merged_at_is_empty(store):
     published: list[tuple[str, dict]] = []
     calls: list[tuple[str, int, str]] = []
 
-    async def on_merged(repo: str, pr_number: int, title: str) -> None:
+    async def on_merged(repo: str, pr_number: int, title: str, body: str = "") -> None:
         calls.append((repo, pr_number, title))
 
     watcher = _make_watcher(store, gh, published, on_merged=on_merged)
@@ -388,7 +462,7 @@ async def test_merged_does_not_refire_when_merged_at_appears_later(store):
     published: list[tuple[str, dict]] = []
     calls: list[tuple[str, int, str]] = []
 
-    async def on_merged(repo: str, pr_number: int, title: str) -> None:
+    async def on_merged(repo: str, pr_number: int, title: str, body: str = "") -> None:
         calls.append((repo, pr_number, title))
 
     watcher = _make_watcher(store, gh, published, on_merged=on_merged)
@@ -1950,7 +2024,7 @@ async def test_all_open_mode_fires_merged_for_pr_that_leaves_open_set(store):
     published: list[tuple[str, dict]] = []
     calls: list[tuple[str, int, str]] = []
 
-    async def on_merged(repo: str, pr_number: int, title: str) -> None:
+    async def on_merged(repo: str, pr_number: int, title: str, body: str = "") -> None:
         calls.append((repo, pr_number, title))
 
     async def publish(topic: str, payload: dict) -> None:
@@ -2199,7 +2273,7 @@ async def test_disappeared_pr_tracking_survives_a_process_restart(store):
     # store and watcher_id, constructed exactly like rehydrate() would.
     calls: list[tuple[str, int, str]] = []
 
-    async def on_merged(repo: str, pr_number: int, title: str) -> None:
+    async def on_merged(repo: str, pr_number: int, title: str, body: str = "") -> None:
         calls.append((repo, pr_number, title))
 
     watcher_b = PRFleetWatcher(
@@ -2230,7 +2304,7 @@ async def test_failed_on_merged_does_not_orphan_all_open_mode_retry(store):
     calls: list[tuple[str, int, str]] = []
     should_fail = [True]
 
-    async def on_merged(repo: str, pr_number: int, title: str) -> None:
+    async def on_merged(repo: str, pr_number: int, title: str, body: str = "") -> None:
         calls.append((repo, pr_number, title))
         if should_fail[0]:
             raise RuntimeError("simulated failure")
@@ -2289,7 +2363,7 @@ async def test_on_merged_retries_after_a_failure_then_stops_once_synced(store):
     calls: list[tuple[str, int, str]] = []
     should_fail = [True]
 
-    async def on_merged(repo: str, pr_number: int, title: str) -> None:
+    async def on_merged(repo: str, pr_number: int, title: str, body: str = "") -> None:
         calls.append((repo, pr_number, title))
         if should_fail[0]:
             raise RuntimeError("simulated crash mid on_merged")
@@ -2966,6 +3040,33 @@ async def test_pr_fleet_digest_review_body_roundtrips_through_snapshot_builder()
         "body": "Summary body here.",
         "submitted_at": "2026-04-22T10:00:00Z",
     }]
+
+
+async def test_snapshot_from_github_projects_pr_body(store):
+    """fr_developer_cfe3001c: the PR's own body (not just its reviews'
+    bodies) is projected onto the snapshot so on_merged's FR-id scan can
+    cover body references, not just the title."""
+    from developer.pr_watcher import _snapshot_from_github
+
+    class _StubGH:
+        async def get_pr(self, repo, pr_number):
+            return {
+                "head_sha": "abc", "state": "open", "mergeable": True,
+                "mergeable_state": "clean", "title": "fix: thing",
+                "body": "Closes fr_developer_deadbeef",
+            }
+
+        async def list_pr_reviews(self, repo, pr_number):
+            return []
+
+        async def list_pr_issue_comments(self, repo, pr_number):
+            return []
+
+        async def list_pr_review_comments(self, repo, pr_number):
+            return []
+
+    snap = await _snapshot_from_github(_StubGH(), "owner/repo", 1)
+    assert snap.body == "Closes fr_developer_deadbeef"
 
 
 # ---------------------------------------------------------------------------

@@ -35,6 +35,7 @@ stopped (or a fatal infrastructure failure) ends the task.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import re
 import sqlite3
@@ -634,6 +635,7 @@ class PRSnapshot:
     pr_number: int
     head_sha: str
     title: str = ""
+    body: str = ""  # PR description text; fr_developer_cfe3001c FR-id scan
     state: str = "open"           # open | closed
     merged: bool = False
     merged_at: str = ""
@@ -704,8 +706,50 @@ ListOpenPRsFn = Callable[[str], Awaitable[list[int]]]
 # and this hook completing always retries on the next successful
 # fetch, in either watch mode — see poll_once for the full reasoning.
 # (repo, pr_number, title) -> None. Optional — None disables FR-status
-# auto-sync entirely (fr_developer_c7d5f22b).
+# auto-sync entirely (fr_developer_c7d5f22b). Callers may additionally
+# accept an optional keyword-only ``body`` (fr_developer_cfe3001c
+# reverse-link population scans title + body for FR ids) — Callable
+# typing isn't checked for arity at runtime, so this stays a 3-arg
+# type hint for the common case while real implementations may accept
+# the extra keyword. See :func:`_invoke_on_merged` for the compat shim
+# that makes calling with ``body`` safe for BOTH shapes.
 OnMergedFn = Callable[[str, int, str], Awaitable[None]]
+
+
+async def _invoke_on_merged(
+    on_merged: OnMergedFn, repo: str, pr_number: int, title: str,
+    body: str, merged_at: str = "",
+) -> None:
+    """Call ``on_merged`` with ``body``/``merged_at`` only if it accepts
+    them.
+
+    fr_developer_cfe3001c added optional ``body``/``merged_at`` kwargs
+    for reverse-link population (FR-id scanning and accurate PR merge
+    chronology respectively), but ``OnMergedFn``'s public contract has
+    always been the bare 3-arg ``(repo, pr_number, title)`` shape.
+    Calling every implementation with those kwargs unconditionally
+    would raise ``TypeError`` on any pre-existing 3-arg-only callback —
+    in the watcher path that means the merge is never marked synced and
+    retries forever (Codex R3 on PR #93). Inspecting the signature once
+    per call keeps every shape working without requiring every
+    implementer to add the new parameters.
+    """
+    try:
+        params = inspect.signature(on_merged).parameters
+        accepts_kwargs = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        extra: dict[str, str] = {}
+        if "body" in params or accepts_kwargs:
+            extra["body"] = body
+        if "merged_at" in params or accepts_kwargs:
+            extra["merged_at"] = merged_at
+    except (TypeError, ValueError):
+        # Signature introspection can fail for some callables (e.g. certain
+        # C-extension or functools.partial-wrapped objects) — fall back to
+        # the documented 3-arg shape rather than risk a spurious TypeError.
+        extra = {}
+    await on_merged(repo, pr_number, title, **extra)
 
 
 @dataclass
@@ -1098,7 +1142,10 @@ class PRFleetWatcher:
                         watcher_id, repo, pr_number, snapshot.title,
                     )
                     try:
-                        await self._on_merged(repo, pr_number, snapshot.title)
+                        await _invoke_on_merged(
+                            self._on_merged, repo, pr_number,
+                            snapshot.title, snapshot.body, snapshot.merged_at,
+                        )
                     except asyncio.CancelledError:
                         raise
                     except Exception:
@@ -1961,6 +2008,7 @@ async def _snapshot_from_github(
         pr_number=pr_number,
         head_sha=str(pr.get("head_sha") or ""),
         title=str(pr.get("title") or ""),
+        body=str(pr.get("body") or ""),
         state=str(pr.get("state") or "open"),
         merged=merged,
         merged_at=merged_at,

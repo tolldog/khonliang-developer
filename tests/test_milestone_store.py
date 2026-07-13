@@ -1363,3 +1363,160 @@ def test_propose_slugifies_target_in_milestone_id(pipeline):
 def test_propose_rejects_target_with_no_id_safe_chars(pipeline):
     with pytest.raises(MilestoneError, match="id-safe"):
         pipeline.milestones.propose_from_work_unit(_work_unit(), target="!!!")
+
+
+# ---------------------------------------------------------------------------
+# Reverse links (fr_developer_cfe3001c)
+# ---------------------------------------------------------------------------
+
+
+def _wu_for(*fr_ids):
+    return {
+        "name": "wu",
+        "rank": 1,
+        "targets": ["developer"],
+        "frs": [{"fr_id": fid, "target": "developer", "title": fid} for fid in fr_ids],
+    }
+
+
+def test_propose_from_work_unit_mirrors_linked_milestone_when_fr_store_given(pipeline):
+    fr_a = pipeline.frs.promote(target="developer", title="A", description="d")
+    fr_b = pipeline.frs.promote(target="developer", title="B", description="d")
+
+    ms = pipeline.milestones.propose_from_work_unit(
+        _wu_for(fr_a.id, fr_b.id), fr_store=pipeline.frs,
+    )
+
+    assert pipeline.frs.get(fr_a.id).linked_milestones == [ms.id]
+    assert pipeline.frs.get(fr_b.id).linked_milestones == [ms.id]
+
+
+def test_propose_from_work_unit_without_fr_store_does_not_mirror(pipeline):
+    fr_a = pipeline.frs.promote(target="developer", title="C", description="d")
+    pipeline.milestones.propose_from_work_unit(_wu_for(fr_a.id))
+    assert pipeline.frs.get(fr_a.id).linked_milestones == []
+
+
+def test_propose_from_work_unit_mirror_is_best_effort_on_unresolvable_fr(pipeline):
+    """An fr_id that doesn't exist in the FR store must not raise —
+    the milestone write already landed and mirroring is secondary."""
+    ms = pipeline.milestones.propose_from_work_unit(
+        _wu_for("fr_developer_deadbeef"), fr_store=pipeline.frs,
+    )
+    assert ms.fr_ids == ["fr_developer_deadbeef"]
+
+
+def test_update_frs_mirrors_newly_added_fr_ids_only(pipeline):
+    fr_a = pipeline.frs.promote(target="developer", title="D", description="d")
+    fr_b = pipeline.frs.promote(target="developer", title="E", description="d")
+    ms = pipeline.milestones.propose_from_work_unit(_wu_for(fr_a.id), fr_store=pipeline.frs)
+
+    pipeline.milestones.update_frs(ms.id, add_fr_ids=[fr_b.id], fr_store=pipeline.frs)
+
+    assert pipeline.frs.get(fr_a.id).linked_milestones == [ms.id]
+    assert pipeline.frs.get(fr_b.id).linked_milestones == [ms.id]
+
+
+def test_update_frs_does_not_unmirror_removed_fr_ids(pipeline):
+    """fr_ids stays historically accurate — removing an FR from the bundle
+    does not strip the milestone from that FR's linked_milestones."""
+    fr_a = pipeline.frs.promote(target="developer", title="F", description="d")
+    ms = pipeline.milestones.propose_from_work_unit(_wu_for(fr_a.id), fr_store=pipeline.frs)
+
+    pipeline.milestones.update_frs(ms.id, remove_fr_ids=[fr_a.id], fr_store=pipeline.frs)
+
+    assert pipeline.frs.get(fr_a.id).linked_milestones == [ms.id]
+
+
+def test_milestone_add_linked_pr_appends_and_dedupes(pipeline):
+    fr_a = pipeline.frs.promote(target="developer", title="G", description="d")
+    ms = pipeline.milestones.propose_from_work_unit(_wu_for(fr_a.id))
+
+    pipeline.milestones.add_linked_pr(ms.id, {
+        "repo": "tolldog/khonliang-developer", "number": 5, "state": "open", "merged_at": None,
+    })
+    updated = pipeline.milestones.add_linked_pr(ms.id, {
+        "repo": "tolldog/khonliang-developer", "number": 5, "state": "merged", "merged_at": 1.0,
+    })
+
+    assert len(updated.linked_prs) == 1
+    assert updated.linked_prs[0]["state"] == "merged"
+
+
+def test_milestone_add_linked_pr_unknown_milestone_raises(pipeline):
+    with pytest.raises(MilestoneError):
+        pipeline.milestones.add_linked_pr("ms_developer_deadbeef", {"repo": "r", "number": 1})
+
+
+def test_milestone_add_linked_pr_does_not_downgrade_a_more_complete_entry(pipeline):
+    """Codex R11 on PR #93: an out-of-order or stale replay must not
+    regress an already-merged milestone PR entry back to open/unknown
+    merged_at."""
+    fr_a = pipeline.frs.promote(target="developer", title="G2", description="d")
+    ms = pipeline.milestones.propose_from_work_unit(_wu_for(fr_a.id))
+
+    pipeline.milestones.add_linked_pr(ms.id, {
+        "repo": "r", "number": 9, "state": "merged", "merged_at": "2026-05-01T00:00:00Z",
+    })
+    updated = pipeline.milestones.add_linked_pr(ms.id, {
+        "repo": "r", "number": 9, "state": "open", "merged_at": None,
+    })
+
+    assert len(updated.linked_prs) == 1
+    assert updated.linked_prs[0]["state"] == "merged"
+    assert updated.linked_prs[0]["merged_at"] == "2026-05-01T00:00:00Z"
+
+
+def test_sync_linked_prs_prefers_more_complete_duplicate_across_bundled_frs(pipeline):
+    """Codex R9 on PR #93: two FRs in the same milestone can carry
+    different copies of the SAME PR (e.g. one still has a pre-merge/
+    missing-merged_at entry). The union must keep the more complete
+    copy regardless of fr_ids iteration order, not whichever FR
+    happens to be visited last."""
+    stale_fr = pipeline.frs.promote(target="developer", title="Sync dup stale", description="d")
+    complete_fr = pipeline.frs.promote(target="developer", title="Sync dup complete", description="d")
+    pipeline.frs.add_linked_pr(
+        stale_fr.id, {"repo": "r", "number": 1, "state": "open", "merged_at": None},
+    )
+    pipeline.frs.add_linked_pr(
+        complete_fr.id,
+        {"repo": "r", "number": 1, "state": "merged", "merged_at": "2026-05-01T00:00:00Z"},
+    )
+    ms = pipeline.milestones.propose_from_work_unit(
+        _wu_for(stale_fr.id, complete_fr.id), fr_store=pipeline.frs,
+    )
+
+    assert pipeline.milestones.get(ms.id).linked_prs == [
+        {"repo": "r", "number": 1, "state": "merged", "merged_at": "2026-05-01T00:00:00Z"},
+    ]
+
+
+def test_repropose_preserves_linked_prs_without_fr_store(pipeline):
+    """Codex R5 on PR #93: re-proposing an existing milestone rebuilds
+    a fresh Milestone object. Without this preservation, a caller that
+    re-proposes without an fr_store (so _sync_linked_prs_from_bundle
+    never runs to refill it) would silently wipe previously recorded
+    PR links."""
+    fr = pipeline.frs.promote(target="developer", title="Repropose test", description="d")
+
+    def _wu(fid):
+        return {
+            "name": "wu", "rank": 1, "targets": ["developer"],
+            "frs": [{"fr_id": fid, "target": "developer", "title": fid}],
+        }
+
+    ms = pipeline.milestones.propose_from_work_unit(_wu(fr.id), fr_store=pipeline.frs)
+    pipeline.frs.add_linked_pr(fr.id, {
+        "repo": "r", "number": 1, "state": "merged", "merged_at": 1.0,
+    })
+    pipeline.milestones.add_linked_pr(ms.id, {
+        "repo": "r", "number": 1, "state": "merged", "merged_at": 1.0,
+    })
+
+    # Re-propose WITHOUT fr_store — the legacy/no-sync path.
+    reproposed = pipeline.milestones.propose_from_work_unit(_wu(fr.id))
+
+    assert reproposed.id == ms.id
+    assert reproposed.linked_prs == [
+        {"repo": "r", "number": 1, "state": "merged", "merged_at": 1.0},
+    ]

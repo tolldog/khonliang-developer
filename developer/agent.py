@@ -234,9 +234,11 @@ class DeveloperAgent(BaseAgent):
         return self._pr_watcher_registry
 
     async def _sync_fr_status_on_merge(
-        self, repo: str, pr_number: int, title: str,
+        self, repo: str, pr_number: int, title: str, *,
+        body: str = "", merged_at: str = "",
     ) -> None:
-        """Auto-advance any FR named in a merged PR's title to 'completed'.
+        """Auto-advance any FR named in a merged PR's title to 'completed',
+        and record the merge as a reverse link on the FR (fr_developer_cfe3001c).
 
         fr_developer_c7d5f22b: the FR store previously had no way to
         learn a PR merged, so callers repeatedly picked up FRs that
@@ -253,18 +255,80 @@ class DeveloperAgent(BaseAgent):
         capability and dependents never unblock (only 'completed'
         does). A PR shipping means the work exists, so 'completed' is
         the correct terminal state.
+
+        Reverse-link population is a *separate* invariant from status
+        completion and deliberately uses the opposite redirect policy:
+        ``add_linked_pr`` resolves through ``follow_redirect=True`` so
+        the link lands on the terminal FR (with ``redirected_from`` set
+        when a redirect fired) — a merged-away FR shouldn't accumulate
+        new PR references. Status completion stays ``follow_redirect=
+        False`` (unchanged, see ``_advance_fr_to_completed``): those are
+        independent concerns and mixing them would let one source FR's
+        completion mark a whole consolidated target as shipped.
+
+        Status completion is TITLE-ONLY, deliberately narrower than
+        reverse-link population (Codex R11 on PR #93): a PR body
+        commonly mentions FR ids that this PR does NOT close — related
+        work, dependencies ("depends on fr_x"), checklists — so
+        scanning the whole body for auto-completion would wrongly mark
+        unrelated FRs 'completed' and unblock their dependents on a
+        merely-mentioned reference. Reverse-link tracking has no such
+        side effect (it's just "this PR touched this FR" metadata), so
+        it's fine to be broader and cover body mentions too.
         """
         from developer.pr_watcher import extract_fr_ids
         from developer.fr_store import FRError
 
         notes = f"auto-synced: {repo}#{pr_number} merged"
-        for fr_id in extract_fr_ids(title):
+        title_fr_ids = extract_fr_ids(title)
+        linked_fr_ids = title_fr_ids
+        if body:
+            linked_fr_ids = list(dict.fromkeys(title_fr_ids + extract_fr_ids(body)))
+        for fr_id in title_fr_ids:
             try:
                 self._advance_fr_to_completed(fr_id, notes)
             except FRError as e:
                 await self._safe_report_gap(
                     "pr_watcher.on_merged", f"{fr_id} ({repo}#{pr_number}): {e}",
                 )
+        for fr_id in linked_fr_ids:
+            pr_entry = {
+                "repo": repo,
+                "number": pr_number,
+                "state": "merged",
+                # GitHub's actual merge timestamp (ISO8601), not this
+                # hook's run time — a delayed sync (restart, retry,
+                # watcher backlog) would otherwise record the wrong
+                # chronology (Codex R7 on PR #93). Falls back to None
+                # when unavailable (e.g. a legacy 3-arg on_merged
+                # caller that doesn't supply merged_at at all).
+                "merged_at": merged_at or None,
+            }
+            try:
+                fr = self.pipeline.frs.add_linked_pr(fr_id, pr_entry)
+            except FRError as e:
+                await self._safe_report_gap(
+                    "pr_watcher.on_merged.linked_prs",
+                    f"{fr_id} ({repo}#{pr_number}): {e}",
+                )
+                continue
+            # Milestone.linked_prs is the union of PRs touching any
+            # CURRENTLY bundled FR. fr.linked_milestones is historical
+            # (an FR removed from a bundle keeps the pointer for audit
+            # — see MilestoneStore.update_frs), so recompute from each
+            # milestone's actual fr_ids rather than blindly attaching
+            # this PR — a milestone that no longer bundles fr_id must
+            # not gain it (Codex R4 on PR #93).
+            for milestone_id in fr.linked_milestones:
+                try:
+                    self.pipeline.milestones.sync_linked_prs(
+                        self.pipeline.frs, milestone_id,
+                    )
+                except Exception as e:
+                    await self._safe_report_gap(
+                        "pr_watcher.on_merged.milestone_linked_prs",
+                        f"{milestone_id} <- {fr_id} ({repo}#{pr_number}): {e}",
+                    )
 
     def _advance_fr_to_completed(self, fr_id: str, notes: str) -> None:
         """Move ``fr_id`` to 'completed', hopping through 'in_progress'
@@ -681,6 +745,22 @@ class DeveloperAgent(BaseAgent):
                   {"milestone_id": {"type": "string", "required": True},
                    "reason": {"type": "string", "default": ""}},
                   since="0.16.0"),
+            Skill("audit_link_integrity",
+                  "Read-only scan of FR <-> milestone reverse links. Flags "
+                  "milestones whose fr_ids has no matching linked_milestones "
+                  "entry on the (redirect-resolved) FR, and reverse links "
+                  "stranded on an FR that's since been merged away.",
+                  {"project": {"type": "string", "default": "",
+                               "description": "empty = every project"}},
+                  since="0.23.0"),
+            Skill("repair_link_integrity",
+                  "Reconcile mismatches audit_link_integrity flags. Defaults "
+                  "to dry_run=True (report only) — pass dry_run=false to "
+                  "actually write the repairs.",
+                  {"project": {"type": "string", "default": "",
+                               "description": "empty = every project"},
+                   "dry_run": {"type": "boolean", "default": True}},
+                  since="0.23.0"),
             Skill("migrate_frs_from_researcher",
                   "One-way migration of researcher-owned FRs into developer's store",
                   {"source_db": {"type": "string", "required": True},
@@ -2816,6 +2896,7 @@ class DeveloperAgent(BaseAgent):
                 summary=args.get("summary", ""),
                 source=source,
                 project=project,
+                fr_store=self.pipeline.frs,
             )
         except (MilestoneError, ValueError, TypeError) as e:
             await self.report_gap("propose_milestone_from_work_unit", str(e))
@@ -2967,6 +3048,7 @@ class DeveloperAgent(BaseAgent):
                 add_fr_ids=add_fr_ids,
                 remove_fr_ids=remove_fr_ids,
                 notes=args.get("notes", ""),
+                fr_store=self.pipeline.frs,
             )
         except MilestoneError as e:
             await self._safe_report_gap("update_milestone_frs", str(e))
@@ -2989,6 +3071,26 @@ class DeveloperAgent(BaseAgent):
         except MilestoneError as e:
             await self._safe_report_gap("delete_milestone", str(e))
             return {"error": str(e)}
+
+    @handler("audit_link_integrity")
+    async def handle_audit_link_integrity(self, args):
+        from developer.link_integrity import audit_link_integrity
+
+        project = args.get("project") or None
+        return audit_link_integrity(
+            self.pipeline.frs, self.pipeline.milestones, project=project,
+        )
+
+    @handler("repair_link_integrity")
+    async def handle_repair_link_integrity(self, args):
+        from developer.link_integrity import repair_link_integrity
+
+        project = args.get("project") or None
+        dry_run = _bool_arg(args, "dry_run", default=True)
+        return repair_link_integrity(
+            self.pipeline.frs, self.pipeline.milestones,
+            project=project, dry_run=dry_run,
+        )
 
     @handler("migrate_frs_from_researcher")
     async def handle_migrate_frs_from_researcher(self, args):
@@ -3115,6 +3217,7 @@ class DeveloperAgent(BaseAgent):
                     summary=args.get("summary", ""),
                     source=source,
                     project=handoff_project,
+                    fr_store=self.pipeline.frs,
                 )
 
             review = self.pipeline.milestones.review_scope(

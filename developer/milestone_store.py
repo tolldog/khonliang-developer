@@ -123,6 +123,19 @@ ALLOWED_MILESTONE_TRANSITIONS: dict[str, set[str]] = {
 }
 
 
+def _pr_completeness_score(pr: dict) -> tuple:
+    """Rank a ``linked_prs`` entry's completeness for duplicate-{repo,
+    number} resolution (fr_developer_cfe3001c, Codex R9 on PR #93).
+
+    Duplicated (not imported) from ``FRStore``'s identical helper —
+    this module deliberately stays free of any hard dependency on
+    fr_store (see the module docstring), so the tiny scoring rule is
+    kept local rather than pulled in via an import. Merged beats any
+    other state; a known ``merged_at`` beats an unknown one.
+    """
+    return (pr.get("state") == "merged", pr.get("merged_at") is not None)
+
+
 class MilestoneError(ValueError):
     """Raised on invalid milestone operations."""
 
@@ -157,6 +170,9 @@ class Milestone:
     # Read-time fallback to DEFAULT_PROJECT keeps pre-existing records
     # valid; migrate_records_to_project() canonicalizes the metadata.
     project: str = DEFAULT_PROJECT
+    # fr_developer_cfe3001c: union of PRs touching any bundled FR. See
+    # MilestoneStore.add_linked_pr.
+    linked_prs: list[dict] = field(default_factory=list)
 
     def to_public_dict(self) -> dict[str, Any]:
         # ``fr_descriptions`` is intentionally excluded — its prose is
@@ -182,6 +198,7 @@ class Milestone:
             "superseded_by": self.superseded_by,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "linked_prs": list(self.linked_prs),
         }
 
 
@@ -292,6 +309,7 @@ class MilestoneStore:
         source: str = "work_unit",
         project: Optional[str] = None,
         fr_descriptions: Optional[dict[str, str]] = None,
+        fr_store: Optional[Any] = None,
     ) -> Milestone:
         """Create or update a proposed milestone from a ranked work unit.
 
@@ -329,6 +347,14 @@ class MilestoneStore:
           map keep their previously-cached prose. Prevents a degraded
           ``fr_store`` (some FRs not resolvable) from stripping prose
           for the FRs that did resolve last time.
+
+        ``fr_store`` (fr_developer_cfe3001c, optional): when provided,
+        every id in the final ``fr_ids`` bundle gets this milestone
+        mirrored onto its terminal FR's ``linked_milestones`` via
+        :meth:`FRStore.add_linked_milestone`. Best-effort -- a failure
+        (unknown FR id, store hiccup) is logged, not raised, since this
+        is a secondary reverse-link write, not the milestone's own
+        state.
         """
         if not isinstance(work_unit, dict) or not work_unit:
             raise MilestoneError("work_unit is required")
@@ -371,6 +397,15 @@ class MilestoneStore:
         if existing is not None:
             notes_history = list(existing.notes_history)
             superseded_by = existing.superseded_by
+            # Preserve linked_prs across re-propose (fr_developer_
+            # cfe3001c, Codex R5 on PR #93): without this, rebuilding a
+            # fresh Milestone below defaults it to [], and a caller that
+            # re-proposes without an fr_store (so _sync_linked_prs_from_
+            # bundle never runs to refill it) silently wipes previously
+            # recorded PR links. `_sync_linked_prs_from_bundle` recomputes
+            # it correctly right after IF fr_store is given; this default
+            # only matters for the no-fr_store case.
+            preserved_linked_prs = list(existing.linked_prs)
             if preserve_existing_project:
                 project = existing.project or DEFAULT_PROJECT
             # Re-propose sidecar policy: ``None`` preserves wholesale,
@@ -391,6 +426,7 @@ class MilestoneStore:
                 "notes": "proposed",
             }]
             superseded_by = ""
+            preserved_linked_prs = []
             if preserve_existing_project:
                 project = DEFAULT_PROJECT
         # Filter the final sidecar to the milestone's current ``fr_ids``
@@ -426,8 +462,104 @@ class MilestoneStore:
             project=project,
             created_at=created_at,
             updated_at=now,
+            linked_prs=preserved_linked_prs,
         )
         self._store(milestone)
+        if fr_store is not None:
+            self._mirror_linked_milestone(fr_store, milestone.id, fr_ids)
+            self._sync_linked_prs_from_bundle(fr_store, milestone)
+        return milestone
+
+    def _mirror_linked_milestone(
+        self, fr_store: Any, milestone_id: str, fr_ids: Iterable[str],
+    ) -> None:
+        """Best-effort: mirror ``milestone_id`` onto each fr's terminal
+        ``linked_milestones`` (fr_developer_cfe3001c).
+
+        Only handles the FR-side pointer; ``linked_prs`` recompute is
+        :meth:`_sync_linked_prs_from_bundle`'s job (separate because it
+        must run over the FULL current bundle, not just the ids passed
+        here, so an FR *removal* correctly drops its PRs too).
+
+        Never raises — a reverse-link failure must not fail the
+        milestone mutation that's already landed.
+        """
+        for fr_id in fr_ids:
+            try:
+                fr_store.add_linked_milestone(fr_id, milestone_id)
+            except Exception:
+                logger.warning(
+                    "linked_milestones mirror failed for fr %s <- milestone %s",
+                    fr_id, milestone_id, exc_info=True,
+                )
+
+    def _sync_linked_prs_from_bundle(self, fr_store: Any, milestone: Milestone) -> None:
+        """Recompute ``milestone.linked_prs`` as the union of every
+        currently-bundled FR's ``linked_prs`` (fr_developer_cfe3001c,
+        Codex R3 on PR #93).
+
+        A wholesale recompute — not an incremental add-only mirror —
+        is what keeps "union of PRs touching any bundled FR" honest
+        across removals: an FR dropped from the bundle must stop
+        contributing its PRs to the milestone, and an add-only mirror
+        can never observe that. Best-effort; a lookup failure for one
+        FR just excludes its PRs rather than failing the whole sync.
+        """
+        union: dict[tuple, dict] = {}
+        for fr_id in milestone.fr_ids:
+            try:
+                fr = fr_store.get(fr_id, follow_redirect=True)
+            except Exception:
+                continue
+            if fr is None:
+                continue
+            for pr in fr.linked_prs:
+                key = (pr.get("repo"), pr.get("number"))
+                existing = union.get(key)
+                # Two bundled FRs can carry different copies of the SAME
+                # PR (e.g. one still has a pre-merge/missing-merged_at
+                # entry while another was synced later) — plain
+                # last-write-wins would let whichever FR is iterated
+                # last decide the milestone's view, even if its copy is
+                # stale (Codex R9 on PR #93). Keep whichever copy is
+                # more complete instead.
+                if existing is None or _pr_completeness_score(pr) > _pr_completeness_score(existing):
+                    union[key] = pr
+        new_linked_prs = list(union.values())
+        if new_linked_prs == milestone.linked_prs:
+            return
+        milestone.linked_prs = new_linked_prs
+        milestone.updated_at = time.time()
+        try:
+            self._store(milestone)
+        except Exception:
+            logger.warning(
+                "linked_prs recompute failed to persist for milestone %s",
+                milestone.id, exc_info=True,
+            )
+
+    def sync_linked_prs(self, fr_store: Any, milestone_id: str) -> Optional[Milestone]:
+        """Public entry point: recompute ``linked_prs`` for one milestone.
+
+        The correct call for a caller iterating ``FR.linked_milestones``
+        (e.g. after a PR merge, or during repair) — that field is
+        intentionally HISTORICAL (fr_developer_cfe3001c: an FR removed
+        from a milestone's bundle keeps the pointer for audit), so
+        blindly calling :meth:`add_linked_pr` for every id in it would
+        attach PRs to milestones the FR no longer actively belongs to
+        (Codex R4 on PR #93). Recomputing from ``milestone.fr_ids`` (the
+        actual current bundle) is what keeps that distinction correct —
+        a stale historical milestone just won't list this FR anymore,
+        so its PRs don't propagate there.
+
+        Returns ``None`` (no-op, not an error) if ``milestone_id``
+        doesn't exist — callers iterating a possibly-stale id list
+        shouldn't have to special-case a deleted milestone.
+        """
+        milestone = self.get(milestone_id)
+        if milestone is None:
+            return None
+        self._sync_linked_prs_from_bundle(fr_store, milestone)
         return milestone
 
     def review_scope(
@@ -659,6 +791,7 @@ class MilestoneStore:
         add_fr_ids: Optional[Iterable[str]] = None,
         remove_fr_ids: Optional[Iterable[str]] = None,
         notes: str = "",
+        fr_store: Optional[Any] = None,
     ) -> Milestone:
         """Mutate the FR bundle on a ``proposed`` milestone.
 
@@ -675,6 +808,14 @@ class MilestoneStore:
         normalized to a single-element list here so a caller passing
         e.g. ``add_fr_ids="fr_developer_foo"`` doesn't get iterated
         character-by-character — classic Python footgun.
+
+        ``fr_store`` (fr_developer_cfe3001c, optional): when provided,
+        every newly-added fr id gets this milestone mirrored onto its
+        terminal FR's ``linked_milestones``. Removed ids are NOT
+        un-mirrored — ``fr_ids`` stays historically accurate per the
+        FR's design (a milestone that once bundled an FR keeps that
+        fact discoverable even after the FR is dropped from the active
+        bundle).
         """
         milestone = self.get(milestone_id)
         if milestone is None:
@@ -742,6 +883,13 @@ class MilestoneStore:
         # finding 2.
         self._refresh_draft_spec(milestone)
         self._store(milestone)
+        if fr_store is not None:
+            if added:
+                self._mirror_linked_milestone(fr_store, milestone.id, added)
+            # Unconditional (not gated on `added`): removals must prune
+            # linked_prs too, and this recompute is a no-op if the
+            # bundle's PR union hasn't actually changed.
+            self._sync_linked_prs_from_bundle(fr_store, milestone)
         return milestone
 
     def delete(
@@ -900,6 +1048,42 @@ class MilestoneStore:
             "reason": reason,
         }
 
+    def add_linked_pr(self, milestone_id: str, pr: dict) -> Milestone:
+        """Record (or update) a PR reference touching this milestone's
+        bundled FRs (fr_developer_cfe3001c).
+
+        ``pr`` is ``{repo, number, state, merged_at}``. Dedupes on
+        ``(repo, number)`` — a later call for the same PR (e.g.
+        open -> merged) updates the existing entry in place, but only
+        when the new entry is at least as complete (Codex R11 on PR
+        #93, same policy as ``FRStore.add_linked_pr``): an
+        out-of-order or stale replay must not regress an already-
+        ``merged`` entry back to ``open``/unknown ``merged_at``.
+        """
+        milestone = self.get(milestone_id)
+        if milestone is None:
+            raise MilestoneError(f"unknown milestone id: {milestone_id}")
+        repo = str(pr.get("repo") or "")
+        number = pr.get("number")
+        if not repo or number is None:
+            raise MilestoneError("pr entry requires non-empty 'repo' and 'number'")
+        entry = {
+            "repo": repo,
+            "number": number,
+            "state": str(pr.get("state") or ""),
+            "merged_at": pr.get("merged_at"),
+        }
+        for i, existing in enumerate(milestone.linked_prs):
+            if existing.get("repo") == repo and existing.get("number") == number:
+                if _pr_completeness_score(entry) >= _pr_completeness_score(existing):
+                    milestone.linked_prs[i] = entry
+                break
+        else:
+            milestone.linked_prs.append(entry)
+        milestone.updated_at = time.time()
+        self._store(milestone)
+        return milestone
+
     def _refresh_draft_spec(self, milestone: Milestone) -> None:
         """Recompute ``milestone.draft_spec`` from current milestone state.
 
@@ -950,6 +1134,7 @@ class MilestoneStore:
                 "draft_spec": milestone.draft_spec,
                 "notes_history": list(milestone.notes_history),
                 "superseded_by": milestone.superseded_by,
+                "linked_prs": list(milestone.linked_prs),
             },
             created_at=milestone.created_at,
             updated_at=milestone.updated_at,
@@ -1073,6 +1258,7 @@ def _milestone_from_entry(entry: KnowledgeEntry) -> Milestone:
         project=normalize_project(meta.get("project")),
         created_at=entry.created_at,
         updated_at=entry.updated_at,
+        linked_prs=list(meta.get("linked_prs") or []),
     )
 
 

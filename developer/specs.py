@@ -11,12 +11,16 @@ developer-specific glue:
     referenced therein. FRs are resolved from developer's authoritative
     FR store; researcher remains an evidence/concept source only.
 
-No persistence. No LLM calls. Spec/milestone documents are workspace
-artifacts and are never written to ``KnowledgeStore``.
+No LLM calls. Spec/milestone documents themselves are workspace
+artifacts and are never written to ``KnowledgeStore`` — the one
+exception is ``list_specs``' best-effort mirror of each spec's
+``**FR:**`` reference onto that FR's ``linked_specs`` (fr_developer_
+cfe3001c), which does write through ``FRStore`` when one is configured.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +30,8 @@ from khonliang_researcher.doc_reader import DocContent, LocalDocReader
 from developer.config import ProjectConfig
 from developer.fr_store import FRStore
 from developer.researcher_client import FRRecord
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -216,15 +222,90 @@ class SpecReader:
         Uses ``projects[project].specs_dir`` from config — never a hardcoded
         ``specs/`` path. Returns an empty list if the project is unknown or
         the specs directory does not exist.
+
+        Best-effort side effect (fr_developer_cfe3001c): for every spec
+        with a resolvable ``**FR:**`` id, mirrors ``{project, path,
+        section=title}`` onto that FR's terminal ``linked_specs`` via
+        ``FRStore.add_linked_spec``, then reconciles: any
+        ``linked_specs`` entry recorded for THIS project whose
+        ``(path, section)`` no longer maps back to that FR (the spec
+        was retargeted to a different FR, its section/title changed,
+        or the file moved/was deleted) is removed via
+        ``FRStore.remove_linked_specs`` — the add step alone is
+        append-only and would otherwise leave stale cross-links
+        forever (Codex R5/R6 on PR #93).
+
+        Reconciliation scans every FR in the store (not filtered by
+        ``target``, which is a DIFFERENT dimension from this
+        ``project`` slug and cannot be assumed to match it — Codex R6
+        finding) and matches purely on the ``project`` field each
+        ``linked_specs`` entry already carries; comparisons resolve
+        each scanned spec's raw ``**FR:**`` id through
+        ``FRStore.resolve_id`` first, since ``add_linked_spec`` writes
+        through ``follow_redirect=True`` and a naive raw-id comparison
+        would flag every redirected spec as stale on the very call
+        that just wrote it.
+
+        Only runs when this reader was constructed with an
+        ``fr_store``; a failure for one spec/FR is logged and does not
+        stop the scan or fail the call. Reconciliation runs even when
+        the whole ``specs_root`` is gone (renamed/deleted project
+        directory) — an empty scan correctly flags every previously-
+        recorded ``linked_specs`` entry for this project as stale
+        rather than silently leaving them all in place forever (Codex
+        R11 on PR #93; individual file deletion was already handled by
+        the per-path comparison, but the whole-directory case used to
+        bypass reconciliation entirely via an early ``return``).
         """
         proj = self._projects.get(project)
         if proj is None:
             return []
         root = proj.specs_root
-        if not root.exists():
-            return []
-        paths = self._reader.glob_docs(str(root), pattern="**/spec.md")
-        return [self.summarize(p) for p in paths]
+        if root.exists():
+            paths = self._reader.glob_docs(str(root), pattern="**/spec.md")
+            summaries = [self.summarize(p) for p in paths]
+        else:
+            summaries = []
+        if self._fr_store is not None:
+            # Authoritative path -> (terminal fr id, current section),
+            # from THIS scan. Resolve through redirects so a spec still
+            # naming a merged-away id compares against the SAME
+            # terminal add_linked_spec actually wrote to.
+            path_to_current: dict[str, tuple[str, str]] = {}
+            for s in summaries:
+                if not s.fr:
+                    continue
+                try:
+                    terminal_id = self._fr_store.resolve_id(s.fr)
+                except Exception:
+                    terminal_id = s.fr
+                path_to_current[s.path] = (terminal_id, s.title)
+                try:
+                    self._fr_store.add_linked_spec(s.fr, {
+                        "project": project,
+                        "path": s.path,
+                        "section": s.title,
+                    })
+                except Exception:
+                    logger.warning(
+                        "linked_specs mirror failed for fr %s <- spec %s",
+                        s.fr, s.path, exc_info=True,
+                    )
+            try:
+                for fr in self._fr_store.list(include_all=True):
+                    stale = [
+                        sp for sp in fr.linked_specs
+                        if sp.get("project") == project
+                        and path_to_current.get(sp.get("path")) != (fr.id, sp.get("section"))
+                    ]
+                    if stale:
+                        self._fr_store.remove_linked_specs(fr.id, stale)
+            except Exception:
+                logger.warning(
+                    "linked_specs stale-entry reconciliation failed for project %s",
+                    project, exc_info=True,
+                )
+        return summaries
 
     # ------------------------------------------------------------------
     # Traverse
