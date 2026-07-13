@@ -232,9 +232,10 @@ class _FakePR:
     def __init__(self, number=42, title="t", state="open", draft=False,
                  mergeable=True, author="tolldog", head="feat/x", base="main",
                  head_sha="b348b3f1234567890", mergeable_state="blocked",
-                 merged=False, merged_at=None):
+                 merged=False, merged_at=None, body=""):
         self.number = number
         self.title = title
+        self.body = body
         self.state = state
         self.draft = draft
         self.mergeable = mergeable
@@ -498,6 +499,24 @@ async def test_get_pr_returns_normalized_metadata():
     # Open PR: merged is False, merged_at is None.
     assert out["merged"] is False
     assert out["merged_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_pr_surfaces_body():
+    """fr_developer_cfe3001c: PR body is surfaced so callers can scan it
+    for FR ids (title-only scanning missed body-only references)."""
+    c = GithubClient(token="t")
+    _install_fake_gh(c, pr=_FakePR(number=1, body="Closes fr_developer_deadbeef"))
+    out = await c.get_pr("o/n", 1)
+    assert out["body"] == "Closes fr_developer_deadbeef"
+
+
+@pytest.mark.asyncio
+async def test_get_pr_defaults_body_to_empty_string_when_none():
+    c = GithubClient(token="t")
+    _install_fake_gh(c, pr=_FakePR(number=2, body=None))
+    out = await c.get_pr("o/n", 2)
+    assert out["body"] == ""
 
 
 @pytest.mark.asyncio

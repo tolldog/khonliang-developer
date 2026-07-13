@@ -70,6 +70,60 @@ def test_list_specs_unknown_project_returns_empty(pipeline):
 
 
 # ---------------------------------------------------------------------------
+# Reverse links (fr_developer_cfe3001c) — list_specs mirrors linked_specs
+# ---------------------------------------------------------------------------
+
+
+def _spec_reader_over(tmp_path, fr_store):
+    from developer.config import ProjectConfig
+    from developer.specs import SpecReader
+    from khonliang_researcher.doc_reader import LocalDocReader
+    from developer.specs import FR_ID_PATTERN
+
+    specs_dir = tmp_path / "specs" / "MS-01"
+    specs_dir.mkdir(parents=True)
+    return SpecReader(
+        reader=LocalDocReader(reference_pattern=FR_ID_PATTERN),
+        projects={"proj": ProjectConfig(name="proj", repo=tmp_path, specs_dir="specs")},
+        fr_store=fr_store,
+    ), specs_dir
+
+
+def test_list_specs_mirrors_linked_spec_onto_fr(pipeline, tmp_path):
+    fr = pipeline.frs.promote(target="developer", title="Spec mirror test", description="d")
+    reader, specs_dir = _spec_reader_over(tmp_path, pipeline.frs)
+    (specs_dir / "spec.md").write_text(
+        f"# MS-01\n\n**FR:** `{fr.id}`\n**Status:** approved\n"
+    )
+
+    reader.list_specs("proj")
+
+    linked = pipeline.frs.get(fr.id).linked_specs
+    assert linked == [{"project": "proj", "path": str(specs_dir / "spec.md"), "section": "MS-01"}]
+
+
+def test_list_specs_mirror_is_idempotent(pipeline, tmp_path):
+    fr = pipeline.frs.promote(target="developer", title="Spec mirror idempotent", description="d")
+    reader, specs_dir = _spec_reader_over(tmp_path, pipeline.frs)
+    (specs_dir / "spec.md").write_text(f"# MS-01\n\n**FR:** `{fr.id}`\n")
+
+    reader.list_specs("proj")
+    reader.list_specs("proj")
+
+    assert len(pipeline.frs.get(fr.id).linked_specs) == 1
+
+
+def test_list_specs_mirror_is_best_effort_on_unresolvable_fr(tmp_path, pipeline):
+    """A spec referencing an FR id that doesn't exist must not raise —
+    list_specs already has real results to return."""
+    reader, specs_dir = _spec_reader_over(tmp_path, pipeline.frs)
+    (specs_dir / "spec.md").write_text("# MS-01\n\n**FR:** `fr_developer_deadbeef`\n")
+
+    summaries = reader.list_specs("proj")
+    assert len(summaries) == 1
+
+
+# ---------------------------------------------------------------------------
 # Acceptance #6 — traverse_milestone walks milestone → specs → FRs
 # ---------------------------------------------------------------------------
 

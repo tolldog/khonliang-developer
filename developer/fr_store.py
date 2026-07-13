@@ -135,6 +135,14 @@ class FR:
     # migration pass (though `migrate_records_to_project` is provided to
     # tidy the metadata once and for all).
     project: str = DEFAULT_PROJECT
+    # fr_developer_cfe3001c: reverse links. Always populated against the
+    # TERMINAL fr (post follow_redirect=True resolution) — see
+    # FRStore.add_linked_pr/add_linked_spec/add_linked_milestone. Records
+    # pre-dating these fields read back as empty lists via the defaults
+    # in `_fr_from_entry`, same backward-compat story as `project` above.
+    linked_prs: list[dict] = field(default_factory=list)
+    linked_specs: list[dict] = field(default_factory=list)
+    linked_milestones: list[str] = field(default_factory=list)
 
     def to_public_dict(self) -> dict[str, Any]:
         """Serializable representation for MCP / JSON consumers."""
@@ -159,6 +167,9 @@ class FR:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "redirected_from": self.redirected_from,
+            "linked_prs": list(self.linked_prs),
+            "linked_specs": list(self.linked_specs),
+            "linked_milestones": list(self.linked_milestones),
         }
 
 
@@ -1030,6 +1041,124 @@ class FRStore:
         return fr
 
     # ------------------------------------------------------------------
+    # Reverse links (fr_developer_cfe3001c)
+    # ------------------------------------------------------------------
+    #
+    # All three methods resolve ``fr_id`` through follow_redirect=True
+    # before writing, per the FR's merge-redirect invariant: a reverse
+    # link always lands on the terminal FR, never on a merged-away
+    # source id, so a link populated before a merge doesn't go stale
+    # once the merge happens. ``redirected_from`` is recorded on the
+    # entry itself (not just implied) so the audit trail survives even
+    # after the source id is no longer directly resolvable to anything
+    # but its terminal.
+
+    def _resolve_for_link(self, fr_id: str) -> FR:
+        """Resolve ``fr_id`` to its terminal FR record, or raise.
+
+        Shared precondition for all three ``add_linked_*`` methods —
+        the terminal id, not the caller's original id, is what gets a
+        new reverse link.
+        """
+        fr = self.get(fr_id, follow_redirect=True)
+        if fr is None:
+            raise FRError(f"unknown fr id: {fr_id}")
+        return fr
+
+    def add_linked_pr(self, fr_id: str, pr: dict) -> FR:
+        """Record (or update) a PR reference on ``fr_id``'s terminal FR.
+
+        ``pr`` is ``{repo, number, state, merged_at}``; a
+        ``redirected_from`` key is added automatically when ``fr_id``
+        resolved through a merge redirect. Dedupes on ``(repo,
+        number)`` — a later call for the same PR (e.g. open -> merged)
+        updates the existing entry in place rather than appending a
+        duplicate.
+        """
+        fr = self._resolve_for_link(fr_id)
+        repo = str(pr.get("repo") or "")
+        number = pr.get("number")
+        if not repo or number is None:
+            raise FRError("pr entry requires non-empty 'repo' and 'number'")
+        entry = {
+            "repo": repo,
+            "number": number,
+            "state": str(pr.get("state") or ""),
+            "merged_at": pr.get("merged_at"),
+        }
+        if fr.id != fr_id:
+            entry["redirected_from"] = fr_id
+        for i, existing in enumerate(fr.linked_prs):
+            if existing.get("repo") == repo and existing.get("number") == number:
+                fr.linked_prs[i] = entry
+                break
+        else:
+            fr.linked_prs.append(entry)
+        fr.updated_at = time.time()
+        self._store(fr)
+        return fr
+
+    def add_linked_spec(self, fr_id: str, spec: dict) -> FR:
+        """Record a spec reference on ``fr_id``'s terminal FR.
+
+        ``spec`` is ``{project, path, section}``. Dedupes on
+        ``(project, path, section)``.
+        """
+        fr = self._resolve_for_link(fr_id)
+        project = str(spec.get("project") or "")
+        path = str(spec.get("path") or "")
+        if not path:
+            raise FRError("spec entry requires a non-empty 'path'")
+        section = str(spec.get("section") or "")
+        entry = {"project": project, "path": path, "section": section}
+        if fr.id != fr_id:
+            entry["redirected_from"] = fr_id
+        key = (project, path, section)
+        for existing in fr.linked_specs:
+            if (
+                existing.get("project"), existing.get("path"), existing.get("section"),
+            ) == key:
+                return fr
+        fr.linked_specs.append(entry)
+        fr.updated_at = time.time()
+        self._store(fr)
+        return fr
+
+    def add_linked_milestone(self, fr_id: str, milestone_id: str) -> FR:
+        """Record a milestone id on ``fr_id``'s terminal FR.
+
+        Dedupes — a milestone already present is a no-op.
+        """
+        fr = self._resolve_for_link(fr_id)
+        milestone_id = str(milestone_id or "").strip()
+        if not milestone_id:
+            raise FRError("milestone_id is required")
+        if milestone_id in fr.linked_milestones:
+            return fr
+        fr.linked_milestones.append(milestone_id)
+        fr.updated_at = time.time()
+        self._store(fr)
+        return fr
+
+    def clear_reverse_links(self, fr_id: str) -> FR:
+        """Wipe ``linked_prs``/``linked_specs``/``linked_milestones`` on
+        the EXACT id given (no redirect resolution).
+
+        Used by :mod:`developer.link_integrity`'s repair pass to strip
+        stale reverse links off a since-merged FR after they've been
+        re-homed onto the terminal FR via the ``add_linked_*`` methods.
+        """
+        fr = self.get(fr_id, follow_redirect=False)
+        if fr is None:
+            raise FRError(f"unknown fr id: {fr_id}")
+        fr.linked_prs = []
+        fr.linked_specs = []
+        fr.linked_milestones = []
+        fr.updated_at = time.time()
+        self._store(fr)
+        return fr
+
+    # ------------------------------------------------------------------
     # Capability graph
     # ------------------------------------------------------------------
 
@@ -1106,6 +1235,9 @@ class FRStore:
                 "merged_from": list(fr.merged_from),
                 "merge_role": fr.merge_role,
                 "merge_note": fr.merge_note,
+                "linked_prs": list(fr.linked_prs),
+                "linked_specs": list(fr.linked_specs),
+                "linked_milestones": list(fr.linked_milestones),
             },
             created_at=fr.created_at,
             updated_at=fr.updated_at,
@@ -1403,6 +1535,9 @@ def _fr_from_entry(entry: KnowledgeEntry) -> FR:
         merge_note=meta.get("merge_note", ""),
         created_at=entry.created_at,
         updated_at=entry.updated_at,
+        linked_prs=list(meta.get("linked_prs") or []),
+        linked_specs=list(meta.get("linked_specs") or []),
+        linked_milestones=list(meta.get("linked_milestones") or []),
     )
 
 

@@ -411,9 +411,9 @@ class _FakeGithubClientForMerge:
     def __init__(self, *, title="fr_developer_1234abcd: thing", head="feat/x",
                  merged=True, sha="abc123",
                  head_repo="tolldog/khonliang-developer",
-                 base_repo="tolldog/khonliang-developer"):
+                 base_repo="tolldog/khonliang-developer", body=""):
         self._pr = {
-            "title": title, "head": head,
+            "title": title, "head": head, "body": body,
             "head_repo": head_repo, "base_repo": base_repo,
         }
         self._merge_result = {"merged": merged, "sha": sha}
@@ -437,7 +437,7 @@ async def test_merge_pr_and_sync_happy_path_deletes_branch_and_fires_hook():
     fake_gh = _FakeGithubClientForMerge()
     on_merged_calls = []
 
-    async def fake_on_merged(repo, pr_number, title):
+    async def fake_on_merged(repo, pr_number, title, body=""):
         on_merged_calls.append((repo, pr_number, title))
 
     result = await merge_pr_and_sync(
@@ -458,6 +458,24 @@ async def test_merge_pr_and_sync_happy_path_deletes_branch_and_fires_hook():
 
 
 @pytest.mark.asyncio
+async def test_merge_pr_and_sync_passes_pr_body_to_on_merged():
+    """fr_developer_cfe3001c: on_merged receives the PR's body (not just
+    title) so reverse-link population can scan it for FR ids too."""
+    fake_gh = _FakeGithubClientForMerge(body="Closes fr_developer_deadbeef")
+    received = {}
+
+    async def fake_on_merged(repo, pr_number, title, body=""):
+        received["body"] = body
+
+    await merge_pr_and_sync(
+        "https://github.com/tolldog/khonliang-developer/pull/84",
+        github_client=fake_gh, on_merged=fake_on_merged,
+    )
+
+    assert received["body"] == "Closes fr_developer_deadbeef"
+
+
+@pytest.mark.asyncio
 async def test_merge_pr_and_sync_skips_branch_delete_for_fork_pr():
     """Codex R1 on PR #88: a fork-shaped PR (head repo != base repo)
     must not have its head branch deleted against the base repo — that
@@ -472,7 +490,7 @@ async def test_merge_pr_and_sync_skips_branch_delete_for_fork_pr():
     )
     on_merged_calls = []
 
-    async def fake_on_merged(repo, pr_number, title):
+    async def fake_on_merged(repo, pr_number, title, body=""):
         on_merged_calls.append((repo, pr_number, title))
 
     result = await merge_pr_and_sync(
@@ -528,7 +546,7 @@ async def test_merge_pr_and_sync_skips_side_effects_when_merge_not_confirmed():
     fake_gh = _FakeGithubClientForMerge(merged=False)
     on_merged_calls = []
 
-    async def fake_on_merged(repo, pr_number, title):
+    async def fake_on_merged(repo, pr_number, title, body=""):
         on_merged_calls.append((repo, pr_number, title))
 
     result = await merge_pr_and_sync(
@@ -563,7 +581,7 @@ async def test_merge_pr_and_sync_survives_on_merged_hook_failure():
     """
     fake_gh = _FakeGithubClientForMerge()
 
-    async def raising_hook(repo, pr_number, title):
+    async def raising_hook(repo, pr_number, title, body=""):
         raise RuntimeError("boom")
 
     result = await merge_pr_and_sync(

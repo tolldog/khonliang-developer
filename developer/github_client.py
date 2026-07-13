@@ -415,9 +415,9 @@ class GithubClient:
     async def get_pr(self, repo: str, pr_number: int) -> dict:
         """Return normalized PR metadata.
 
-        Surfaced fields: ``number``, ``title``, ``state``, ``draft``,
-        ``mergeable``, ``mergeable_state``, ``author``, ``head``,
-        ``head_sha``, ``head_repo``, ``base``, ``base_repo``,
+        Surfaced fields: ``number``, ``title``, ``body``, ``state``,
+        ``draft``, ``mergeable``, ``mergeable_state``, ``author``,
+        ``head``, ``head_sha``, ``head_repo``, ``base``, ``base_repo``,
         ``html_url``, ``merged``, ``merged_at``.
 
         ``head_repo`` / ``base_repo`` are ``"owner/name"`` strings for
@@ -463,6 +463,7 @@ class GithubClient:
         return {
             "number": pr.number,
             "title": pr.title,
+            "body": getattr(pr, "body", "") or "",
             "state": pr.state,
             "draft": pr.draft,
             "mergeable": pr.mergeable,

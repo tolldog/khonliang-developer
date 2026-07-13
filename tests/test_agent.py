@@ -4076,6 +4076,184 @@ async def test_sync_fr_status_on_merge_is_idempotent_on_already_completed_fr(har
     assert len(after.notes_history) == history_len_before
 
 
+# -- reverse links on PR merge (fr_developer_cfe3001c) -------------------
+
+
+@pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_records_linked_pr(harness):
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Linked PR test", description="d",
+    )
+
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 200, f"fix: ship it ({fr.id})",
+    )
+
+    updated = harness.agent.pipeline.frs.get(fr.id)
+    assert len(updated.linked_prs) == 1
+    assert updated.linked_prs[0]["repo"] == "tolldog/khonliang-developer"
+    assert updated.linked_prs[0]["number"] == 200
+    assert updated.linked_prs[0]["state"] == "merged"
+
+
+@pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_scans_body_too(harness):
+    """FR ids in the PR body (not just title) must be picked up."""
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Body scan test", description="d",
+    )
+
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 201, "chore: bump deps",
+        body=f"Closes {fr.id}",
+    )
+
+    updated = harness.agent.pipeline.frs.get(fr.id)
+    assert updated.status == "completed"
+    assert len(updated.linked_prs) == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_mirrors_milestone_linked_prs(harness):
+    """A merged PR's linked_pr also lands on every milestone bundling
+    the (terminal) FR — Milestone.linked_prs is the union view."""
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Milestone mirror test", description="d",
+    )
+    ms = harness.agent.pipeline.milestones.propose_from_work_unit({
+        "name": "wu", "rank": 1, "targets": ["developer"],
+        "frs": [{"fr_id": fr.id, "target": "developer", "title": fr.id}],
+    }, fr_store=harness.agent.pipeline.frs)
+
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 202, f"fix: ship it ({fr.id})",
+    )
+
+    updated_ms = harness.agent.pipeline.milestones.get(ms.id)
+    assert len(updated_ms.linked_prs) == 1
+    assert updated_ms.linked_prs[0]["number"] == 202
+
+
+@pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_links_pr_to_terminal_fr_after_redirect(harness):
+    """Acceptance test (fr_developer_cfe3001c): a PR body naming a
+    since-merged-away FR id records the reverse link on the terminal
+    FR (with redirected_from set), not on the merged-away source —
+    while status-completion keeps its existing follow_redirect=False
+    policy (unaffected, separate invariant).
+    """
+    source = harness.agent.pipeline.frs.promote(
+        target="developer", title="Redirect source", description="d",
+    )
+    other = harness.agent.pipeline.frs.promote(
+        target="developer", title="Redirect other", description="d",
+    )
+    terminal = harness.agent.pipeline.frs.merge(
+        source_ids=[source.id, other.id], title="Consolidated", description="d",
+    )
+
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 203, "chore: bump deps",
+        body=f"Closes {source.id}",
+    )
+
+    terminal_after = harness.agent.pipeline.frs.get(terminal.id)
+    assert len(terminal_after.linked_prs) == 1
+    assert terminal_after.linked_prs[0]["number"] == 203
+    assert terminal_after.linked_prs[0]["redirected_from"] == source.id
+
+    source_after = harness.agent.pipeline.frs.get(source.id, follow_redirect=False)
+    assert source_after.linked_prs == []
+
+
+# -- audit_link_integrity / repair_link_integrity (fr_developer_cfe3001c) --
+
+
+@pytest.mark.asyncio
+async def test_audit_link_integrity_flags_missing_reverse_link(harness):
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Audit gap test", description="d",
+    )
+    # Bundle without fr_store — no mirror happens, simulating pre-existing drift.
+    ms = harness.agent.pipeline.milestones.propose_from_work_unit({
+        "name": "wu", "rank": 1, "targets": ["developer"],
+        "frs": [{"fr_id": fr.id, "target": "developer", "title": fr.id}],
+    })
+
+    result = await harness.call("audit_link_integrity", {"project": "khonliang"})
+
+    mismatch_types = {m["type"] for m in result["mismatches"]}
+    assert "milestone_fr_missing_reverse_link" in mismatch_types
+    hit = next(
+        m for m in result["mismatches"]
+        if m["type"] == "milestone_fr_missing_reverse_link"
+    )
+    assert hit["milestone_id"] == ms.id
+    assert hit["fr_id"] == fr.id
+
+
+@pytest.mark.asyncio
+async def test_audit_link_integrity_flags_reverse_link_on_merged_fr(harness):
+    source = harness.agent.pipeline.frs.promote(
+        target="developer", title="Merged drift source", description="d",
+    )
+    other = harness.agent.pipeline.frs.promote(
+        target="developer", title="Merged drift other", description="d",
+    )
+    # Populate a reverse link, THEN merge source away — simulating a
+    # population path that ran before the merge (drift).
+    harness.agent.pipeline.frs.add_linked_pr(source.id, {"repo": "r", "number": 1})
+    harness.agent.pipeline.frs.merge(
+        source_ids=[source.id, other.id], title="Merged drift target", description="d",
+    )
+
+    result = await harness.call("audit_link_integrity", {"project": "khonliang"})
+
+    drift = [m for m in result["mismatches"] if m["type"] == "reverse_link_on_merged_fr"]
+    assert any(m["fr_id"] == source.id for m in drift)
+
+
+@pytest.mark.asyncio
+async def test_repair_link_integrity_dry_run_does_not_mutate(harness):
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Repair dry run test", description="d",
+    )
+    harness.agent.pipeline.milestones.propose_from_work_unit({
+        "name": "wu", "rank": 1, "targets": ["developer"],
+        "frs": [{"fr_id": fr.id, "target": "developer", "title": fr.id}],
+    })
+
+    result = await harness.call("repair_link_integrity", {"project": "khonliang"})
+
+    assert result["dry_run"] is True
+    assert result["repaired"] == []
+    assert len(result["skipped"]) == result["total_mismatches"] > 0
+    assert harness.agent.pipeline.frs.get(fr.id).linked_milestones == []
+
+
+@pytest.mark.asyncio
+async def test_repair_link_integrity_applies_fix_when_dry_run_false(harness):
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Repair apply test", description="d",
+    )
+    ms = harness.agent.pipeline.milestones.propose_from_work_unit({
+        "name": "wu", "rank": 1, "targets": ["developer"],
+        "frs": [{"fr_id": fr.id, "target": "developer", "title": fr.id}],
+    })
+
+    result = await harness.call(
+        "repair_link_integrity", {"project": "khonliang", "dry_run": False},
+    )
+
+    assert result["dry_run"] is False
+    assert len(result["repaired"]) == 1
+    assert harness.agent.pipeline.frs.get(fr.id).linked_milestones == [ms.id]
+
+    # Re-auditing now finds nothing left to repair.
+    rechecked = await harness.call("repair_link_integrity", {"project": "khonliang"})
+    assert rechecked["total_mismatches"] == 0
+
+
 # -- dev-repo registry (fr_developer_5f3dc62e) --------------------------
 
 

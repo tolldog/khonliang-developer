@@ -634,6 +634,7 @@ class PRSnapshot:
     pr_number: int
     head_sha: str
     title: str = ""
+    body: str = ""  # PR description text; fr_developer_cfe3001c FR-id scan
     state: str = "open"           # open | closed
     merged: bool = False
     merged_at: str = ""
@@ -704,7 +705,12 @@ ListOpenPRsFn = Callable[[str], Awaitable[list[int]]]
 # and this hook completing always retries on the next successful
 # fetch, in either watch mode — see poll_once for the full reasoning.
 # (repo, pr_number, title) -> None. Optional — None disables FR-status
-# auto-sync entirely (fr_developer_c7d5f22b).
+# auto-sync entirely (fr_developer_c7d5f22b). Callers may additionally
+# accept an optional keyword-only ``body`` (fr_developer_cfe3001c
+# reverse-link population scans title + body for FR ids) — Callable
+# typing isn't checked for arity at runtime, so this stays a 3-arg
+# type hint for the common case while real implementations may accept
+# the extra keyword.
 OnMergedFn = Callable[[str, int, str], Awaitable[None]]
 
 
@@ -1098,7 +1104,9 @@ class PRFleetWatcher:
                         watcher_id, repo, pr_number, snapshot.title,
                     )
                     try:
-                        await self._on_merged(repo, pr_number, snapshot.title)
+                        await self._on_merged(
+                            repo, pr_number, snapshot.title, body=snapshot.body,
+                        )
                     except asyncio.CancelledError:
                         raise
                     except Exception:
@@ -1961,6 +1969,7 @@ async def _snapshot_from_github(
         pr_number=pr_number,
         head_sha=str(pr.get("head_sha") or ""),
         title=str(pr.get("title") or ""),
+        body=str(pr.get("body") or ""),
         state=str(pr.get("state") or "open"),
         merged=merged,
         merged_at=merged_at,

@@ -1366,3 +1366,77 @@ def test_clean_target_ids_unchanged(store):
     fr = store.promote(target="developer", title="T", description="d", concept="c")
     digest = hashlib.sha256("developer:T:c".encode("utf-8")).hexdigest()[:8]
     assert fr.id == f"fr_developer_{digest}"
+
+
+# ---------------------------------------------------------------------------
+# Reverse links (fr_developer_cfe3001c)
+# ---------------------------------------------------------------------------
+
+
+def test_add_linked_pr_appends_entry(store):
+    fr = store.promote(target="developer", title="T1", description="d")
+    updated = store.add_linked_pr(fr.id, {
+        "repo": "tolldog/khonliang-developer", "number": 42,
+        "state": "open", "merged_at": None,
+    })
+    assert updated.linked_prs == [{
+        "repo": "tolldog/khonliang-developer", "number": 42,
+        "state": "open", "merged_at": None,
+    }]
+
+
+def test_add_linked_pr_updates_existing_entry_in_place(store):
+    fr = store.promote(target="developer", title="T2", description="d")
+    store.add_linked_pr(fr.id, {"repo": "r", "number": 1, "state": "open", "merged_at": None})
+    updated = store.add_linked_pr(fr.id, {"repo": "r", "number": 1, "state": "merged", "merged_at": 123.0})
+    assert len(updated.linked_prs) == 1
+    assert updated.linked_prs[0]["state"] == "merged"
+    assert updated.linked_prs[0]["merged_at"] == 123.0
+
+
+def test_add_linked_pr_resolves_through_merge_redirect(store):
+    """A PR reference to a since-merged-away FR lands on the terminal FR,
+    with redirected_from recording the original id."""
+    a = store.promote(target="developer", title="A", description="d")
+    b = store.promote(target="developer", title="B", description="d")
+    merged = store.merge(source_ids=[a.id, b.id], title="A+B", description="d")
+
+    updated = store.add_linked_pr(a.id, {"repo": "r", "number": 7, "state": "merged", "merged_at": 1.0})
+    assert updated.id == merged.id
+    assert updated.linked_prs[0]["redirected_from"] == a.id
+
+    stale = store.get(a.id, follow_redirect=False)
+    assert stale.linked_prs == []
+
+
+def test_add_linked_pr_unknown_fr_raises(store):
+    with pytest.raises(FRError):
+        store.add_linked_pr("fr_developer_deadbeef", {"repo": "r", "number": 1})
+
+
+def test_add_linked_spec_appends_and_dedupes(store):
+    fr = store.promote(target="developer", title="T3", description="d")
+    spec = {"project": "developer", "path": "specs/MS-01/spec.md", "section": "MS-01"}
+    store.add_linked_spec(fr.id, spec)
+    updated = store.add_linked_spec(fr.id, spec)
+    assert updated.linked_specs == [spec]
+
+
+def test_add_linked_milestone_appends_and_dedupes(store):
+    fr = store.promote(target="developer", title="T4", description="d")
+    store.add_linked_milestone(fr.id, "ms_developer_abc123")
+    updated = store.add_linked_milestone(fr.id, "ms_developer_abc123")
+    assert updated.linked_milestones == ["ms_developer_abc123"]
+
+
+def test_clear_reverse_links_wipes_all_three_on_exact_id(store):
+    a = store.promote(target="developer", title="A2", description="d")
+    b = store.promote(target="developer", title="B2", description="d")
+    store.add_linked_pr(a.id, {"repo": "r", "number": 1})
+    store.merge(source_ids=[a.id, b.id], title="A2+B2", description="d")
+    # a is now merged (terminal target differs) — clear its stale linked_prs
+    # directly by exact id (no redirect) as the repair pass does.
+    cleared = store.clear_reverse_links(a.id)
+    assert cleared.linked_prs == []
+    assert cleared.linked_specs == []
+    assert cleared.linked_milestones == []

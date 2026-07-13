@@ -330,6 +330,7 @@ async def merge_pr_and_sync(
 
     pr = await gh.get_pr(repo, pr_number)
     title = str(pr.get("title") or "")
+    body = str(pr.get("body") or "")
     head_ref = str(pr.get("head") or "")
     head_repo = str(pr.get("head_repo") or "")
     base_repo = str(pr.get("base_repo") or "") or repo
@@ -380,7 +381,7 @@ async def merge_pr_and_sync(
 
     if merged and on_merged is not None:
         try:
-            await on_merged(repo, pr_number, title)
+            await on_merged(repo, pr_number, title, body=body)
         except Exception as e:
             logger.warning(
                 "merge_pr_and_sync(%s#%d): on_merged hook failed: %s",

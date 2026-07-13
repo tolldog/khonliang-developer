@@ -11,12 +11,16 @@ developer-specific glue:
     referenced therein. FRs are resolved from developer's authoritative
     FR store; researcher remains an evidence/concept source only.
 
-No persistence. No LLM calls. Spec/milestone documents are workspace
-artifacts and are never written to ``KnowledgeStore``.
+No LLM calls. Spec/milestone documents themselves are workspace
+artifacts and are never written to ``KnowledgeStore`` — the one
+exception is ``list_specs``' best-effort mirror of each spec's
+``**FR:**`` reference onto that FR's ``linked_specs`` (fr_developer_
+cfe3001c), which does write through ``FRStore`` when one is configured.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +30,8 @@ from khonliang_researcher.doc_reader import DocContent, LocalDocReader
 from developer.config import ProjectConfig
 from developer.fr_store import FRStore
 from developer.researcher_client import FRRecord
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +222,13 @@ class SpecReader:
         Uses ``projects[project].specs_dir`` from config — never a hardcoded
         ``specs/`` path. Returns an empty list if the project is unknown or
         the specs directory does not exist.
+
+        Best-effort side effect (fr_developer_cfe3001c): for every spec
+        with a resolvable ``**FR:**`` id, mirrors ``{project, path,
+        section=title}`` onto that FR's terminal ``linked_specs`` via
+        ``FRStore.add_linked_spec``. Only runs when this reader was
+        constructed with an ``fr_store``; a mirror failure for one spec
+        is logged and does not stop the scan or fail the call.
         """
         proj = self._projects.get(project)
         if proj is None:
@@ -224,7 +237,23 @@ class SpecReader:
         if not root.exists():
             return []
         paths = self._reader.glob_docs(str(root), pattern="**/spec.md")
-        return [self.summarize(p) for p in paths]
+        summaries = [self.summarize(p) for p in paths]
+        if self._fr_store is not None:
+            for summary in summaries:
+                if not summary.fr:
+                    continue
+                try:
+                    self._fr_store.add_linked_spec(summary.fr, {
+                        "project": project,
+                        "path": summary.path,
+                        "section": summary.title,
+                    })
+                except Exception:
+                    logger.warning(
+                        "linked_specs mirror failed for fr %s <- spec %s",
+                        summary.fr, summary.path, exc_info=True,
+                    )
+        return summaries
 
     # ------------------------------------------------------------------
     # Traverse
