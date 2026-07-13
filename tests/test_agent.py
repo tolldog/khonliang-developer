@@ -4514,3 +4514,134 @@ async def test_compose_extension_briefing_repo_context_honors_requested_detail(h
     # "domain" only appears in brief/full EcosystemView.to_dict output,
     # not compact — its presence proves detail was threaded through.
     assert "domain" in result["repo_context"]
+
+
+# -- run_tests → store artifact routing (fr_developer_a6627bb4) --------
+
+
+def _fake_run_result(*, raw_output="collected 1 item\n1 passed in 0.01s\n",
+                      passed=1, failed=0, errors=0, timed_out=False):
+    from developer.tests_runner import RunResult
+    return RunResult(
+        command=["pytest"],
+        cwd=".",
+        returncode=0,
+        elapsed_s=0.01,
+        passed=passed,
+        failed=failed,
+        errors=errors,
+        parsed=True,
+        raw_output=raw_output,
+        timed_out=timed_out,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_tests_persists_pytest_output_as_store_artifact(harness, monkeypatch):
+    from developer import tests_runner
+
+    fake_result = _fake_run_result()
+
+    async def fake_run_pytest(*, cwd, target, timeout_s):
+        return fake_result
+
+    monkeypatch.setattr(tests_runner, "run_pytest", fake_run_pytest)
+
+    captured = {}
+
+    async def mock_request(**kwargs):
+        captured.update(kwargs)
+        assert kwargs["agent_type"] == "store"
+        assert kwargs["operation"] == "artifact_create"
+        return {"result": {"id": "art_abc123"}}
+
+    harness.agent.request = mock_request
+    result = await harness.call("run_tests", {"project": "developer"})
+
+    assert result["artifact_id"] == "art_abc123"
+    store_args = captured["args"]
+    assert store_args["kind"] == "pytest_output"
+    assert store_args["content"] == fake_result.raw_output
+    assert store_args["content_type"] == "text/plain"
+    assert store_args["metadata"]["project"] == "developer"
+    assert store_args["metadata"]["passed"] == 1
+    assert store_args["metadata"]["failed"] == 0
+    assert store_args["metadata"]["raw_chars"] == len(fake_result.raw_output)
+    assert store_args["metadata"]["exceeds_read_cap"] is False
+    # digest is still returned in the same shape as before.
+    assert "digest" in result
+    # Codex review on PR #92: bound with a short explicit timeout, not
+    # the bus client's 30s default, so a down/slow store can't stall
+    # run_tests's return. 2.0 (not 5.0) because BaseAgent.request adds
+    # a fixed 5s read slack on top — round 2 finding: 5.0 here would
+    # actually allow ~10s, not the intended ~5s worst case.
+    assert captured["timeout"] == 2.0
+
+
+@pytest.mark.asyncio
+async def test_run_tests_flags_exceeds_read_cap_for_large_output(harness, monkeypatch):
+    from developer import tests_runner
+
+    big_output = "x" * 20_001
+    fake_result = _fake_run_result(raw_output=big_output)
+
+    async def fake_run_pytest(*, cwd, target, timeout_s):
+        return fake_result
+
+    monkeypatch.setattr(tests_runner, "run_pytest", fake_run_pytest)
+
+    captured = {}
+
+    async def mock_request(**kwargs):
+        captured.update(kwargs)
+        return {"result": {"id": "art_big"}}
+
+    harness.agent.request = mock_request
+    result = await harness.call("run_tests", {"project": "developer"})
+
+    assert result["artifact_id"] == "art_big"
+    assert captured["args"]["metadata"]["exceeds_read_cap"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_tests_store_unreachable_does_not_fail_the_run(harness, monkeypatch):
+    """Persistence is best-effort: a store failure must not fail run_tests
+    itself, and the digest/summary fields still come back unchanged."""
+    from developer import tests_runner
+
+    fake_result = _fake_run_result(passed=0, failed=1)
+
+    async def fake_run_pytest(*, cwd, target, timeout_s):
+        return fake_result
+
+    monkeypatch.setattr(tests_runner, "run_pytest", fake_run_pytest)
+
+    async def failing_request(**kwargs):
+        raise ConnectionError("store unreachable")
+
+    harness.agent.request = failing_request
+    result = await harness.call("run_tests", {"project": "developer"})
+
+    assert result["artifact_id"] is None
+    assert result["failed"] == 1
+    assert "digest" in result
+
+
+@pytest.mark.asyncio
+async def test_run_tests_store_error_envelope_yields_none_artifact_id(harness, monkeypatch):
+    from developer import tests_runner
+
+    fake_result = _fake_run_result()
+
+    async def fake_run_pytest(*, cwd, target, timeout_s):
+        return fake_result
+
+    monkeypatch.setattr(tests_runner, "run_pytest", fake_run_pytest)
+
+    async def mock_request(**kwargs):
+        return {"result": {"error": "kind is required"}}
+
+    harness.agent.request = mock_request
+    result = await harness.call("run_tests", {"project": "developer"})
+
+    assert result["artifact_id"] is None

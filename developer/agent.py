@@ -96,6 +96,24 @@ def _parse_repos_arg(raw):
 
 logger = logging.getLogger(__name__)
 
+# Mirrors store's read-side clamp (khonliang-store store/local_store.py
+# HARD_MAX_CHARS=20000) so run_tests can flag at write time whether a
+# caller reading the artifact back via the default artifact_get will hit
+# truncation, without importing the store package as a dependency.
+_STORE_READ_CAP_CHARS = 20_000
+
+
+def _unwrap(envelope: Any) -> Any:
+    """Pull the inner payload from a bus request envelope.
+
+    ``self.request`` wraps a handler's result as ``{"result": <payload>}``;
+    error/transport envelopes arrive flat. Return the inner ``result`` when
+    present, otherwise the envelope itself, so store callers see one shape.
+    """
+    if isinstance(envelope, dict):
+        return envelope.get("result", envelope)
+    return envelope
+
 
 class DeveloperAgent(BaseAgent):
     agent_type = "developer"
@@ -4569,6 +4587,10 @@ class DeveloperAgent(BaseAgent):
             await self.report_gap("run_tests", f"pytest launch failed in {cwd}: {e}")
             raise
 
+        artifact_id = await self._persist_run_tests_artifact(
+            project=project, cwd=str(cwd), target=target, result=result,
+        )
+
         return {
             "project": project,
             "cwd": str(cwd),
@@ -4581,7 +4603,68 @@ class DeveloperAgent(BaseAgent):
             "timed_out": result.timed_out,
             "parsed": result.parsed,
             "digest": tests_runner.format_response(result, detail=detail),
+            "artifact_id": artifact_id,
         }
+
+    async def _persist_run_tests_artifact(
+        self, *, project: str, cwd: str, target: str, result,
+    ) -> str | None:
+        """Best-effort: stage raw pytest output as a store artifact.
+
+        Returns the new artifact id, or ``None`` when the store is
+        unreachable / errors — persistence is secondary to the test run
+        itself, so a store failure must never fail run_tests. Uses a
+        short explicit timeout (not the bus client's 30s default) so a
+        down/slow store degrades run_tests's return time by a few
+        seconds, not tens of seconds. ``BaseAgent.request`` adds a fixed
+        5s read slack on top of whatever ``timeout`` it's given (Codex
+        round 2 on PR #92), so passing 2.0 here bounds the actual worst
+        case at ~7s, not the naively-expected 5s.
+        """
+        from developer.git_client import GitClient, GitClientError
+
+        try:
+            short_sha = GitClient(cwd).rev_parse("HEAD")[:12]
+        except GitClientError:
+            short_sha = "unknown"
+
+        raw = result.raw_output
+        try:
+            resp = await self.request(
+                agent_type="store",
+                operation="artifact_create",
+                args={
+                    "kind": "pytest_output",
+                    "title": f"{project} @ {short_sha}"[:200],
+                    "content": raw,
+                    "content_type": "text/plain",
+                    "producer": getattr(self, "agent_id", "developer"),
+                    "metadata": {
+                        "project": project,
+                        "target": target,
+                        "passed": result.passed,
+                        "failed": result.failed,
+                        "errors": result.errors,
+                        "timed_out": result.timed_out,
+                        "raw_chars": len(raw),
+                        "exceeds_read_cap": len(raw) > _STORE_READ_CAP_CHARS,
+                    },
+                },
+                timeout=2.0,
+            )
+        except Exception as exc:  # bus unreachable / transport error
+            logger.warning(
+                "run_tests: pytest_output artifact persistence skipped "
+                "(store unreachable): %s", exc,
+            )
+            return None
+        payload = _unwrap(resp)
+        if not isinstance(payload, dict) or "error" in payload:
+            logger.warning(
+                "run_tests: pytest_output artifact persistence failed: %s", payload,
+            )
+            return None
+        return payload.get("id") or (payload.get("artifact") or {}).get("id")
 
     # -- tracking infrastructure (Phase 1: CRUD-only) --
     #
