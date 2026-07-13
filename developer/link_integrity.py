@@ -150,12 +150,19 @@ def repair_link_integrity(
             # actually the more complete one — skipping it here instead
             # threw away real upgrades, the exact legacy-drift case
             # repair exists to fix.
+            # Pass the ORIGINAL stale id, not the pre-resolved
+            # terminal_id (Codex R12 on PR #93) — add_linked_* already
+            # does its own redirect resolution and sets
+            # redirected_from when the id it was given differs from
+            # where it landed; pre-resolving here meant the id we
+            # passed always equaled the terminal, so that provenance
+            # marker was silently dropped on every repaired entry.
             for pr in stale.linked_prs:
-                frs.add_linked_pr(terminal_id, pr)
+                frs.add_linked_pr(mismatch["fr_id"], pr)
             for spec in stale.linked_specs:
-                frs.add_linked_spec(terminal_id, spec)
+                frs.add_linked_spec(mismatch["fr_id"], spec)
             for ms_id in stale.linked_milestones:
-                frs.add_linked_milestone(terminal_id, ms_id)
+                frs.add_linked_milestone(mismatch["fr_id"], ms_id)
             frs.clear_reverse_links(mismatch["fr_id"])
             terminal = frs.get(terminal_id, follow_redirect=False)
             if terminal is not None:

@@ -1174,7 +1174,13 @@ class FRStore:
         """Record a spec reference on ``fr_id``'s terminal FR.
 
         ``spec`` is ``{project, path, section}``. Dedupes on
-        ``(project, path, section)``.
+        ``(project, path, section)``, but a matching entry is replaced
+        in place (not treated as a permanent no-op) when its
+        ``redirected_from`` marker is stale — e.g. a spec first scanned
+        while ``fr_id`` still redirected, then rescanned after the file
+        was edited to reference the terminal id directly (Codex R12 on
+        PR #93): the old entry would otherwise keep claiming a redirect
+        that no longer applies.
         """
         fr = self._resolve_for_link(fr_id)
         project = str(spec.get("project") or "")
@@ -1186,10 +1192,15 @@ class FRStore:
         if fr.id != fr_id:
             entry["redirected_from"] = fr_id
         key = (project, path, section)
-        for existing in fr.linked_specs:
+        for i, existing in enumerate(fr.linked_specs):
             if (
                 existing.get("project"), existing.get("path"), existing.get("section"),
             ) == key:
+                if existing == entry:
+                    return fr
+                fr.linked_specs[i] = entry
+                fr.updated_at = time.time()
+                self._store(fr)
                 return fr
         fr.linked_specs.append(entry)
         fr.updated_at = time.time()

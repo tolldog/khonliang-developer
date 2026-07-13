@@ -1434,6 +1434,23 @@ def test_add_linked_spec_appends_and_dedupes(store):
     assert updated.linked_specs == [spec]
 
 
+def test_add_linked_spec_refreshes_stale_redirected_from_marker(store):
+    """Codex R12 on PR #93: a spec first scanned while still naming a
+    merged-away FR id gets redirected_from set. If the file is later
+    edited to reference the terminal id directly, re-scanning must
+    refresh (not permanently keep) that now-stale marker."""
+    a = store.promote(target="developer", title="Refresh A", description="d")
+    b = store.promote(target="developer", title="Refresh B", description="d")
+    terminal = store.merge(source_ids=[a.id, b.id], title="Refresh target", description="d")
+    spec = {"project": "developer", "path": "specs/MS-01/spec.md", "section": "MS-01"}
+
+    updated = store.add_linked_spec(a.id, spec)
+    assert updated.linked_specs[0]["redirected_from"] == a.id
+
+    refreshed = store.add_linked_spec(terminal.id, spec)
+    assert "redirected_from" not in refreshed.linked_specs[0]
+
+
 def test_add_linked_milestone_appends_and_dedupes(store):
     fr = store.promote(target="developer", title="T4", description="d")
     store.add_linked_milestone(fr.id, "ms_developer_abc123")

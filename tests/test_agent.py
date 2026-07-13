@@ -4776,7 +4776,10 @@ async def test_repair_link_integrity_upgrades_terminal_with_more_complete_stale_
 
     terminal_after = harness.agent.pipeline.frs.get(target_fr.id, follow_redirect=False)
     assert terminal_after.linked_prs == [
-        {"repo": "r", "number": 1, "state": "merged", "merged_at": "2026-05-01T00:00:00Z"},
+        {
+            "repo": "r", "number": 1, "state": "merged", "merged_at": "2026-05-01T00:00:00Z",
+            "redirected_from": "fr_developer_upgradesrc",
+        },
     ]
 
 
