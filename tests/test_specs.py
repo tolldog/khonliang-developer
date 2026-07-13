@@ -210,6 +210,29 @@ def test_list_specs_prunes_stale_linked_spec_when_file_deleted(pipeline, tmp_pat
     assert pipeline.frs.get(fr.id).linked_specs == []
 
 
+def test_list_specs_prunes_stale_linked_spec_when_specs_root_deleted(pipeline, tmp_path):
+    """Codex R11 on PR #93: the whole specs_root directory being
+    renamed/deleted (not just one file) must still trigger
+    reconciliation — the old early ``return []`` when ``root.exists()``
+    is False bypassed the stale-entry cleanup entirely, leaving every
+    previously-recorded linked_specs entry for the project stranded
+    forever."""
+    import shutil
+
+    fr = pipeline.frs.promote(target="developer", title="Whole root deleted test", description="d")
+    reader, specs_dir = _spec_reader_over(tmp_path, pipeline.frs)
+    spec_path = specs_dir / "spec.md"
+    spec_path.write_text(f"# MS-01\n\n**FR:** `{fr.id}`\n")
+    reader.list_specs("proj")
+    assert pipeline.frs.get(fr.id).linked_specs != []
+
+    shutil.rmtree(tmp_path / "specs")
+    summaries = reader.list_specs("proj")
+
+    assert summaries == []
+    assert pipeline.frs.get(fr.id).linked_specs == []
+
+
 # ---------------------------------------------------------------------------
 # Acceptance #6 — traverse_milestone walks milestone → specs → FRs
 # ---------------------------------------------------------------------------

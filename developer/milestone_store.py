@@ -1054,7 +1054,11 @@ class MilestoneStore:
 
         ``pr`` is ``{repo, number, state, merged_at}``. Dedupes on
         ``(repo, number)`` — a later call for the same PR (e.g.
-        open -> merged) updates the existing entry in place.
+        open -> merged) updates the existing entry in place, but only
+        when the new entry is at least as complete (Codex R11 on PR
+        #93, same policy as ``FRStore.add_linked_pr``): an
+        out-of-order or stale replay must not regress an already-
+        ``merged`` entry back to ``open``/unknown ``merged_at``.
         """
         milestone = self.get(milestone_id)
         if milestone is None:
@@ -1071,7 +1075,8 @@ class MilestoneStore:
         }
         for i, existing in enumerate(milestone.linked_prs):
             if existing.get("repo") == repo and existing.get("number") == number:
-                milestone.linked_prs[i] = entry
+                if _pr_completeness_score(entry) >= _pr_completeness_score(existing):
+                    milestone.linked_prs[i] = entry
                 break
         else:
             milestone.linked_prs.append(entry)

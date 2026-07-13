@@ -4133,8 +4133,14 @@ async def test_sync_fr_status_on_merge_falls_back_to_none_without_merged_at(harn
 
 
 @pytest.mark.asyncio
-async def test_sync_fr_status_on_merge_scans_body_too(harness):
-    """FR ids in the PR body (not just title) must be picked up."""
+async def test_sync_fr_status_on_merge_scans_body_for_linked_prs_only(harness):
+    """Codex R11 on PR #93: a body-only FR reference populates the
+    reverse link (informational, no side effect on the FR's own
+    lifecycle) but must NOT auto-complete the FR's status — PR bodies
+    routinely mention FRs they don't close (dependencies, related
+    work, checklists), and status-completion has real side effects
+    (unblocking dependents). Title-only stays the completion signal;
+    title+body is the reverse-link signal."""
     fr = harness.agent.pipeline.frs.promote(
         target="developer", title="Body scan test", description="d",
     )
@@ -4145,8 +4151,32 @@ async def test_sync_fr_status_on_merge_scans_body_too(harness):
     )
 
     updated = harness.agent.pipeline.frs.get(fr.id)
-    assert updated.status == "completed"
+    assert updated.status == "open"
     assert len(updated.linked_prs) == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_completes_only_title_referenced_fr(harness):
+    """Codex R11 on PR #93: a PR whose title closes FR A but whose body
+    merely mentions FR B (a dependency, "relates to", etc.) must
+    complete A but leave B's status untouched — B still gets the
+    reverse link since it's genuinely a PR that touched it."""
+    fr_a = harness.agent.pipeline.frs.promote(
+        target="developer", title="Title-closed FR", description="d",
+    )
+    fr_b = harness.agent.pipeline.frs.promote(
+        target="developer", title="Body-mentioned FR", description="d",
+    )
+
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 206, f"fix: ship it ({fr_a.id})",
+        body=f"Depends on {fr_b.id}",
+    )
+
+    assert harness.agent.pipeline.frs.get(fr_a.id).status == "completed"
+    updated_b = harness.agent.pipeline.frs.get(fr_b.id)
+    assert updated_b.status == "open"
+    assert len(updated_b.linked_prs) == 1
 
 
 @pytest.mark.asyncio

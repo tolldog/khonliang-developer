@@ -248,16 +248,24 @@ class SpecReader:
 
         Only runs when this reader was constructed with an
         ``fr_store``; a failure for one spec/FR is logged and does not
-        stop the scan or fail the call.
+        stop the scan or fail the call. Reconciliation runs even when
+        the whole ``specs_root`` is gone (renamed/deleted project
+        directory) — an empty scan correctly flags every previously-
+        recorded ``linked_specs`` entry for this project as stale
+        rather than silently leaving them all in place forever (Codex
+        R11 on PR #93; individual file deletion was already handled by
+        the per-path comparison, but the whole-directory case used to
+        bypass reconciliation entirely via an early ``return``).
         """
         proj = self._projects.get(project)
         if proj is None:
             return []
         root = proj.specs_root
-        if not root.exists():
-            return []
-        paths = self._reader.glob_docs(str(root), pattern="**/spec.md")
-        summaries = [self.summarize(p) for p in paths]
+        if root.exists():
+            paths = self._reader.glob_docs(str(root), pattern="**/spec.md")
+            summaries = [self.summarize(p) for p in paths]
+        else:
+            summaries = []
         if self._fr_store is not None:
             # Authoritative path -> (terminal fr id, current section),
             # from THIS scan. Resolve through redirects so a spec still

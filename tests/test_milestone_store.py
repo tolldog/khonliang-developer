@@ -1448,6 +1448,25 @@ def test_milestone_add_linked_pr_unknown_milestone_raises(pipeline):
         pipeline.milestones.add_linked_pr("ms_developer_deadbeef", {"repo": "r", "number": 1})
 
 
+def test_milestone_add_linked_pr_does_not_downgrade_a_more_complete_entry(pipeline):
+    """Codex R11 on PR #93: an out-of-order or stale replay must not
+    regress an already-merged milestone PR entry back to open/unknown
+    merged_at."""
+    fr_a = pipeline.frs.promote(target="developer", title="G2", description="d")
+    ms = pipeline.milestones.propose_from_work_unit(_wu_for(fr_a.id))
+
+    pipeline.milestones.add_linked_pr(ms.id, {
+        "repo": "r", "number": 9, "state": "merged", "merged_at": "2026-05-01T00:00:00Z",
+    })
+    updated = pipeline.milestones.add_linked_pr(ms.id, {
+        "repo": "r", "number": 9, "state": "open", "merged_at": None,
+    })
+
+    assert len(updated.linked_prs) == 1
+    assert updated.linked_prs[0]["state"] == "merged"
+    assert updated.linked_prs[0]["merged_at"] == "2026-05-01T00:00:00Z"
+
+
 def test_sync_linked_prs_prefers_more_complete_duplicate_across_bundled_frs(pipeline):
     """Codex R9 on PR #93: two FRs in the same milestone can carry
     different copies of the SAME PR (e.g. one still has a pre-merge/

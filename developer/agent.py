@@ -247,21 +247,33 @@ class DeveloperAgent(BaseAgent):
         False`` (unchanged, see ``_advance_fr_to_completed``): those are
         independent concerns and mixing them would let one source FR's
         completion mark a whole consolidated target as shipped.
+
+        Status completion is TITLE-ONLY, deliberately narrower than
+        reverse-link population (Codex R11 on PR #93): a PR body
+        commonly mentions FR ids that this PR does NOT close — related
+        work, dependencies ("depends on fr_x"), checklists — so
+        scanning the whole body for auto-completion would wrongly mark
+        unrelated FRs 'completed' and unblock their dependents on a
+        merely-mentioned reference. Reverse-link tracking has no such
+        side effect (it's just "this PR touched this FR" metadata), so
+        it's fine to be broader and cover body mentions too.
         """
         from developer.pr_watcher import extract_fr_ids
         from developer.fr_store import FRError
 
         notes = f"auto-synced: {repo}#{pr_number} merged"
-        fr_ids = extract_fr_ids(title)
+        title_fr_ids = extract_fr_ids(title)
+        linked_fr_ids = title_fr_ids
         if body:
-            fr_ids = list(dict.fromkeys(fr_ids + extract_fr_ids(body)))
-        for fr_id in fr_ids:
+            linked_fr_ids = list(dict.fromkeys(title_fr_ids + extract_fr_ids(body)))
+        for fr_id in title_fr_ids:
             try:
                 self._advance_fr_to_completed(fr_id, notes)
             except FRError as e:
                 await self._safe_report_gap(
                     "pr_watcher.on_merged", f"{fr_id} ({repo}#{pr_number}): {e}",
                 )
+        for fr_id in linked_fr_ids:
             pr_entry = {
                 "repo": repo,
                 "number": pr_number,
