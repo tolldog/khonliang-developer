@@ -4409,6 +4409,88 @@ async def test_repair_link_integrity_backfills_milestone_linked_prs(harness):
     }]
 
 
+@pytest.mark.asyncio
+async def test_repair_link_integrity_refuses_to_destroy_data_on_dangling_redirect(harness):
+    """Codex R3 on PR #93: if merged_into points at a missing FR
+    (broken/dangling redirect on legacy or corrupted data), resolve_id
+    falls back to the stale id itself. Moving links to "the terminal"
+    in that case would re-add them to the SAME record right before
+    clearing it — destroying the only copy. Repair must refuse instead
+    of wiping the data."""
+    import time as _time
+
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+
+    now = _time.time()
+    entry = KnowledgeEntry(
+        id="fr_developer_danglingsrc",
+        tier=Tier.DERIVED,
+        title="dangling source",
+        content="d",
+        source="test",
+        scope="development",
+        tags=["fr", "target:developer", "app"],
+        status=EntryStatus.DISTILLED,
+        metadata={
+            "fr_status": "merged",
+            "priority": "medium",
+            "target": "developer",
+            "classification": "app",
+            "merged_into": "fr_developer_doesnotexist",
+            "linked_prs": [{"repo": "r", "number": 1}],
+        },
+        created_at=now,
+        updated_at=now,
+    )
+    harness.agent.pipeline.frs.knowledge.add(entry)
+
+    result = await harness.call(
+        "repair_link_integrity", {"project": "khonliang", "dry_run": False},
+    )
+
+    assert result["repaired"] == []
+    hit = next(
+        m for m in result["skipped"] if m["fr_id"] == "fr_developer_danglingsrc"
+    )
+    assert "broken" in hit["reason"] or "dangling" in hit["reason"]
+    # The critical assertion: data survives.
+    survived = harness.agent.pipeline.frs.get("fr_developer_danglingsrc", follow_redirect=False)
+    assert survived.linked_prs == [{"repo": "r", "number": 1}]
+
+
+@pytest.mark.asyncio
+async def test_update_frs_prunes_stale_milestone_linked_pr_on_removal(harness):
+    """Codex R3 on PR #93: Milestone.linked_prs must be a wholesale
+    recompute over the CURRENT bundle, not an add-only mirror — an FR
+    removed from the bundle must stop contributing its PR to the
+    milestone's union."""
+    fr_a = harness.agent.pipeline.frs.promote(
+        target="developer", title="Prune test A", description="d",
+    )
+    fr_b = harness.agent.pipeline.frs.promote(
+        target="developer", title="Prune test B", description="d",
+    )
+    harness.agent.pipeline.frs.add_linked_pr(fr_a.id, {
+        "repo": "r", "number": 1, "state": "merged", "merged_at": 1.0,
+    })
+    ms = harness.agent.pipeline.milestones.propose_from_work_unit({
+        "name": "wu", "rank": 1, "targets": ["developer"],
+        "frs": [
+            {"fr_id": fr_a.id, "target": "developer", "title": fr_a.id},
+            {"fr_id": fr_b.id, "target": "developer", "title": fr_b.id},
+        ],
+    }, fr_store=harness.agent.pipeline.frs)
+    assert harness.agent.pipeline.milestones.get(ms.id).linked_prs == [
+        {"repo": "r", "number": 1, "state": "merged", "merged_at": 1.0},
+    ]
+
+    await harness.call("update_milestone_frs", {
+        "milestone_id": ms.id, "remove_fr_ids": fr_a.id,
+    })
+
+    assert harness.agent.pipeline.milestones.get(ms.id).linked_prs == []
+
+
 # -- dev-repo registry (fr_developer_5f3dc62e) --------------------------
 
 

@@ -380,8 +380,10 @@ async def merge_pr_and_sync(
                 )
 
     if merged and on_merged is not None:
+        from developer.pr_watcher import _invoke_on_merged
+
         try:
-            await on_merged(repo, pr_number, title, body=body)
+            await _invoke_on_merged(on_merged, repo, pr_number, title, body)
         except Exception as e:
             logger.warning(
                 "merge_pr_and_sync(%s#%d): on_merged hook failed: %s",

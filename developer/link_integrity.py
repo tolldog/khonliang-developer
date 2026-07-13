@@ -114,6 +114,23 @@ def repair_link_integrity(
             repaired.append(mismatch)
         elif kind == "reverse_link_on_merged_fr":
             terminal_id = frs.resolve_id(mismatch["fr_id"])
+            if terminal_id == mismatch["fr_id"]:
+                # resolve_id() falls back to the stale id itself when
+                # merged_into points at a missing/broken target
+                # (dangling redirect on corrupted/legacy data) — moving
+                # links to "the terminal" would just re-add them to the
+                # SAME record right before clear_reverse_links wipes it,
+                # destroying the only copy (Codex R3 on PR #93). Refuse
+                # rather than repair onto a target that isn't real.
+                skipped.append({
+                    **mismatch,
+                    "reason": (
+                        "merged_into is missing/broken; resolve_id "
+                        "can't find a real terminal fr — refusing to "
+                        "move (and then wipe) reverse links"
+                    ),
+                })
+                continue
             stale = frs.get(mismatch["fr_id"], follow_redirect=False)
             if stale is None:
                 skipped.append({**mismatch, "reason": "stale fr no longer exists"})

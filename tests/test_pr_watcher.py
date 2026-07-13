@@ -349,6 +349,31 @@ async def test_on_merged_hook_receives_pr_body(store):
     assert received["body"] == "Closes fr_developer_deadbeef"
 
 
+async def test_on_merged_hook_backward_compatible_with_bare_3_arg_signature(store):
+    """Codex R3 on PR #93: a pre-existing on_merged implementation with
+    the ORIGINAL bare (repo, pr_number, title) signature — no body
+    param at all — must still be called successfully, not TypeError.
+    A TypeError here would leave the merge un-synced and retried
+    forever every poll cycle."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    calls: list[tuple] = []
+
+    async def legacy_on_merged(repo: str, pr_number: int, title: str) -> None:
+        calls.append((repo, pr_number, title))
+
+    watcher = _make_watcher(store, gh, published, on_merged=legacy_on_merged)
+
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(
+        head_sha="final", title="fix: thing", body="some body",
+        state="closed", merged=True, merged_at="2026-04-21T12:00:00Z",
+        mergeable=True, merge_state="clean",
+    )
+    await watcher.poll_once()
+
+    assert calls == [("owner/repo", 1, "fix: thing")]
+
+
 async def test_on_merged_hook_failure_does_not_break_poll(store):
     """A raising on_merged hook must not crash the poll cycle or prevent
     the TOPIC_MERGED publish from having already landed.

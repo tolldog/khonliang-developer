@@ -476,6 +476,25 @@ async def test_merge_pr_and_sync_passes_pr_body_to_on_merged():
 
 
 @pytest.mark.asyncio
+async def test_merge_pr_and_sync_backward_compatible_with_bare_3_arg_on_merged():
+    """Codex R3 on PR #93: a pre-existing on_merged with the ORIGINAL
+    bare (repo, pr_number, title) signature must still fire — not be
+    silently skipped by a TypeError swallowed as "hook failed"."""
+    fake_gh = _FakeGithubClientForMerge()
+    calls = []
+
+    async def legacy_on_merged(repo, pr_number, title):
+        calls.append((repo, pr_number, title))
+
+    await merge_pr_and_sync(
+        "https://github.com/tolldog/khonliang-developer/pull/84",
+        github_client=fake_gh, on_merged=legacy_on_merged,
+    )
+
+    assert calls == [("tolldog/khonliang-developer", 84, "fr_developer_1234abcd: thing")]
+
+
+@pytest.mark.asyncio
 async def test_merge_pr_and_sync_skips_branch_delete_for_fork_pr():
     """Codex R1 on PR #88: a fork-shaped PR (head repo != base repo)
     must not have its head branch deleted against the base repo — that

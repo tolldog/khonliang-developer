@@ -443,36 +443,66 @@ class MilestoneStore:
         self._store(milestone)
         if fr_store is not None:
             self._mirror_linked_milestone(fr_store, milestone.id, fr_ids)
+            self._sync_linked_prs_from_bundle(fr_store, milestone)
         return milestone
 
     def _mirror_linked_milestone(
         self, fr_store: Any, milestone_id: str, fr_ids: Iterable[str],
     ) -> None:
         """Best-effort: mirror ``milestone_id`` onto each fr's terminal
-        ``linked_milestones``, and backfill any of that fr's EXISTING
-        ``linked_prs`` onto this milestone (fr_developer_cfe3001c,
-        Codex review on PR #93).
+        ``linked_milestones`` (fr_developer_cfe3001c).
 
-        The backfill matters because ``linked_prs`` is advertised as
-        "union of PRs touching any bundled FR" — without it, an FR
-        bundled into a milestone AFTER a PR already merged (or after
-        ``repair_link_integrity`` moved links onto its terminal FR)
-        would leave the milestone's union stale until some later,
-        unrelated PR merge happened to trigger a mirror.
+        Only handles the FR-side pointer; ``linked_prs`` recompute is
+        :meth:`_sync_linked_prs_from_bundle`'s job (separate because it
+        must run over the FULL current bundle, not just the ids passed
+        here, so an FR *removal* correctly drops its PRs too).
 
         Never raises — a reverse-link failure must not fail the
         milestone mutation that's already landed.
         """
         for fr_id in fr_ids:
             try:
-                fr = fr_store.add_linked_milestone(fr_id, milestone_id)
-                for pr in fr.linked_prs:
-                    self.add_linked_pr(milestone_id, pr)
+                fr_store.add_linked_milestone(fr_id, milestone_id)
             except Exception:
                 logger.warning(
                     "linked_milestones mirror failed for fr %s <- milestone %s",
                     fr_id, milestone_id, exc_info=True,
                 )
+
+    def _sync_linked_prs_from_bundle(self, fr_store: Any, milestone: Milestone) -> None:
+        """Recompute ``milestone.linked_prs`` as the union of every
+        currently-bundled FR's ``linked_prs`` (fr_developer_cfe3001c,
+        Codex R3 on PR #93).
+
+        A wholesale recompute — not an incremental add-only mirror —
+        is what keeps "union of PRs touching any bundled FR" honest
+        across removals: an FR dropped from the bundle must stop
+        contributing its PRs to the milestone, and an add-only mirror
+        can never observe that. Best-effort; a lookup failure for one
+        FR just excludes its PRs rather than failing the whole sync.
+        """
+        union: dict[tuple, dict] = {}
+        for fr_id in milestone.fr_ids:
+            try:
+                fr = fr_store.get(fr_id, follow_redirect=True)
+            except Exception:
+                continue
+            if fr is None:
+                continue
+            for pr in fr.linked_prs:
+                union[(pr.get("repo"), pr.get("number"))] = pr
+        new_linked_prs = list(union.values())
+        if new_linked_prs == milestone.linked_prs:
+            return
+        milestone.linked_prs = new_linked_prs
+        milestone.updated_at = time.time()
+        try:
+            self._store(milestone)
+        except Exception:
+            logger.warning(
+                "linked_prs recompute failed to persist for milestone %s",
+                milestone.id, exc_info=True,
+            )
 
     def review_scope(
         self,
@@ -795,8 +825,13 @@ class MilestoneStore:
         # finding 2.
         self._refresh_draft_spec(milestone)
         self._store(milestone)
-        if fr_store is not None and added:
-            self._mirror_linked_milestone(fr_store, milestone.id, added)
+        if fr_store is not None:
+            if added:
+                self._mirror_linked_milestone(fr_store, milestone.id, added)
+            # Unconditional (not gated on `added`): removals must prune
+            # linked_prs too, and this recompute is a no-op if the
+            # bundle's PR union hasn't actually changed.
+            self._sync_linked_prs_from_bundle(fr_store, milestone)
         return milestone
 
     def delete(
