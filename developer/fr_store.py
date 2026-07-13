@@ -96,6 +96,23 @@ ALLOWED_PRIORITIES = {"high", "medium", "low"}
 _MAX_REDIRECT_DEPTH = 16
 
 
+def _pr_completeness_score(pr: dict) -> tuple:
+    """Rank a ``linked_prs`` entry's completeness for duplicate-{repo,
+    number} resolution (fr_developer_cfe3001c, Codex R8/R9 on PR #93).
+
+    Multiple independent sync paths (the PR watcher, ``merge_pr_and_
+    sync``, ``FRStore.merge()``'s reverse-link carry-forward, repair)
+    can all observe and write the SAME PR at different points in its
+    lifecycle. Naive last-write-wins lets a stale replay (e.g. an
+    ``open``/``merged_at=None`` copy arriving after a ``merged`` copy
+    was already recorded) regress already-correct data. Comparing
+    tuples with ``>`` picks the more complete entry regardless of
+    write order: merged beats any other state, and a known
+    ``merged_at`` beats an unknown one.
+    """
+    return (pr.get("state") == "merged", pr.get("merged_at") is not None)
+
+
 # ---------------------------------------------------------------------------
 # Domain object
 # ---------------------------------------------------------------------------
@@ -669,17 +686,10 @@ class FRStore:
                 # another after it merged) — keeping the first-seen
                 # copy unconditionally would regress the terminal FR
                 # to stale data even when a more complete copy exists
-                # on a later source (Codex R8 on PR #93). Prefer
-                # merged-state over any other state, and a known
-                # merged_at over an unknown one.
+                # on a later source (Codex R8 on PR #93).
                 idx = pr_index[pr_key]
                 existing = combined_linked_prs[idx]
-                existing_score = (
-                    existing.get("state") == "merged",
-                    existing.get("merged_at") is not None,
-                )
-                new_score = (pr.get("state") == "merged", pr.get("merged_at") is not None)
-                if new_score > existing_score:
+                if _pr_completeness_score(pr) > _pr_completeness_score(existing):
                     combined_linked_prs[idx] = dict(pr)
 
         combined_linked_specs: list[dict] = []
@@ -1130,8 +1140,11 @@ class FRStore:
         ``redirected_from`` key is added automatically when ``fr_id``
         resolved through a merge redirect. Dedupes on ``(repo,
         number)`` — a later call for the same PR (e.g. open -> merged)
-        updates the existing entry in place rather than appending a
-        duplicate.
+        updates the existing entry in place, but only when the new
+        entry is at least as complete (see :func:`_pr_completeness_score`):
+        multiple independent sync paths can observe the same merge, and
+        blind last-write-wins would let a stale replay erase an
+        already-correct ``merged`` record (Codex R9 on PR #93).
         """
         fr = self._resolve_for_link(fr_id)
         repo = str(pr.get("repo") or "")
@@ -1148,7 +1161,8 @@ class FRStore:
             entry["redirected_from"] = fr_id
         for i, existing in enumerate(fr.linked_prs):
             if existing.get("repo") == repo and existing.get("number") == number:
-                fr.linked_prs[i] = entry
+                if _pr_completeness_score(entry) >= _pr_completeness_score(existing):
+                    fr.linked_prs[i] = entry
                 break
         else:
             fr.linked_prs.append(entry)

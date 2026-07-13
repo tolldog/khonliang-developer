@@ -1448,6 +1448,30 @@ def test_milestone_add_linked_pr_unknown_milestone_raises(pipeline):
         pipeline.milestones.add_linked_pr("ms_developer_deadbeef", {"repo": "r", "number": 1})
 
 
+def test_sync_linked_prs_prefers_more_complete_duplicate_across_bundled_frs(pipeline):
+    """Codex R9 on PR #93: two FRs in the same milestone can carry
+    different copies of the SAME PR (e.g. one still has a pre-merge/
+    missing-merged_at entry). The union must keep the more complete
+    copy regardless of fr_ids iteration order, not whichever FR
+    happens to be visited last."""
+    stale_fr = pipeline.frs.promote(target="developer", title="Sync dup stale", description="d")
+    complete_fr = pipeline.frs.promote(target="developer", title="Sync dup complete", description="d")
+    pipeline.frs.add_linked_pr(
+        stale_fr.id, {"repo": "r", "number": 1, "state": "open", "merged_at": None},
+    )
+    pipeline.frs.add_linked_pr(
+        complete_fr.id,
+        {"repo": "r", "number": 1, "state": "merged", "merged_at": "2026-05-01T00:00:00Z"},
+    )
+    ms = pipeline.milestones.propose_from_work_unit(
+        _wu_for(stale_fr.id, complete_fr.id), fr_store=pipeline.frs,
+    )
+
+    assert pipeline.milestones.get(ms.id).linked_prs == [
+        {"repo": "r", "number": 1, "state": "merged", "merged_at": "2026-05-01T00:00:00Z"},
+    ]
+
+
 def test_repropose_preserves_linked_prs_without_fr_store(pipeline):
     """Codex R5 on PR #93: re-proposing an existing milestone rebuilds
     a fresh Milestone object. Without this preservation, a caller that

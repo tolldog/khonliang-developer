@@ -123,6 +123,19 @@ ALLOWED_MILESTONE_TRANSITIONS: dict[str, set[str]] = {
 }
 
 
+def _pr_completeness_score(pr: dict) -> tuple:
+    """Rank a ``linked_prs`` entry's completeness for duplicate-{repo,
+    number} resolution (fr_developer_cfe3001c, Codex R9 on PR #93).
+
+    Duplicated (not imported) from ``FRStore``'s identical helper —
+    this module deliberately stays free of any hard dependency on
+    fr_store (see the module docstring), so the tiny scoring rule is
+    kept local rather than pulled in via an import. Merged beats any
+    other state; a known ``merged_at`` beats an unknown one.
+    """
+    return (pr.get("state") == "merged", pr.get("merged_at") is not None)
+
+
 class MilestoneError(ValueError):
     """Raised on invalid milestone operations."""
 
@@ -501,7 +514,17 @@ class MilestoneStore:
             if fr is None:
                 continue
             for pr in fr.linked_prs:
-                union[(pr.get("repo"), pr.get("number"))] = pr
+                key = (pr.get("repo"), pr.get("number"))
+                existing = union.get(key)
+                # Two bundled FRs can carry different copies of the SAME
+                # PR (e.g. one still has a pre-merge/missing-merged_at
+                # entry while another was synced later) — plain
+                # last-write-wins would let whichever FR is iterated
+                # last decide the milestone's view, even if its copy is
+                # stale (Codex R9 on PR #93). Keep whichever copy is
+                # more complete instead.
+                if existing is None or _pr_completeness_score(pr) > _pr_completeness_score(existing):
+                    union[key] = pr
         new_linked_prs = list(union.values())
         if new_linked_prs == milestone.linked_prs:
             return

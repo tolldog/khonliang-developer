@@ -1394,6 +1394,18 @@ def test_add_linked_pr_updates_existing_entry_in_place(store):
     assert updated.linked_prs[0]["merged_at"] == 123.0
 
 
+def test_add_linked_pr_does_not_downgrade_a_more_complete_entry(store):
+    """Codex R9 on PR #93: a later call with LESS complete data (e.g. a
+    stale replay from a different sync path) must not overwrite an
+    already-recorded merged/merged_at entry."""
+    fr = store.promote(target="developer", title="T2b", description="d")
+    store.add_linked_pr(fr.id, {"repo": "r", "number": 1, "state": "merged", "merged_at": "2026-05-01T00:00:00Z"})
+    updated = store.add_linked_pr(fr.id, {"repo": "r", "number": 1, "state": "open", "merged_at": None})
+    assert len(updated.linked_prs) == 1
+    assert updated.linked_prs[0]["state"] == "merged"
+    assert updated.linked_prs[0]["merged_at"] == "2026-05-01T00:00:00Z"
+
+
 def test_add_linked_pr_resolves_through_merge_redirect(store):
     """A PR reference to a since-merged-away FR lands on the terminal FR,
     with redirected_from recording the original id."""
