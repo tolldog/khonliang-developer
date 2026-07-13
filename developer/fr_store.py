@@ -1165,6 +1165,32 @@ class FRStore:
         self._store(fr)
         return fr
 
+    def remove_linked_specs(self, fr_id: str, specs: list[dict]) -> FR:
+        """Remove specific ``linked_specs`` entries by exact
+        ``(project, path, section)`` match, on the EXACT id given (no
+        redirect resolution — callers already have a resolved FR from
+        ``list()``/``get()``).
+
+        Used by :meth:`developer.specs.SpecReader.list_specs` to prune
+        stale reverse links when a spec's ``**FR:**`` reference changes
+        or the file moves/is deleted (fr_developer_cfe3001c, Codex R5
+        on PR #93) — ``add_linked_spec`` is append-only by design and
+        has no way to know an old entry is no longer current.
+        """
+        fr = self.get(fr_id, follow_redirect=False)
+        if fr is None:
+            raise FRError(f"unknown fr id: {fr_id}")
+        remove_keys = {
+            (s.get("project"), s.get("path"), s.get("section")) for s in specs
+        }
+        fr.linked_specs = [
+            sp for sp in fr.linked_specs
+            if (sp.get("project"), sp.get("path"), sp.get("section")) not in remove_keys
+        ]
+        fr.updated_at = time.time()
+        self._store(fr)
+        return fr
+
     def add_linked_milestone(self, fr_id: str, milestone_id: str) -> FR:
         """Record a milestone id on ``fr_id``'s terminal FR.
 

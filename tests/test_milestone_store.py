@@ -1446,3 +1446,34 @@ def test_milestone_add_linked_pr_appends_and_dedupes(pipeline):
 def test_milestone_add_linked_pr_unknown_milestone_raises(pipeline):
     with pytest.raises(MilestoneError):
         pipeline.milestones.add_linked_pr("ms_developer_deadbeef", {"repo": "r", "number": 1})
+
+
+def test_repropose_preserves_linked_prs_without_fr_store(pipeline):
+    """Codex R5 on PR #93: re-proposing an existing milestone rebuilds
+    a fresh Milestone object. Without this preservation, a caller that
+    re-proposes without an fr_store (so _sync_linked_prs_from_bundle
+    never runs to refill it) would silently wipe previously recorded
+    PR links."""
+    fr = pipeline.frs.promote(target="developer", title="Repropose test", description="d")
+
+    def _wu(fid):
+        return {
+            "name": "wu", "rank": 1, "targets": ["developer"],
+            "frs": [{"fr_id": fid, "target": "developer", "title": fid}],
+        }
+
+    ms = pipeline.milestones.propose_from_work_unit(_wu(fr.id), fr_store=pipeline.frs)
+    pipeline.frs.add_linked_pr(fr.id, {
+        "repo": "r", "number": 1, "state": "merged", "merged_at": 1.0,
+    })
+    pipeline.milestones.add_linked_pr(ms.id, {
+        "repo": "r", "number": 1, "state": "merged", "merged_at": 1.0,
+    })
+
+    # Re-propose WITHOUT fr_store — the legacy/no-sync path.
+    reproposed = pipeline.milestones.propose_from_work_unit(_wu(fr.id))
+
+    assert reproposed.id == ms.id
+    assert reproposed.linked_prs == [
+        {"repo": "r", "number": 1, "state": "merged", "merged_at": 1.0},
+    ]

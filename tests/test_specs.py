@@ -123,6 +123,45 @@ def test_list_specs_mirror_is_best_effort_on_unresolvable_fr(tmp_path, pipeline)
     assert len(summaries) == 1
 
 
+def test_list_specs_prunes_stale_linked_spec_when_fr_reference_retargeted(pipeline, tmp_path):
+    """Codex R5 on PR #93: add_linked_spec is append-only, so a spec
+    retargeted from FR A to FR B must have its rescan prune the now-
+    stale entry off FR A — otherwise the same spec looks linked from
+    two FRs forever even though only one **FR:** line exists."""
+    fr_a = pipeline.frs.promote(target="proj", title="Stale A", description="d")
+    fr_b = pipeline.frs.promote(target="proj", title="Stale B", description="d")
+    reader, specs_dir = _spec_reader_over(tmp_path, pipeline.frs)
+    spec_path = specs_dir / "spec.md"
+    spec_path.write_text(f"# MS-01\n\n**FR:** `{fr_a.id}`\n")
+
+    reader.list_specs("proj")
+    assert pipeline.frs.get(fr_a.id).linked_specs == [
+        {"project": "proj", "path": str(spec_path), "section": "MS-01"},
+    ]
+
+    spec_path.write_text(f"# MS-01\n\n**FR:** `{fr_b.id}`\n")
+    reader.list_specs("proj")
+
+    assert pipeline.frs.get(fr_a.id).linked_specs == []
+    assert pipeline.frs.get(fr_b.id).linked_specs == [
+        {"project": "proj", "path": str(spec_path), "section": "MS-01"},
+    ]
+
+
+def test_list_specs_prunes_stale_linked_spec_when_file_deleted(pipeline, tmp_path):
+    fr = pipeline.frs.promote(target="proj", title="Deleted spec test", description="d")
+    reader, specs_dir = _spec_reader_over(tmp_path, pipeline.frs)
+    spec_path = specs_dir / "spec.md"
+    spec_path.write_text(f"# MS-01\n\n**FR:** `{fr.id}`\n")
+    reader.list_specs("proj")
+    assert pipeline.frs.get(fr.id).linked_specs != []
+
+    spec_path.unlink()
+    reader.list_specs("proj")
+
+    assert pipeline.frs.get(fr.id).linked_specs == []
+
+
 # ---------------------------------------------------------------------------
 # Acceptance #6 — traverse_milestone walks milestone → specs → FRs
 # ---------------------------------------------------------------------------

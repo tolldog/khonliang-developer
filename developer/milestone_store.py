@@ -384,6 +384,15 @@ class MilestoneStore:
         if existing is not None:
             notes_history = list(existing.notes_history)
             superseded_by = existing.superseded_by
+            # Preserve linked_prs across re-propose (fr_developer_
+            # cfe3001c, Codex R5 on PR #93): without this, rebuilding a
+            # fresh Milestone below defaults it to [], and a caller that
+            # re-proposes without an fr_store (so _sync_linked_prs_from_
+            # bundle never runs to refill it) silently wipes previously
+            # recorded PR links. `_sync_linked_prs_from_bundle` recomputes
+            # it correctly right after IF fr_store is given; this default
+            # only matters for the no-fr_store case.
+            preserved_linked_prs = list(existing.linked_prs)
             if preserve_existing_project:
                 project = existing.project or DEFAULT_PROJECT
             # Re-propose sidecar policy: ``None`` preserves wholesale,
@@ -404,6 +413,7 @@ class MilestoneStore:
                 "notes": "proposed",
             }]
             superseded_by = ""
+            preserved_linked_prs = []
             if preserve_existing_project:
                 project = DEFAULT_PROJECT
         # Filter the final sidecar to the milestone's current ``fr_ids``
@@ -439,6 +449,7 @@ class MilestoneStore:
             project=project,
             created_at=created_at,
             updated_at=now,
+            linked_prs=preserved_linked_prs,
         )
         self._store(milestone)
         if fr_store is not None:
