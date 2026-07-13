@@ -4613,7 +4613,10 @@ class DeveloperAgent(BaseAgent):
 
         Returns the new artifact id, or ``None`` when the store is
         unreachable / errors — persistence is secondary to the test run
-        itself, so a store failure must never fail run_tests.
+        itself, so a store failure must never fail run_tests. Uses a
+        short explicit timeout (not the bus client's 30s default) so a
+        down/slow store degrades run_tests's return time by seconds,
+        not tens of seconds (Codex review on PR #92).
         """
         from developer.git_client import GitClient, GitClientError
 
@@ -4644,6 +4647,7 @@ class DeveloperAgent(BaseAgent):
                         "exceeds_read_cap": len(raw) > _STORE_READ_CAP_CHARS,
                     },
                 },
+                timeout=5.0,
             )
         except Exception as exc:  # bus unreachable / transport error
             logger.warning(

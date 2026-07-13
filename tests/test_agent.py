@@ -4570,6 +4570,10 @@ async def test_run_tests_persists_pytest_output_as_store_artifact(harness, monke
     assert store_args["metadata"]["exceeds_read_cap"] is False
     # digest is still returned in the same shape as before.
     assert "digest" in result
+    # Codex review on PR #92: bound with a short explicit timeout, not
+    # the bus client's 30s default, so a down/slow store can't stall
+    # run_tests's return.
+    assert captured["timeout"] == 5.0
 
 
 @pytest.mark.asyncio
