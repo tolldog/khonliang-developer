@@ -411,17 +411,26 @@ class _FakeGithubClientForMerge:
     def __init__(self, *, title="fr_developer_1234abcd: thing", head="feat/x",
                  merged=True, sha="abc123",
                  head_repo="tolldog/khonliang-developer",
-                 base_repo="tolldog/khonliang-developer", body=""):
+                 base_repo="tolldog/khonliang-developer", body="", merged_at=""):
         self._pr = {
             "title": title, "head": head, "body": body,
             "head_repo": head_repo, "base_repo": base_repo,
         }
         self._merge_result = {"merged": merged, "sha": sha}
+        self._merged_at = merged_at
         self.merge_calls: list[tuple] = []
         self.delete_calls: list[tuple] = []
+        self.get_pr_calls = 0
 
     async def get_pr(self, repo, pr_number):
-        return dict(self._pr)
+        self.get_pr_calls += 1
+        # Real GitHub only reports merged_at once the merge has actually
+        # happened — the fake mirrors that so tests can distinguish the
+        # pre-merge vs. post-merge fetch (Codex R7 on PR #93 fix).
+        pr = dict(self._pr)
+        if self.merge_calls:
+            pr["merged_at"] = self._merged_at
+        return pr
 
     async def merge_pr(self, repo, pr_number, *, method="squash"):
         self.merge_calls.append((repo, pr_number, method))
@@ -473,6 +482,27 @@ async def test_merge_pr_and_sync_passes_pr_body_to_on_merged():
     )
 
     assert received["body"] == "Closes fr_developer_deadbeef"
+
+
+@pytest.mark.asyncio
+async def test_merge_pr_and_sync_refetches_real_merged_at_for_on_merged():
+    """Codex R7 on PR #93: the pre-merge get_pr fetch has no real
+    merged_at (the PR wasn't merged yet at that point) — merge_pr_and_sync
+    must refetch post-merge so on_merged (and the reverse link it writes)
+    records GitHub's actual merge timestamp."""
+    fake_gh = _FakeGithubClientForMerge(merged_at="2026-05-01T00:00:00Z")
+    received = {}
+
+    async def fake_on_merged(repo, pr_number, title, body="", merged_at=""):
+        received["merged_at"] = merged_at
+
+    await merge_pr_and_sync(
+        "https://github.com/tolldog/khonliang-developer/pull/84",
+        github_client=fake_gh, on_merged=fake_on_merged,
+    )
+
+    assert received["merged_at"] == "2026-05-01T00:00:00Z"
+    assert fake_gh.get_pr_calls == 2
 
 
 @pytest.mark.asyncio

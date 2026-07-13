@@ -717,34 +717,39 @@ OnMergedFn = Callable[[str, int, str], Awaitable[None]]
 
 
 async def _invoke_on_merged(
-    on_merged: OnMergedFn, repo: str, pr_number: int, title: str, body: str,
+    on_merged: OnMergedFn, repo: str, pr_number: int, title: str,
+    body: str, merged_at: str = "",
 ) -> None:
-    """Call ``on_merged`` with ``body`` only if it actually accepts one.
+    """Call ``on_merged`` with ``body``/``merged_at`` only if it accepts
+    them.
 
-    fr_developer_cfe3001c added an optional ``body`` kwarg for reverse-
-    link population, but ``OnMergedFn``'s public contract has always
-    been the bare 3-arg ``(repo, pr_number, title)`` shape. Calling
-    every implementation with ``body=...`` unconditionally would raise
-    ``TypeError`` on any pre-existing 3-arg-only callback — in the
-    watcher path that means the merge is never marked synced and
+    fr_developer_cfe3001c added optional ``body``/``merged_at`` kwargs
+    for reverse-link population (FR-id scanning and accurate PR merge
+    chronology respectively), but ``OnMergedFn``'s public contract has
+    always been the bare 3-arg ``(repo, pr_number, title)`` shape.
+    Calling every implementation with those kwargs unconditionally
+    would raise ``TypeError`` on any pre-existing 3-arg-only callback —
+    in the watcher path that means the merge is never marked synced and
     retries forever (Codex R3 on PR #93). Inspecting the signature once
-    per call keeps both shapes working without requiring every
-    implementer to add the new parameter.
+    per call keeps every shape working without requiring every
+    implementer to add the new parameters.
     """
     try:
         params = inspect.signature(on_merged).parameters
-        accepts_body = "body" in params or any(
+        accepts_kwargs = any(
             p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
         )
+        extra: dict[str, str] = {}
+        if "body" in params or accepts_kwargs:
+            extra["body"] = body
+        if "merged_at" in params or accepts_kwargs:
+            extra["merged_at"] = merged_at
     except (TypeError, ValueError):
         # Signature introspection can fail for some callables (e.g. certain
         # C-extension or functools.partial-wrapped objects) — fall back to
         # the documented 3-arg shape rather than risk a spurious TypeError.
-        accepts_body = False
-    if accepts_body:
-        await on_merged(repo, pr_number, title, body=body)
-    else:
-        await on_merged(repo, pr_number, title)
+        extra = {}
+    await on_merged(repo, pr_number, title, **extra)
 
 
 @dataclass
@@ -1139,7 +1144,7 @@ class PRFleetWatcher:
                     try:
                         await _invoke_on_merged(
                             self._on_merged, repo, pr_number,
-                            snapshot.title, snapshot.body,
+                            snapshot.title, snapshot.body, snapshot.merged_at,
                         )
                     except asyncio.CancelledError:
                         raise

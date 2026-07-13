@@ -382,8 +382,25 @@ async def merge_pr_and_sync(
     if merged and on_merged is not None:
         from developer.pr_watcher import _invoke_on_merged
 
+        # Codex R7 on PR #93: the pre-merge `pr` fetch above has no real
+        # merged_at (the PR wasn't merged yet at that point) — refetch
+        # so reverse links record GitHub's actual merge time, not just
+        # "whenever this hook happened to run." Best-effort: a refetch
+        # failure falls back to "" (unknown) rather than blocking the
+        # already-successful merge/delete on a secondary lookup.
+        merged_at = ""
         try:
-            await _invoke_on_merged(on_merged, repo, pr_number, title, body)
+            post_merge_pr = await gh.get_pr(repo, pr_number)
+            merged_at = str(post_merge_pr.get("merged_at") or "")
+        except GithubClientError as e:
+            logger.warning(
+                "merge_pr_and_sync(%s#%d): post-merge get_pr for merged_at "
+                "failed (best-effort): %s",
+                repo, pr_number, e,
+            )
+
+        try:
+            await _invoke_on_merged(on_merged, repo, pr_number, title, body, merged_at)
         except Exception as e:
             logger.warning(
                 "merge_pr_and_sync(%s#%d): on_merged hook failed: %s",

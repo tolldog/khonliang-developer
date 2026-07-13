@@ -136,7 +136,19 @@ def repair_link_integrity(
             if stale is None:
                 skipped.append({**mismatch, "reason": "stale fr no longer exists"})
                 continue
+            # Don't replay a PR the terminal FR already tracks (Codex
+            # R7 on PR #93): the terminal may have received a NEWER
+            # sync (e.g. merged_at/state updated) since the stale entry
+            # was written on the source — blindly re-adding the stale
+            # copy would downgrade the terminal's already-current data.
+            terminal_before = frs.get(terminal_id, follow_redirect=False)
+            existing_pr_keys = {
+                (p.get("repo"), p.get("number"))
+                for p in (terminal_before.linked_prs if terminal_before else [])
+            }
             for pr in stale.linked_prs:
+                if (pr.get("repo"), pr.get("number")) in existing_pr_keys:
+                    continue
                 frs.add_linked_pr(terminal_id, pr)
             for spec in stale.linked_specs:
                 frs.add_linked_spec(terminal_id, spec)

@@ -4097,6 +4097,42 @@ async def test_sync_fr_status_on_merge_records_linked_pr(harness):
 
 
 @pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_records_real_github_merged_at(harness):
+    """Codex R7 on PR #93: merged_at must be GitHub's actual merge
+    timestamp (threaded through from the watcher/merge_pr_and_sync),
+    not this hook's own run time — a delayed sync would otherwise
+    record the wrong chronology."""
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Merged-at accuracy test", description="d",
+    )
+
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 204, f"fix: ship it ({fr.id})",
+        merged_at="2026-04-21T12:00:00Z",
+    )
+
+    updated = harness.agent.pipeline.frs.get(fr.id)
+    assert updated.linked_prs[0]["merged_at"] == "2026-04-21T12:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_sync_fr_status_on_merge_falls_back_to_none_without_merged_at(harness):
+    """A legacy caller that doesn't supply merged_at (e.g. a pre-fix
+    3-arg on_merged invocation path) records None rather than a
+    fabricated "now" timestamp — honest-unknown beats wrong-but-present."""
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="No merged_at test", description="d",
+    )
+
+    await harness.agent._sync_fr_status_on_merge(
+        "tolldog/khonliang-developer", 205, f"fix: ship it ({fr.id})",
+    )
+
+    updated = harness.agent.pipeline.frs.get(fr.id)
+    assert updated.linked_prs[0]["merged_at"] is None
+
+
+@pytest.mark.asyncio
 async def test_sync_fr_status_on_merge_scans_body_too(harness):
     """FR ids in the PR body (not just title) must be picked up."""
     fr = harness.agent.pipeline.frs.promote(
@@ -4485,6 +4521,56 @@ async def test_repair_link_integrity_refuses_to_destroy_data_on_dangling_redirec
     # The critical assertion: data survives.
     survived = harness.agent.pipeline.frs.get("fr_developer_danglingsrc", follow_redirect=False)
     assert survived.linked_prs == [{"repo": "r", "number": 1}]
+
+
+@pytest.mark.asyncio
+async def test_repair_link_integrity_does_not_downgrade_terminal_pr_data(harness):
+    """Codex R7 on PR #93: if the terminal FR already tracks a PR (from
+    a later, more accurate sync) and a stale merged-away source also
+    carries an entry for the SAME {repo, number}, repair must not
+    replay the stale copy over the terminal's already-current data."""
+    import time as _time
+
+    from khonliang.knowledge.store import EntryStatus, KnowledgeEntry, Tier
+
+    target_fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="No-downgrade target", description="d",
+    )
+    # Terminal already has the accurate, up-to-date entry.
+    harness.agent.pipeline.frs.add_linked_pr(target_fr.id, {
+        "repo": "r", "number": 1, "state": "merged", "merged_at": "2026-05-01T00:00:00Z",
+    })
+    now = _time.time()
+    entry = KnowledgeEntry(
+        id="fr_developer_downgradesrc",
+        tier=Tier.DERIVED,
+        title="stale source",
+        content="d",
+        source="test",
+        scope="development",
+        tags=["fr", "target:developer", "app"],
+        status=EntryStatus.DISTILLED,
+        metadata={
+            "fr_status": "merged",
+            "priority": "medium",
+            "target": "developer",
+            "classification": "app",
+            "merged_into": target_fr.id,
+            # Same {repo, number} but stale/incomplete state — must NOT
+            # overwrite the terminal's accurate entry.
+            "linked_prs": [{"repo": "r", "number": 1, "state": "open", "merged_at": None}],
+        },
+        created_at=now,
+        updated_at=now,
+    )
+    harness.agent.pipeline.frs.knowledge.add(entry)
+
+    await harness.call("repair_link_integrity", {"project": "khonliang", "dry_run": False})
+
+    terminal_after = harness.agent.pipeline.frs.get(target_fr.id, follow_redirect=False)
+    assert terminal_after.linked_prs == [
+        {"repo": "r", "number": 1, "state": "merged", "merged_at": "2026-05-01T00:00:00Z"},
+    ]
 
 
 @pytest.mark.asyncio

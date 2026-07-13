@@ -349,6 +349,31 @@ async def test_on_merged_hook_receives_pr_body(store):
     assert received["body"] == "Closes fr_developer_deadbeef"
 
 
+async def test_on_merged_hook_receives_merged_at(store):
+    """Codex R7 on PR #93: on_merged is called with the snapshot's real
+    merged_at so reverse links record GitHub's actual merge time, not
+    just whenever this hook happened to run."""
+    gh = _FakeGithub()
+    published: list[tuple[str, dict]] = []
+    received: dict = {}
+
+    async def on_merged(
+        repo: str, pr_number: int, title: str, body: str = "", merged_at: str = "",
+    ) -> None:
+        received["merged_at"] = merged_at
+
+    watcher = _make_watcher(store, gh, published, on_merged=on_merged)
+
+    gh.snapshots[("owner/repo", 1)] = _make_snapshot(
+        head_sha="final", title="fix: thing",
+        state="closed", merged=True, merged_at="2026-04-21T12:00:00Z",
+        mergeable=True, merge_state="clean",
+    )
+    await watcher.poll_once()
+
+    assert received["merged_at"] == "2026-04-21T12:00:00Z"
+
+
 async def test_on_merged_hook_backward_compatible_with_bare_3_arg_signature(store):
     """Codex R3 on PR #93: a pre-existing on_merged implementation with
     the ORIGINAL bare (repo, pr_number, title) signature — no body

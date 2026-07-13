@@ -216,7 +216,8 @@ class DeveloperAgent(BaseAgent):
         return self._pr_watcher_registry
 
     async def _sync_fr_status_on_merge(
-        self, repo: str, pr_number: int, title: str, *, body: str = "",
+        self, repo: str, pr_number: int, title: str, *,
+        body: str = "", merged_at: str = "",
     ) -> None:
         """Auto-advance any FR named in a merged PR's title to 'completed',
         and record the merge as a reverse link on the FR (fr_developer_cfe3001c).
@@ -265,7 +266,13 @@ class DeveloperAgent(BaseAgent):
                 "repo": repo,
                 "number": pr_number,
                 "state": "merged",
-                "merged_at": time.time(),
+                # GitHub's actual merge timestamp (ISO8601), not this
+                # hook's run time — a delayed sync (restart, retry,
+                # watcher backlog) would otherwise record the wrong
+                # chronology (Codex R7 on PR #93). Falls back to None
+                # when unavailable (e.g. a legacy 3-arg on_merged
+                # caller that doesn't supply merged_at at all).
+                "merged_at": merged_at or None,
             }
             try:
                 fr = self.pipeline.frs.add_linked_pr(fr_id, pr_entry)
