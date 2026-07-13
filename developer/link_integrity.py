@@ -100,7 +100,17 @@ def repair_link_integrity(
             skipped.append(mismatch)
             continue
         if kind == "milestone_fr_missing_reverse_link":
-            frs.add_linked_milestone(mismatch["terminal_fr_id"], mismatch["milestone_id"])
+            terminal_fr_id = mismatch["terminal_fr_id"]
+            milestone_id = mismatch["milestone_id"]
+            fr = frs.add_linked_milestone(terminal_fr_id, milestone_id)
+            # Backfill: the FR may already carry PRs that predate this
+            # milestone bundling (or were moved here by an earlier
+            # reverse_link_on_merged_fr repair below) — without this,
+            # "linked_prs is the union of PRs touching any bundled FR"
+            # stays stale until an unrelated future PR merge (Codex R2
+            # on PR #93).
+            for pr in fr.linked_prs:
+                milestones.add_linked_pr(milestone_id, pr)
             repaired.append(mismatch)
         elif kind == "reverse_link_on_merged_fr":
             terminal_id = frs.resolve_id(mismatch["fr_id"])
@@ -115,6 +125,11 @@ def repair_link_integrity(
             for ms_id in stale.linked_milestones:
                 frs.add_linked_milestone(terminal_id, ms_id)
             frs.clear_reverse_links(mismatch["fr_id"])
+            terminal = frs.get(terminal_id, follow_redirect=False)
+            if terminal is not None:
+                for ms_id in terminal.linked_milestones:
+                    for pr in terminal.linked_prs:
+                        milestones.add_linked_pr(ms_id, pr)
             repaired.append(mismatch)
         else:  # pragma: no cover — defensive, audit only emits the two kinds above
             skipped.append({**mismatch, "reason": f"unknown mismatch type {kind!r}"})

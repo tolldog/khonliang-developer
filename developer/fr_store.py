@@ -650,6 +650,37 @@ class FRStore:
                     "Resolve the dependency before merging."
                 )
 
+        # Carry forward reverse links (fr_developer_cfe3001c, Codex R2 on
+        # PR #93): a source FR merged away would otherwise silently drop
+        # any PR/spec/milestone reverse links it had accumulated — the
+        # new terminal FR is where those links belong now, since
+        # add_linked_* always resolves to the terminal FR going forward.
+        combined_linked_prs: list[dict] = []
+        seen_pr_keys: set[tuple] = set()
+        for fr in resolved_sources:
+            for pr in fr.linked_prs:
+                pr_key = (pr.get("repo"), pr.get("number"))
+                if pr_key in seen_pr_keys:
+                    continue
+                seen_pr_keys.add(pr_key)
+                combined_linked_prs.append(dict(pr))
+
+        combined_linked_specs: list[dict] = []
+        seen_spec_keys: set[tuple] = set()
+        for fr in resolved_sources:
+            for spec in fr.linked_specs:
+                spec_key = (spec.get("project"), spec.get("path"), spec.get("section"))
+                if spec_key in seen_spec_keys:
+                    continue
+                seen_spec_keys.add(spec_key)
+                combined_linked_specs.append(dict(spec))
+
+        combined_linked_milestones: list[str] = []
+        for fr in resolved_sources:
+            for ms_id in fr.linked_milestones:
+                if ms_id not in combined_linked_milestones:
+                    combined_linked_milestones.append(ms_id)
+
         now = time.time()
         # New FR starts `open`; the merge doesn't imply the combined work is
         # planned or in-progress yet. `project` inherits from the sources
@@ -679,6 +710,9 @@ class FRStore:
             merge_note=merge_note,
             created_at=now,
             updated_at=now,
+            linked_prs=combined_linked_prs,
+            linked_specs=combined_linked_specs,
+            linked_milestones=combined_linked_milestones,
         )
         self._store(new_fr)
 
@@ -703,6 +737,13 @@ class FRStore:
                 "notes": f"merged into {new_id}" + (f" ({role})" if role else ""),
             })
             fr.updated_at = now
+            # Reverse links moved to new_fr above — clear them here so
+            # audit_link_integrity's "reverse_link_on_merged_fr" check
+            # only flags genuine drift (a population path that ran
+            # AFTER this merge), not every merge unconditionally.
+            fr.linked_prs = []
+            fr.linked_specs = []
+            fr.linked_milestones = []
             self._store(fr)
             # Capability: mark abandoned. The old entry's fr_id ref remains
             # for audit; a new capability entry for the merged FR will be
