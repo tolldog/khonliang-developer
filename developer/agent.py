@@ -276,11 +276,17 @@ class DeveloperAgent(BaseAgent):
                 )
                 continue
             # Milestone.linked_prs is the union of PRs touching any
-            # bundled FR — mirror onto every milestone this (terminal)
-            # FR is already known to belong to.
+            # CURRENTLY bundled FR. fr.linked_milestones is historical
+            # (an FR removed from a bundle keeps the pointer for audit
+            # — see MilestoneStore.update_frs), so recompute from each
+            # milestone's actual fr_ids rather than blindly attaching
+            # this PR — a milestone that no longer bundles fr_id must
+            # not gain it (Codex R4 on PR #93).
             for milestone_id in fr.linked_milestones:
                 try:
-                    self.pipeline.milestones.add_linked_pr(milestone_id, pr_entry)
+                    self.pipeline.milestones.sync_linked_prs(
+                        self.pipeline.frs, milestone_id,
+                    )
                 except Exception as e:
                     await self._safe_report_gap(
                         "pr_watcher.on_merged.milestone_linked_prs",

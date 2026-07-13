@@ -504,6 +504,30 @@ class MilestoneStore:
                 milestone.id, exc_info=True,
             )
 
+    def sync_linked_prs(self, fr_store: Any, milestone_id: str) -> Optional[Milestone]:
+        """Public entry point: recompute ``linked_prs`` for one milestone.
+
+        The correct call for a caller iterating ``FR.linked_milestones``
+        (e.g. after a PR merge, or during repair) — that field is
+        intentionally HISTORICAL (fr_developer_cfe3001c: an FR removed
+        from a milestone's bundle keeps the pointer for audit), so
+        blindly calling :meth:`add_linked_pr` for every id in it would
+        attach PRs to milestones the FR no longer actively belongs to
+        (Codex R4 on PR #93). Recomputing from ``milestone.fr_ids`` (the
+        actual current bundle) is what keeps that distinction correct —
+        a stale historical milestone just won't list this FR anymore,
+        so its PRs don't propagate there.
+
+        Returns ``None`` (no-op, not an error) if ``milestone_id``
+        doesn't exist — callers iterating a possibly-stale id list
+        shouldn't have to special-case a deleted milestone.
+        """
+        milestone = self.get(milestone_id)
+        if milestone is None:
+            return None
+        self._sync_linked_prs_from_bundle(fr_store, milestone)
+        return milestone
+
     def review_scope(
         self,
         milestone_id: str,

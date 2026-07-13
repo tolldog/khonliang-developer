@@ -102,15 +102,16 @@ def repair_link_integrity(
         if kind == "milestone_fr_missing_reverse_link":
             terminal_fr_id = mismatch["terminal_fr_id"]
             milestone_id = mismatch["milestone_id"]
-            fr = frs.add_linked_milestone(terminal_fr_id, milestone_id)
+            frs.add_linked_milestone(terminal_fr_id, milestone_id)
             # Backfill: the FR may already carry PRs that predate this
             # milestone bundling (or were moved here by an earlier
             # reverse_link_on_merged_fr repair below) — without this,
             # "linked_prs is the union of PRs touching any bundled FR"
             # stays stale until an unrelated future PR merge (Codex R2
-            # on PR #93).
-            for pr in fr.linked_prs:
-                milestones.add_linked_pr(milestone_id, pr)
+            # on PR #93). ``milestone_id`` is safe here — the mismatch
+            # itself proves fr_id is currently in this milestone's
+            # fr_ids, unlike the historical-membership case below.
+            milestones.sync_linked_prs(frs, milestone_id)
             repaired.append(mismatch)
         elif kind == "reverse_link_on_merged_fr":
             terminal_id = frs.resolve_id(mismatch["fr_id"])
@@ -144,9 +145,13 @@ def repair_link_integrity(
             frs.clear_reverse_links(mismatch["fr_id"])
             terminal = frs.get(terminal_id, follow_redirect=False)
             if terminal is not None:
+                # terminal.linked_milestones is historical (Codex R4 on
+                # PR #93) — sync_linked_prs recomputes from each
+                # milestone's actual current fr_ids, so a milestone the
+                # FR was later removed from correctly doesn't gain this
+                # PR back.
                 for ms_id in terminal.linked_milestones:
-                    for pr in terminal.linked_prs:
-                        milestones.add_linked_pr(ms_id, pr)
+                    milestones.sync_linked_prs(frs, ms_id)
             repaired.append(mismatch)
         else:  # pragma: no cover — defensive, audit only emits the two kinds above
             skipped.append({**mismatch, "reason": f"unknown mismatch type {kind!r}"})
