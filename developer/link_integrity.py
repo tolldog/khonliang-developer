@@ -14,18 +14,22 @@ Two mismatch classes:
   entry on the (redirect-resolved) FR it names — a bundling gap, most
   often from FR/milestone mutations that predate this FR or that ran
   without an ``fr_store`` handle.
-- ``reverse_link_on_merged_fr``: a reverse link landed on an FR that
-  has SINCE been merged into another (``merged_into`` set) — drift
-  from a population path that ran before the merge. Per the FR's
-  merge-redirect invariant, every reverse link belongs on the terminal
-  FR; a merged-away FR carrying one is always wrong.
+- ``reverse_link_on_merged_fr``: a reverse link landed on an FR whose
+  status is ``merged`` — drift from a population path that ran before
+  (or independently of) the merge. Per the FR's merge-redirect
+  invariant, every reverse link belongs on the terminal FR; a
+  merged-away FR carrying one is always wrong. Flagged on status alone
+  (not on ``merged_into`` being set) — ``FRStore.update_status`` can
+  set status to ``merged`` directly, without ever going through
+  ``merge()``, producing a "merged but no merged_into pointer" shape
+  that must be just as visible to the audit (Codex R8 on PR #93).
 """
 
 from __future__ import annotations
 
 from typing import Any, Optional
 
-from developer.fr_store import FRStore
+from developer.fr_store import FR_STATUS_MERGED, FRStore
 from developer.milestone_store import MilestoneStore
 
 
@@ -59,7 +63,7 @@ def audit_link_integrity(
                 })
 
     for fr in all_frs:
-        if not fr.merged_into:
+        if fr.status != FR_STATUS_MERGED:
             continue
         if fr.linked_prs or fr.linked_specs or fr.linked_milestones:
             mismatches.append({

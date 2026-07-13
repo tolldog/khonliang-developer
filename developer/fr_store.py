@@ -656,14 +656,31 @@ class FRStore:
         # new terminal FR is where those links belong now, since
         # add_linked_* always resolves to the terminal FR going forward.
         combined_linked_prs: list[dict] = []
-        seen_pr_keys: set[tuple] = set()
+        pr_index: dict[tuple, int] = {}
         for fr in resolved_sources:
             for pr in fr.linked_prs:
                 pr_key = (pr.get("repo"), pr.get("number"))
-                if pr_key in seen_pr_keys:
+                if pr_key not in pr_index:
+                    pr_index[pr_key] = len(combined_linked_prs)
+                    combined_linked_prs.append(dict(pr))
                     continue
-                seen_pr_keys.add(pr_key)
-                combined_linked_prs.append(dict(pr))
+                # Two sources can carry different copies of the SAME
+                # PR (e.g. one source recorded it while still open,
+                # another after it merged) — keeping the first-seen
+                # copy unconditionally would regress the terminal FR
+                # to stale data even when a more complete copy exists
+                # on a later source (Codex R8 on PR #93). Prefer
+                # merged-state over any other state, and a known
+                # merged_at over an unknown one.
+                idx = pr_index[pr_key]
+                existing = combined_linked_prs[idx]
+                existing_score = (
+                    existing.get("state") == "merged",
+                    existing.get("merged_at") is not None,
+                )
+                new_score = (pr.get("state") == "merged", pr.get("merged_at") is not None)
+                if new_score > existing_score:
+                    combined_linked_prs[idx] = dict(pr)
 
         combined_linked_specs: list[dict] = []
         seen_spec_keys: set[tuple] = set()

@@ -4362,6 +4362,37 @@ async def test_merge_carries_forward_reverse_links_to_terminal_fr(harness):
 
 
 @pytest.mark.asyncio
+async def test_merge_prefers_most_complete_duplicate_pr_entry(harness):
+    """Codex R8 on PR #93: when two sources being merged both carry an
+    entry for the SAME {repo, number} (one stale/incomplete, one
+    merged-state and complete), the terminal FR must end up with the
+    more complete copy — not just whichever source happened to be
+    listed first."""
+    stale_source = harness.agent.pipeline.frs.promote(
+        target="developer", title="Dup PR stale source", description="d",
+    )
+    complete_source = harness.agent.pipeline.frs.promote(
+        target="developer", title="Dup PR complete source", description="d",
+    )
+    harness.agent.pipeline.frs.add_linked_pr(
+        stale_source.id, {"repo": "r", "number": 1, "state": "open", "merged_at": None},
+    )
+    harness.agent.pipeline.frs.add_linked_pr(
+        complete_source.id,
+        {"repo": "r", "number": 1, "state": "merged", "merged_at": "2026-05-01T00:00:00Z"},
+    )
+
+    merged = harness.agent.pipeline.frs.merge(
+        source_ids=[stale_source.id, complete_source.id],
+        title="Dup PR merge target", description="d",
+    )
+
+    assert merged.linked_prs == [
+        {"repo": "r", "number": 1, "state": "merged", "merged_at": "2026-05-01T00:00:00Z"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_audit_link_integrity_flags_reverse_link_on_merged_fr(harness):
     """Legacy-drift scenario: an FR record written DIRECTLY to the
     knowledge store (bypassing merge()'s reverse-link carry-forward,
@@ -4405,6 +4436,27 @@ async def test_audit_link_integrity_flags_reverse_link_on_merged_fr(harness):
 
     drift = [m for m in result["mismatches"] if m["type"] == "reverse_link_on_merged_fr"]
     assert any(m["fr_id"] == "fr_developer_legacydrift" for m in drift)
+
+
+@pytest.mark.asyncio
+async def test_audit_link_integrity_flags_merged_fr_without_merged_into(harness):
+    """Codex R8 on PR #93: FRStore.update_status(fr_id, "merged") can
+    set status='merged' directly, without ever going through merge()
+    — producing a 'merged but no merged_into pointer' shape. Audit
+    must flag this on status alone, not require merged_into to be set,
+    or such FRs' reverse links stay permanently invisible to the
+    integrity tooling."""
+    fr = harness.agent.pipeline.frs.promote(
+        target="developer", title="Merged without pointer test", description="d",
+    )
+    harness.agent.pipeline.frs.add_linked_pr(fr.id, {"repo": "r", "number": 1})
+    harness.agent.pipeline.frs.update_status(fr.id, "merged")
+    assert harness.agent.pipeline.frs.get(fr.id, follow_redirect=False).merged_into is None
+
+    result = await harness.call("audit_link_integrity", {"project": "khonliang"})
+
+    drift = [m for m in result["mismatches"] if m["type"] == "reverse_link_on_merged_fr"]
+    assert any(m["fr_id"] == fr.id for m in drift)
 
 
 @pytest.mark.asyncio
