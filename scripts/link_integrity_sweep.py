@@ -70,6 +70,17 @@ def main() -> int:
     # actually be written.
     catalog = None
     if not args.dry_run:
+        # Same fail-fast rationale as db_path above (Codex round 4): a
+        # wrong/unmounted catalog_db_path would otherwise bootstrap a
+        # fresh sidecar there, and repairs would succeed against
+        # developer.db while silently forking catalog updates away
+        # from the real sidecar.
+        if not Path(cfg.catalog_db_path).exists():
+            print(
+                f"[{stamp}] ERROR: configured catalog_db_path does not "
+                f"exist: {cfg.catalog_db_path}"
+            )
+            return 1
         catalog = SelfCatalog(
             db_path=cfg.catalog_db_path, source="developer", owner_agent="developer-primary",
         )
