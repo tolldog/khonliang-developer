@@ -55,9 +55,16 @@ def main() -> int:
 
     cfg = Config.load(args.config)
     knowledge = KnowledgeStore(str(cfg.db_path))
-    catalog = SelfCatalog(
-        db_path=cfg.catalog_db_path, source="developer", owner_agent="developer-primary",
-    )
+    # Catalog is a write-only sidecar (FRStore/MilestoneStore._store's
+    # catalog.upsert) — audit and dry-run repair never touch it, so a
+    # report-only sweep shouldn't depend on the sidecar being present
+    # or writable (Codex round 2). Only construct it when repairs will
+    # actually be written.
+    catalog = None
+    if not args.dry_run:
+        catalog = SelfCatalog(
+            db_path=cfg.catalog_db_path, source="developer", owner_agent="developer-primary",
+        )
     frs = FRStore(knowledge=knowledge, catalog=catalog)
     milestones = MilestoneStore(knowledge=knowledge, catalog=catalog)
 
