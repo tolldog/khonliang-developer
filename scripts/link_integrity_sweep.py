@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 from khonliang.knowledge.store import KnowledgeStore
 from librarian_lib import SelfCatalog
@@ -54,6 +55,13 @@ def main() -> int:
     print(f"[{stamp}] link_integrity_sweep starting (dry_run={args.dry_run})")
 
     cfg = Config.load(args.config)
+    # Fail fast rather than let KnowledgeStore silently create a fresh,
+    # empty DB on a wrong/unmounted db_path (Codex round 3) — that would
+    # audit 0 FRs/milestones and exit 0, a false "all clear" for exactly
+    # the misconfiguration this cron job needs to surface, not hide.
+    if not Path(cfg.db_path).exists():
+        print(f"[{stamp}] ERROR: configured db_path does not exist: {cfg.db_path}")
+        return 1
     knowledge = KnowledgeStore(str(cfg.db_path))
     # Catalog is a write-only sidecar (FRStore/MilestoneStore._store's
     # catalog.upsert) — audit and dry-run repair never touch it, so a
