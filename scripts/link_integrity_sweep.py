@@ -16,6 +16,14 @@ Logs a compact summary to stdout (captured by cron into a logfile via
 redirection); a non-zero exit code signals a run that hit an
 unexpected exception (not: a mismatch was found — mismatches/skips
 found are expected steady-state signal, not a failure).
+
+Constructs FRStore/MilestoneStore directly rather than going through
+Pipeline.from_config (Codex review): the full pipeline also
+constructs BugStore/DogfoodStore, which seed curated rows on first
+construction against a fresh/partially-initialized DB — a real write
+side effect that would fire even under --dry-run, contradicting the
+flag's whole purpose. This script only needs the two stores link
+integrity actually touches.
 """
 
 from __future__ import annotations
@@ -24,8 +32,12 @@ import argparse
 import sys
 from datetime import datetime, timezone
 
+from khonliang.knowledge.store import KnowledgeStore
+from librarian_lib import SelfCatalog
+
 from developer.config import Config
-from developer.pipeline import Pipeline
+from developer.fr_store import FRStore
+from developer.milestone_store import MilestoneStore
 from developer.link_integrity import audit_link_integrity, repair_link_integrity
 
 
@@ -42,18 +54,21 @@ def main() -> int:
     print(f"[{stamp}] link_integrity_sweep starting (dry_run={args.dry_run})")
 
     cfg = Config.load(args.config)
-    pipeline = Pipeline.from_config(cfg)
+    knowledge = KnowledgeStore(str(cfg.db_path))
+    catalog = SelfCatalog(
+        db_path=cfg.catalog_db_path, source="developer", owner_agent="developer-primary",
+    )
+    frs = FRStore(knowledge=knowledge, catalog=catalog)
+    milestones = MilestoneStore(knowledge=knowledge, catalog=catalog)
 
-    before = audit_link_integrity(pipeline.frs, pipeline.milestones, project=None)
+    before = audit_link_integrity(frs, milestones, project=None)
     print(
         f"[{stamp}] audit: checked_frs={before['checked_frs']} "
         f"checked_milestones={before['checked_milestones']} "
         f"mismatches={len(before['mismatches'])}"
     )
 
-    result = repair_link_integrity(
-        pipeline.frs, pipeline.milestones, project=None, dry_run=args.dry_run,
-    )
+    result = repair_link_integrity(frs, milestones, project=None, dry_run=args.dry_run)
     print(
         f"[{stamp}] repair: repaired={len(result['repaired'])} "
         f"skipped={len(result['skipped'])} total={result['total_mismatches']}"
