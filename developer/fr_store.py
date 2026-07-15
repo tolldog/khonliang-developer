@@ -160,6 +160,15 @@ class FR:
     linked_prs: list[dict] = field(default_factory=list)
     linked_specs: list[dict] = field(default_factory=list)
     linked_milestones: list[str] = field(default_factory=list)
+    # fr_developer_b053cf8b: cross-project filing. `project` (above) is
+    # the TARGET project — whose store owns this FR and whose repos it
+    # applies to. `origin_project` is the project whose workflow
+    # surfaced the need, when that differs from the target (e.g. a
+    # genealogy task discovers a gap in khonliang-bus: the FR lands in
+    # khonliang's store with origin_project="genealogy"). None means
+    # same-project filing — the common case, behaves identically to
+    # before this field existed.
+    origin_project: Optional[str] = None
 
     def to_public_dict(self) -> dict[str, Any]:
         """Serializable representation for MCP / JSON consumers."""
@@ -173,6 +182,7 @@ class FR:
             "concept": self.concept,
             "classification": self.classification,
             "project": self.project,
+            "origin_project": self.origin_project,
             "backing_papers": list(self.backing_papers),
             "depends_on": list(self.depends_on),
             "branch": self.branch,
@@ -307,6 +317,7 @@ class FRStore:
         status: Optional[str] = None,
         include_all: bool = False,
         project: Optional[str] = None,
+        origin_project: Optional[str] = None,
         sort: bool = True,
     ) -> list[FR]:
         """List FRs in the store.
@@ -316,11 +327,21 @@ class FRStore:
         (completed, archived, merged).
         Pass ``status=<name>`` to filter to a single status
         (ignores ``include_all`` since it's more specific).
-        Pass ``project=<slug>`` to restrict to one project; ``None``
-        returns every project (cross-project view). Empty / whitespace
-        strings normalize to :data:`DEFAULT_PROJECT` — matches writer
-        normalization and avoids bus/CLI defaults (where ``""`` is
-        common) silently bypassing the filter.
+        Pass ``project=<slug>`` to restrict to one TARGET project;
+        ``None`` returns every project (cross-project view). Empty /
+        whitespace strings normalize to :data:`DEFAULT_PROJECT` —
+        matches writer normalization and avoids bus/CLI defaults
+        (where ``""`` is common) silently bypassing the filter.
+
+        Pass ``origin_project=<slug>`` (fr_developer_b053cf8b) to
+        restrict to FRs filed FROM that project, regardless of which
+        project's store they landed in — "what have I asked other
+        projects for?" ``None`` means no origin filter. Unlike
+        ``project``, this is an EXACT match on the raw stored value
+        (no ``normalize_project`` pass) since ``origin_project`` isn't
+        normalized on write either — it's provenance, not a partition
+        key, and an unset origin (``None``) is a real, distinct state
+        from any particular slug.
 
         ``sort=False`` skips the priority+created_at sort. Callers
         that don't need ordered output (counting, scope-only filters,
@@ -345,6 +366,8 @@ class FRStore:
             if target and fr.target != target:
                 continue
             if project is not None and fr.project != project:
+                continue
+            if origin_project is not None and fr.origin_project != origin_project:
                 continue
             if status:
                 if fr.status != status:
@@ -373,6 +396,8 @@ class FRStore:
         classification: str = "app",
         backing_papers: Optional[Iterable[str]] = None,
         project: str = DEFAULT_PROJECT,
+        origin_project: Optional[str] = None,
+        project_store: Optional[Any] = None,
     ) -> FR:
         """Create a new FR. Returns the stored :class:`FR`.
 
@@ -380,10 +405,32 @@ class FRStore:
         so re-promoting the same content yields the same id (collision
         detection via pre-existing entry).
 
-        ``project`` partitions the record into a project slug; defaults
-        to :data:`DEFAULT_PROJECT` so pre-Phase-3 callers keep working
-        without changes. See fr_developer_1c5178d2 (Phase 3) for the
-        full rollout plan.
+        ``project`` (the TARGET project) partitions the record into a
+        project slug; defaults to :data:`DEFAULT_PROJECT` so pre-Phase-3
+        callers keep working without changes. See fr_developer_1c5178d2
+        (Phase 3) for the full rollout plan.
+
+        ``origin_project`` (fr_developer_b053cf8b, optional): the project
+        whose workflow surfaced this FR, when it differs from ``project``
+        — cross-project filing (e.g. a genealogy task discovers a gap in
+        khonliang-bus: the FR lands in khonliang's store, tagged
+        ``origin_project="genealogy"``). ``None`` (the default) is the
+        common same-project case and behaves identically to before this
+        parameter existed — no normalization, no requirement that it
+        match a registered project (an origin is just provenance, not a
+        partition key).
+
+        ``project_store`` (optional, duck-typed to avoid a hard
+        FRStore -> ProjectStore dependency, same pattern as
+        MilestoneStore.delete's ``fr_store`` param): when given and
+        ``project`` is neither :data:`DEFAULT_PROJECT` nor a project
+        registered in it, raises. ``DEFAULT_PROJECT`` ("khonliang")
+        is grandfathered in unconditionally — it predates
+        ``project_init`` (fr_developer_5d0a8711) and was never itself
+        registered, so validating it against the registry would break
+        the single most common call path. Validation is skipped
+        entirely when ``project_store`` is omitted (existing callers
+        that don't pass one see no behavior change).
         """
         if not target or not title:
             raise FRError("promote_fr requires non-empty target and title")
@@ -392,6 +439,15 @@ class FRStore:
                 f"priority must be one of {sorted(ALLOWED_PRIORITIES)}, got {priority!r}"
             )
         project = normalize_project(project)
+        if (
+            project_store is not None
+            and project != DEFAULT_PROJECT
+            and not project_store.exists(project)
+        ):
+            raise FRError(
+                f"target project {project!r} is not registered "
+                "(use project_init to register it first)"
+            )
         backing = list(backing_papers or [])
 
         fr_id = _derive_fr_id(target, title, concept)
@@ -411,6 +467,7 @@ class FRStore:
             concept=concept,
             classification=classification,
             project=project,
+            origin_project=(origin_project or "").strip() or None,
             backing_papers=backing,
             depends_on=[],
             branch="",
@@ -1336,6 +1393,7 @@ class FRStore:
                 "classification": fr.classification,
                 "target": fr.target,
                 "project": fr.project or DEFAULT_PROJECT,
+                "origin_project": fr.origin_project,
                 "backing_papers": list(fr.backing_papers),
                 "depends_on": list(fr.depends_on),
                 "branch": fr.branch,
@@ -1647,6 +1705,7 @@ def _fr_from_entry(entry: KnowledgeEntry) -> FR:
         linked_prs=list(meta.get("linked_prs") or []),
         linked_specs=list(meta.get("linked_specs") or []),
         linked_milestones=list(meta.get("linked_milestones") or []),
+        origin_project=meta.get("origin_project") or None,
     )
 
 
