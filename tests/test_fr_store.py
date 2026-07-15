@@ -1469,3 +1469,101 @@ def test_clear_reverse_links_wipes_all_three_on_exact_id(store):
     assert cleared.linked_prs == []
     assert cleared.linked_specs == []
     assert cleared.linked_milestones == []
+
+
+# ---------------------------------------------------------------------------
+# Cross-project filing (fr_developer_b053cf8b)
+# ---------------------------------------------------------------------------
+
+
+def test_promote_without_origin_project_defaults_to_none(store):
+    fr = store.promote(target="developer", title="No origin", description="d")
+    assert fr.origin_project is None
+    assert store.get(fr.id).origin_project is None
+
+
+def test_promote_with_origin_project_sets_field(store):
+    fr = store.promote(
+        target="developer", title="Cross-filed", description="d",
+        origin_project="genealogy",
+    )
+    assert fr.origin_project == "genealogy"
+    assert store.get(fr.id).origin_project == "genealogy"
+
+
+def test_promote_origin_project_survives_round_trip_in_to_public_dict(store):
+    fr = store.promote(
+        target="developer", title="Round trip", description="d",
+        origin_project="genealogy",
+    )
+    assert fr.to_public_dict()["origin_project"] == "genealogy"
+
+
+def test_promote_validates_target_project_when_registry_given_and_origin_set(store):
+    from developer.project_store import ProjectDuplicateError, ProjectStore
+    from developer.fr_store import FRError
+
+    projects = ProjectStore(knowledge_store=store.knowledge)
+    with pytest.raises(FRError, match="not registered"):
+        store.promote(
+            target="developer", title="Unregistered target", description="d",
+            project="unregistered-project", origin_project="genealogy",
+            project_store=projects,
+        )
+
+
+def test_promote_accepts_registered_target_project(store):
+    from developer.project_store import ProjectStore
+
+    projects = ProjectStore(knowledge_store=store.knowledge)
+    projects.create("genealogy-target", repos=[])
+    fr = store.promote(
+        target="developer", title="Registered target", description="d",
+        project="genealogy-target", origin_project="genealogy",
+        project_store=projects,
+    )
+    assert fr.project == "genealogy-target"
+
+
+def test_promote_grandfathers_default_project_even_with_registry_given(store):
+    """DEFAULT_PROJECT ('khonliang') predates project_init and was never
+    itself registered — validating it against the registry would break
+    the single most common call path, so it's exempted unconditionally."""
+    from developer.project_store import DEFAULT_PROJECT, ProjectStore
+
+    projects = ProjectStore(knowledge_store=store.knowledge)
+    fr = store.promote(
+        target="developer", title="Default project ok", description="d",
+        origin_project="genealogy", project_store=projects,
+    )
+    assert fr.project == DEFAULT_PROJECT
+
+
+def test_promote_skips_validation_when_no_project_store_given(store):
+    """Same-project promote_fr (the common path) must keep working with
+    an arbitrary project slug when no registry is passed — validation is
+    opt-in, not retroactively enforced."""
+    fr = store.promote(
+        target="developer", title="No registry check", description="d",
+        project="whatever-unregistered",
+    )
+    assert fr.project == "whatever-unregistered"
+
+
+def test_list_filters_by_origin_project(store):
+    same = store.promote(target="developer", title="Same-project", description="d")
+    cross = store.promote(
+        target="developer", title="Cross-project", description="d",
+        origin_project="genealogy",
+    )
+    result = store.list(origin_project="genealogy")
+    ids = {fr.id for fr in result}
+    assert cross.id in ids
+    assert same.id not in ids
+
+
+def test_list_origin_project_none_means_no_filter(store):
+    store.promote(target="developer", title="A3", description="d")
+    store.promote(target="developer", title="B3", description="d", origin_project="genealogy")
+    result = store.list(origin_project=None)
+    assert len(result) == 2

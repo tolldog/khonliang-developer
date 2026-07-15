@@ -3417,6 +3417,84 @@ async def test_next_fr_local_filters_by_project(harness):
     assert result["fr"]["id"] == alpha_fr["fr_id"]
 
 
+# -- cross-project FR filing (fr_developer_b053cf8b) ---------------------
+
+
+@pytest.mark.asyncio
+async def test_promote_fr_handler_sets_origin_project(harness):
+    result = await harness.call("promote_fr", {
+        "target": "developer", "title": "Cross-filed via handler", "description": "d",
+        "origin_project": "genealogy",
+    })
+    got = await harness.call("get_fr_local", {"fr_id": result["fr_id"]})
+    assert got["origin_project"] == "genealogy"
+
+
+@pytest.mark.asyncio
+async def test_promote_fr_handler_defaults_origin_project_to_none(harness):
+    result = await harness.call("promote_fr", {
+        "target": "developer", "title": "Same-project via handler", "description": "d",
+    })
+    got = await harness.call("get_fr_local", {"fr_id": result["fr_id"]})
+    assert got["origin_project"] is None
+
+
+@pytest.mark.asyncio
+async def test_promote_fr_handler_rejects_unregistered_target_for_cross_project_filing(harness):
+    result = await harness.call("promote_fr", {
+        "target": "developer", "title": "Should fail", "description": "d",
+        "project": "unregistered-target", "origin_project": "genealogy",
+    })
+    assert "error" in result
+    assert "not registered" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_promote_fr_handler_accepts_registered_target_for_cross_project_filing(harness):
+    harness.agent.pipeline.projects.create("genealogy-target", repos=[])
+    result = await harness.call("promote_fr", {
+        "target": "developer", "title": "Should pass", "description": "d",
+        "project": "genealogy-target", "origin_project": "genealogy",
+    })
+    assert "error" not in result
+    assert result["project"] == "genealogy-target"
+
+
+@pytest.mark.asyncio
+async def test_promote_fr_handler_same_project_ignores_registry_even_unregistered(harness):
+    """Same-project promote_fr (no origin_project) must keep accepting
+    an arbitrary, unregistered project slug — validation only kicks in
+    for genuine cross-project filing (Codex-equivalent regression guard
+    for the fix that scoped project_store to origin_project-only calls)."""
+    result = await harness.call("promote_fr", {
+        "target": "developer", "title": "Same project unregistered slug", "description": "d",
+        "project": "still-unregistered",
+    })
+    assert "error" not in result
+    assert result["project"] == "still-unregistered"
+
+
+@pytest.mark.asyncio
+async def test_list_frs_by_origin_handler(harness):
+    same = await harness.call("promote_fr", {
+        "target": "developer", "title": "Same origin test", "description": "d",
+    })
+    cross = await harness.call("promote_fr", {
+        "target": "developer", "title": "Cross origin test", "description": "d",
+        "origin_project": "genealogy",
+    })
+    result = await harness.call("list_frs_by_origin", {"origin_project": "genealogy"})
+    ids = {f["id"] for f in result["frs"]}
+    assert cross["fr_id"] in ids
+    assert same["fr_id"] not in ids
+
+
+@pytest.mark.asyncio
+async def test_list_frs_by_origin_requires_origin_project(harness):
+    result = await harness.call("list_frs_by_origin", {})
+    assert "error" in result
+
+
 @pytest.mark.asyncio
 async def test_next_fr_local_filters_by_concept(harness):
     """``concept`` filter scopes the search to one concept tag — closes

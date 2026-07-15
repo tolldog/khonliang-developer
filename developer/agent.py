@@ -869,7 +869,11 @@ class DeveloperAgent(BaseAgent):
                    "classification": {"type": "string", "default": "app"},
                    "backing_papers": {"type": "string", "default": ""},
                    "project": {"type": "string", "default": "",
-                               "description": f"project slug (Phase 3); empty defaults to {DEFAULT_PROJECT!r}"},
+                               "description": f"TARGET project slug (Phase 3); empty defaults to {DEFAULT_PROJECT!r}"},
+                   "origin_project": {"type": "string", "default": "",
+                                      "description": "cross-project filing (fr_developer_b053cf8b): "
+                                      "the project whose workflow surfaced this FR, when it differs "
+                                      "from 'project'. Empty = same-project filing (the common case)."},
                    "detail": {"type": "string", "default": "brief",
                               "description": "'brief' (legacy minimal shape) or 'full' (public FR dict)"}},
                   since="0.4.0"),
@@ -927,8 +931,21 @@ class DeveloperAgent(BaseAgent):
                    "status": {"type": "string", "default": ""},
                    "include_all": {"type": "boolean", "default": False},
                    "project": {"type": "string", "default": "",
-                               "description": "project slug to filter by (Phase 3); empty returns all projects"}},
+                               "description": "TARGET project slug to filter by (Phase 3); empty returns all projects"}},
                   since="0.4.0"),
+            # fr_developer_b053cf8b: "what have I asked other projects for?"
+            # — the origin-side complement to list_frs_local's `project`
+            # filter (which already covers the target-side "what's been
+            # filed against my project" case, so no separate
+            # list_frs_by_target skill — it'd just be list_frs_local(project=X)).
+            Skill("list_frs_by_origin",
+                  "List FRs filed FROM a given origin project, regardless "
+                  "of which project's store they landed in (cross-project "
+                  "filing, fr_developer_b053cf8b).",
+                  {"origin_project": {"type": "string", "required": True},
+                   "status": {"type": "string", "default": ""},
+                   "include_all": {"type": "boolean", "default": False}},
+                  since="0.24.0"),
             Skill("update_fr", "Edit an existing FR's content fields in "
                   "place. Terminal FRs are immutable. Unsupported args are "
                   "rejected — status/branch changes go through "
@@ -3724,6 +3741,7 @@ class DeveloperAgent(BaseAgent):
             # store's normalize_project maps it to DEFAULT_PROJECT.
             # An explicit slug partitions the record into that project.
             project = str(args.get("project") or "").strip() or DEFAULT_PROJECT
+            origin_project = str(args.get("origin_project") or "").strip() or None
             fr = self.pipeline.frs.promote(
                 target=args.get("target", ""),
                 title=args.get("title", ""),
@@ -3733,6 +3751,16 @@ class DeveloperAgent(BaseAgent):
                 classification=args.get("classification", "app"),
                 backing_papers=backing,
                 project=project,
+                origin_project=origin_project,
+                # Registry validation only for genuine cross-project
+                # filing (fr_developer_b053cf8b) — same-project
+                # promote_fr (the vast majority of calls, including
+                # ad-hoc project slugs that predate project_init
+                # adoption) must keep working exactly as before. Only
+                # "delve" is registered in production today; requiring
+                # every promote_fr caller's project slug to already be
+                # registered would break the common path.
+                project_store=self.pipeline.projects if origin_project else None,
             )
         except FRError as e:
             await self.report_gap("promote_fr", str(e))
@@ -3905,6 +3933,21 @@ class DeveloperAgent(BaseAgent):
         project = project_raw or None
         frs = self.pipeline.frs.list(
             target=target, status=status, include_all=include_all, project=project,
+        )
+        return {
+            "count": len(frs),
+            "frs": [f.to_public_dict() for f in frs],
+        }
+
+    @handler("list_frs_by_origin")
+    async def handle_list_frs_by_origin(self, args):
+        origin_project = str(args.get("origin_project") or "").strip()
+        if not origin_project:
+            return {"error": "origin_project is required"}
+        status = args.get("status") or None
+        include_all = _bool_arg(args, "include_all", default=False)
+        frs = self.pipeline.frs.list(
+            origin_project=origin_project, status=status, include_all=include_all,
         )
         return {
             "count": len(frs),
