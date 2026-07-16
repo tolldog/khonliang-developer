@@ -33,6 +33,7 @@ For PR 1, the store:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -94,6 +95,16 @@ ALLOWED_PRIORITIES = {"high", "medium", "low"}
 # Cap on redirect chain depth — prevents pathological cycles from
 # manually-constructed metadata.
 _MAX_REDIRECT_DEPTH = 16
+
+# fr_developer_68b4db12 Tier 1: the exact key vocabulary early ingestion
+# used for its embedded-JSON description blobs. See
+# _parse_legacy_description_blob — an FR whose JSON-shaped description
+# uses any key outside this set is presumed to be legitimate content,
+# not the legacy artifact.
+_LEGACY_BLOB_KNOWN_KEYS = {
+    "target", "title", "description", "priority", "backing_papers",
+    "merged_from", "original_description", "original_title",
+}
 
 
 def _pr_completeness_score(pr: dict) -> tuple:
@@ -169,6 +180,13 @@ class FR:
     # same-project filing — the common case, behaves identically to
     # before this field existed.
     origin_project: Optional[str] = None
+    # fr_developer_68b4db12 (Tier 1): set only when this FR's stored
+    # description was mechanically normalized from a legacy raw blob
+    # (e.g. an embedded-JSON dump from early ingestion). Holds the
+    # original, pre-normalization content verbatim so the migration is
+    # reversible/auditable. None for every FR that was never migrated
+    # (the overwhelming majority) or written cleanly to begin with.
+    raw_description: Optional[str] = None
 
     def to_public_dict(self) -> dict[str, Any]:
         """Serializable representation for MCP / JSON consumers."""
@@ -197,6 +215,7 @@ class FR:
             "linked_prs": list(self.linked_prs),
             "linked_specs": list(self.linked_specs),
             "linked_milestones": list(self.linked_milestones),
+            "raw_description": self.raw_description,
         }
 
 
@@ -1324,6 +1343,55 @@ class FRStore:
         self._store(fr)
         return fr
 
+    def normalize_legacy_description(self, fr_id: str) -> Optional[FR]:
+        """Mechanically clean a legacy embedded-JSON description in place.
+
+        fr_developer_68b4db12 (Tier 1): a batch of early-ingestion FRs
+        stored an entire JSON blob (``{"target": ..., "title": ...,
+        "description": ..., "priority": ..., "backing_papers": [...]}``)
+        as their ``description`` field instead of just the description
+        text. This detects that shape, replaces ``description`` with the
+        clean extracted text, backfills ``priority``/``backing_papers``
+        from the blob when it disagrees with what's currently stored
+        (the blob is the original source of truth for those fields), and
+        preserves the raw blob verbatim in ``raw_description`` so the
+        change is reversible/auditable.
+
+        No-op — returns the FR unchanged, no store write — when the
+        description isn't in the legacy blob shape, or has already been
+        normalized (``raw_description`` already set). Returns ``None``
+        when ``fr_id`` doesn't resolve to any FR.
+
+        Like :meth:`add_linked_pr`, this bypasses :meth:`update`'s
+        terminal-status immutability guard: it's a storage-format
+        repair of historical ingestion output, not a content edit, and
+        needs to apply uniformly regardless of FR status (many of the
+        affected legacy FRs are long since completed/archived/merged).
+        """
+        fr = self.get(fr_id, follow_redirect=False)
+        if fr is None:
+            return None
+        if fr.raw_description:
+            return fr
+        parsed = _parse_legacy_description_blob(fr.description, fr.title)
+        if parsed is None:
+            return fr
+        fr.raw_description = fr.description
+        clean_description = str(parsed.get("description") or "").strip()
+        if clean_description:
+            fr.description = clean_description
+        parsed_priority = parsed.get("priority")
+        if parsed_priority in ALLOWED_PRIORITIES:
+            fr.priority = parsed_priority
+        parsed_papers = parsed.get("backing_papers")
+        if isinstance(parsed_papers, list) and parsed_papers:
+            cleaned_papers = [str(p).strip() for p in parsed_papers if str(p).strip()]
+            if cleaned_papers:
+                fr.backing_papers = cleaned_papers
+        fr.updated_at = time.time()
+        self._store(fr)
+        return fr
+
     # ------------------------------------------------------------------
     # Capability graph
     # ------------------------------------------------------------------
@@ -1405,6 +1473,7 @@ class FRStore:
                 "linked_prs": list(fr.linked_prs),
                 "linked_specs": list(fr.linked_specs),
                 "linked_milestones": list(fr.linked_milestones),
+                "raw_description": fr.raw_description,
             },
             created_at=fr.created_at,
             updated_at=fr.updated_at,
@@ -1706,7 +1775,60 @@ def _fr_from_entry(entry: KnowledgeEntry) -> FR:
         linked_specs=list(meta.get("linked_specs") or []),
         linked_milestones=list(meta.get("linked_milestones") or []),
         origin_project=meta.get("origin_project") or None,
+        raw_description=meta.get("raw_description") or None,
     )
+
+
+def _parse_legacy_description_blob(description: str, title: str) -> Optional[dict]:
+    """Detect and parse the legacy embedded-JSON description shape.
+
+    Returns the parsed dict when ``description`` is a JSON object
+    matching the exact shape early ingestion wrote wholesale into the
+    description field; ``None`` for anything else, including malformed
+    JSON that merely happens to start with ``{``.
+
+    Deliberately narrow (two rounds of Codex review on
+    fr_developer_68b4db12's PR — a store-wide sweep can't rely on "no
+    such FR exists today" staying true):
+
+    - Round 1: a looser ``"target" in parsed and "description" in
+      parsed`` check would also match a legitimate FR whose description
+      happens to be an API payload or config example shaped like
+      ``{"target": "...", "description": {...}}``. Fixed by requiring
+      ``target``/``title``/``description`` to all be non-empty strings
+      (not merely present) and every key in the blob to be one this
+      early-ingestion shape is known to use.
+    - Round 2: even that isn't sufficient — a legitimate FR could still
+      document a payload using exactly those three string fields (e.g.
+      ``{"target": "...", "title": "...", "description": "..."}``) by
+      coincidence. Content-shape alone can never fully disambiguate
+      that case from the real artifact, so this also requires
+      ``title`` passed in (``fr.title``, i.e. the entry's *actual*
+      stored title) to exactly match ``parsed["title"]``. Every real
+      legacy record has this property — ingestion wrote the same title
+      both to the entry's title field and inside the blob — while an
+      unrelated FR documenting a same-shaped payload would need its own
+      title to coincidentally equal the payload's "title" value, which
+      isn't a realistic accident for internal FR data.
+    """
+    stripped = (description or "").strip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if not set(parsed.keys()) <= _LEGACY_BLOB_KNOWN_KEYS:
+        return None
+    for key in ("target", "title", "description"):
+        value = parsed.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return None
+    if parsed["title"].strip() != (title or "").strip():
+        return None
+    return parsed
 
 
 def _slug(target: str) -> str:
