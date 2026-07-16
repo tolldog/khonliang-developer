@@ -1373,7 +1373,7 @@ class FRStore:
             return None
         if fr.raw_description:
             return fr
-        parsed = _parse_legacy_description_blob(fr.description)
+        parsed = _parse_legacy_description_blob(fr.description, fr.title)
         if parsed is None:
             return fr
         fr.raw_description = fr.description
@@ -1779,7 +1779,7 @@ def _fr_from_entry(entry: KnowledgeEntry) -> FR:
     )
 
 
-def _parse_legacy_description_blob(description: str) -> Optional[dict]:
+def _parse_legacy_description_blob(description: str, title: str) -> Optional[dict]:
     """Detect and parse the legacy embedded-JSON description shape.
 
     Returns the parsed dict when ``description`` is a JSON object
@@ -1787,16 +1787,29 @@ def _parse_legacy_description_blob(description: str) -> Optional[dict]:
     description field; ``None`` for anything else, including malformed
     JSON that merely happens to start with ``{``.
 
-    Deliberately narrow (Codex review on fr_developer_68b4db12's PR): a
-    looser ``"target" in parsed and "description" in parsed`` check
-    would also match a legitimate FR whose description happens to be an
-    API payload or config example shaped like
-    ``{"target": "...", "description": {...}}`` — store-wide sweeps
-    can't rely on "no such FR exists today" staying true. Requires
-    ``target``/``title``/``description`` to all be non-empty strings
-    (not merely present) and every key in the blob to be one this
-    early-ingestion shape is known to use, so an arbitrary
-    similarly-keyed technical description can't accidentally match.
+    Deliberately narrow (two rounds of Codex review on
+    fr_developer_68b4db12's PR — a store-wide sweep can't rely on "no
+    such FR exists today" staying true):
+
+    - Round 1: a looser ``"target" in parsed and "description" in
+      parsed`` check would also match a legitimate FR whose description
+      happens to be an API payload or config example shaped like
+      ``{"target": "...", "description": {...}}``. Fixed by requiring
+      ``target``/``title``/``description`` to all be non-empty strings
+      (not merely present) and every key in the blob to be one this
+      early-ingestion shape is known to use.
+    - Round 2: even that isn't sufficient — a legitimate FR could still
+      document a payload using exactly those three string fields (e.g.
+      ``{"target": "...", "title": "...", "description": "..."}``) by
+      coincidence. Content-shape alone can never fully disambiguate
+      that case from the real artifact, so this also requires
+      ``title`` passed in (``fr.title``, i.e. the entry's *actual*
+      stored title) to exactly match ``parsed["title"]``. Every real
+      legacy record has this property — ingestion wrote the same title
+      both to the entry's title field and inside the blob — while an
+      unrelated FR documenting a same-shaped payload would need its own
+      title to coincidentally equal the payload's "title" value, which
+      isn't a realistic accident for internal FR data.
     """
     stripped = (description or "").strip()
     if not stripped.startswith("{"):
@@ -1813,6 +1826,8 @@ def _parse_legacy_description_blob(description: str) -> Optional[dict]:
         value = parsed.get(key)
         if not isinstance(value, str) or not value.strip():
             return None
+    if parsed["title"].strip() != (title or "").strip():
+        return None
     return parsed
 
 

@@ -1594,7 +1594,9 @@ def test_normalize_legacy_description_parses_embedded_json(store):
 
 
 def test_normalize_legacy_description_is_idempotent(store):
-    fr = store.promote(target="autostock", title="T", description=_LEGACY_BLOB)
+    fr = store.promote(
+        target="autostock", title="Enhance Trading Strategy", description=_LEGACY_BLOB,
+    )
     first = store.normalize_legacy_description(fr.id)
     second = store.normalize_legacy_description(fr.id)
     assert second.description == first.description
@@ -1637,10 +1639,32 @@ def test_normalize_legacy_description_ignores_legitimate_json_like_content(store
     assert updated.raw_description is None
 
 
+def test_normalize_legacy_description_ignores_coincidentally_shaped_payload_doc(store):
+    """Round 2 of the same Codex review: even a description using
+    exactly the legacy shape's known keys as strings
+    (target/title/description) must not match unless the blob's
+    ``title`` also equals the FR's actual stored title — the property
+    every real legacy record has (ingestion wrote the same title to
+    both places) and an unrelated FR documenting a same-shaped payload
+    wouldn't share by coincidence."""
+    payload_doc = (
+        '{"target": "webhook-router", "title": "push", '
+        '"description": "fires on every push event"}'
+    )
+    fr = store.promote(
+        target="developer", title="Document webhook payload shape", description=payload_doc,
+    )
+    updated = store.normalize_legacy_description(fr.id)
+    assert updated.description == payload_doc
+    assert updated.raw_description is None
+
+
 def test_normalize_legacy_description_applies_to_terminal_fr(store):
     """Bypasses update()'s terminal-status immutability guard — most of
     the affected legacy FRs are long since completed/archived/merged."""
-    fr = store.promote(target="developer", title="T", description=_LEGACY_BLOB)
+    fr = store.promote(
+        target="developer", title="Enhance Trading Strategy", description=_LEGACY_BLOB,
+    )
     store.update_status(fr.id, FR_STATUS_IN_PROGRESS)
     store.update_status(fr.id, FR_STATUS_COMPLETED)
     with pytest.raises(FRError):

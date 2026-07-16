@@ -81,7 +81,7 @@ def normalize_legacy_fr_descriptions(
         if fr.raw_description:
             report.already_normalized += 1
             continue
-        if _parse_legacy_description_blob(fr.description) is None:
+        if _parse_legacy_description_blob(fr.description, fr.title) is None:
             continue
         report.matched += 1
         report.ids.append(fr.id)
