@@ -1567,3 +1567,68 @@ def test_list_origin_project_none_means_no_filter(store):
     store.promote(target="developer", title="B3", description="d", origin_project="genealogy")
     result = store.list(origin_project=None)
     assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
+# normalize_legacy_description (fr_developer_68b4db12 Tier 1)
+# ---------------------------------------------------------------------------
+
+_LEGACY_BLOB = (
+    '{\n  "target": "autostock",\n  "title": "Enhance Trading Strategy",\n'
+    '  "description": "Clean extracted description text.",\n'
+    '  "priority": "high",\n'
+    '  "backing_papers": ["Some Paper"]\n}'
+)
+
+
+def test_normalize_legacy_description_parses_embedded_json(store):
+    fr = store.promote(
+        target="autostock", title="Enhance Trading Strategy", description=_LEGACY_BLOB,
+        priority="medium",
+    )
+    updated = store.normalize_legacy_description(fr.id)
+    assert updated.description == "Clean extracted description text."
+    assert updated.raw_description == _LEGACY_BLOB
+    assert updated.priority == "high"
+    assert updated.backing_papers == ["Some Paper"]
+
+
+def test_normalize_legacy_description_is_idempotent(store):
+    fr = store.promote(target="autostock", title="T", description=_LEGACY_BLOB)
+    first = store.normalize_legacy_description(fr.id)
+    second = store.normalize_legacy_description(fr.id)
+    assert second.description == first.description
+    assert second.raw_description == first.raw_description
+    assert second.updated_at == first.updated_at
+
+
+def test_normalize_legacy_description_noop_on_clean_description(store):
+    fr = store.promote(target="developer", title="T", description="already clean")
+    updated = store.normalize_legacy_description(fr.id)
+    assert updated.description == "already clean"
+    assert updated.raw_description is None
+
+
+def test_normalize_legacy_description_noop_on_malformed_json_looking_text(store):
+    fr = store.promote(target="developer", title="T", description="{not really json")
+    updated = store.normalize_legacy_description(fr.id)
+    assert updated.description == "{not really json"
+    assert updated.raw_description is None
+
+
+def test_normalize_legacy_description_unknown_fr_returns_none(store):
+    assert store.normalize_legacy_description("fr_developer_doesnotexist") is None
+
+
+def test_normalize_legacy_description_applies_to_terminal_fr(store):
+    """Bypasses update()'s terminal-status immutability guard — most of
+    the affected legacy FRs are long since completed/archived/merged."""
+    fr = store.promote(target="developer", title="T", description=_LEGACY_BLOB)
+    store.update_status(fr.id, FR_STATUS_IN_PROGRESS)
+    store.update_status(fr.id, FR_STATUS_COMPLETED)
+    with pytest.raises(FRError):
+        store.update(fr.id, description="direct edit blocked")
+    updated = store.normalize_legacy_description(fr.id)
+    assert updated.status == FR_STATUS_COMPLETED
+    assert updated.description == "Clean extracted description text."
+    assert updated.raw_description == _LEGACY_BLOB

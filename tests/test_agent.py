@@ -1387,6 +1387,35 @@ async def test_migrate_frs_from_researcher_skill_preserves_ids(harness, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_normalize_legacy_fr_descriptions_handler_dry_run_then_apply(harness):
+    blob = (
+        '{"target": "autostock", "title": "T", '
+        '"description": "Clean text.", "priority": "high"}'
+    )
+    promoted = await harness.call("promote_fr", {
+        "target": "autostock", "title": "T", "description": blob,
+    })
+
+    dry = await harness.call("normalize_legacy_fr_descriptions", {})
+    assert dry["dry_run"] is True
+    assert dry["matched"] == 1
+    assert dry["normalized"] == 0
+    assert promoted["fr_id"] in dry["ids"]
+
+    unchanged = await harness.call("get_fr", {"fr_id": promoted["fr_id"]})
+    assert unchanged["description"] == blob
+
+    applied = await harness.call("normalize_legacy_fr_descriptions", {"apply": True})
+    assert applied["dry_run"] is False
+    assert applied["normalized"] == 1
+
+    fixed = await harness.call("get_fr", {"fr_id": promoted["fr_id"]})
+    assert fixed["description"] == "Clean text."
+    assert fixed["raw_description"] == blob
+    assert fixed["priority"] == "high"
+
+
+@pytest.mark.asyncio
 async def test_fr_candidates_from_concepts_returns_fr_aware_diff(harness):
     harness.agent.pipeline.frs.promote(
         target="developer",

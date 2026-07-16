@@ -766,6 +766,15 @@ class DeveloperAgent(BaseAgent):
                   {"source_db": {"type": "string", "required": True},
                    "apply": {"type": "boolean", "default": False}},
                   since="0.10.0"),
+            Skill("normalize_legacy_fr_descriptions",
+                  "Tier 1 mechanical slice of fr_developer_68b4db12: scans "
+                  "every FR (all projects, all statuses) for a legacy "
+                  "embedded-JSON description blob, extracts the clean "
+                  "title/description/priority/backing_papers, and preserves "
+                  "the original blob in raw_description for reversibility. "
+                  "Defaults to apply=false (dry-run report only).",
+                  {"apply": {"type": "boolean", "default": False}},
+                  since="0.25.0"),
             Skill("prepare_development_handoff",
                   "Return a compact bundle → milestone → draft spec handoff "
                   "for implementation. Three modes: pass ``milestone_id`` to "
@@ -3133,6 +3142,28 @@ class DeveloperAgent(BaseAgent):
             "capabilities_found": report.capabilities_found,
             "capabilities_migrated": report.capabilities_migrated,
             "capabilities_already_present": report.capabilities_already_present,
+            "summary": report.summary(),
+        }
+
+    @handler("normalize_legacy_fr_descriptions")
+    async def handle_normalize_legacy_fr_descriptions(self, args):
+        """Tier 1 mechanical slice of fr_developer_68b4db12: clean FR
+        descriptions that are still a raw embedded-JSON blob from early
+        ingestion. Defaults to a dry-run report; pass apply=true to write.
+        """
+        from developer.migrations.normalize_legacy_fr_descriptions import (
+            normalize_legacy_fr_descriptions,
+        )
+
+        apply = _bool_arg(args, "apply", default=False)
+        report = normalize_legacy_fr_descriptions(self.pipeline.frs, apply=apply)
+        return {
+            "dry_run": report.dry_run,
+            "checked": report.checked,
+            "matched": report.matched,
+            "normalized": report.normalized,
+            "already_normalized": report.already_normalized,
+            "ids": list(report.ids),
             "summary": report.summary(),
         }
 
