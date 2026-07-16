@@ -1620,6 +1620,23 @@ def test_normalize_legacy_description_unknown_fr_returns_none(store):
     assert store.normalize_legacy_description("fr_developer_doesnotexist") is None
 
 
+def test_normalize_legacy_description_ignores_legitimate_json_like_content(store):
+    """Codex review on fr_developer_68b4db12's PR: a legitimate FR whose
+    description happens to be a JSON object with 'target'/'description'
+    keys (e.g. documenting an API payload shape) must NOT be treated as
+    the legacy blob artifact — the detector requires the exact known key
+    vocabulary and string-typed target/title/description, not just
+    key presence."""
+    payload_doc = (
+        '{"target": "webhook-router", "description": {"event": "push", '
+        '"repo": "x"}, "extra_field": "not part of the legacy shape"}'
+    )
+    fr = store.promote(target="developer", title="Document webhook payload", description=payload_doc)
+    updated = store.normalize_legacy_description(fr.id)
+    assert updated.description == payload_doc
+    assert updated.raw_description is None
+
+
 def test_normalize_legacy_description_applies_to_terminal_fr(store):
     """Bypasses update()'s terminal-status immutability guard — most of
     the affected legacy FRs are long since completed/archived/merged."""

@@ -96,6 +96,16 @@ ALLOWED_PRIORITIES = {"high", "medium", "low"}
 # manually-constructed metadata.
 _MAX_REDIRECT_DEPTH = 16
 
+# fr_developer_68b4db12 Tier 1: the exact key vocabulary early ingestion
+# used for its embedded-JSON description blobs. See
+# _parse_legacy_description_blob — an FR whose JSON-shaped description
+# uses any key outside this set is presumed to be legitimate content,
+# not the legacy artifact.
+_LEGACY_BLOB_KNOWN_KEYS = {
+    "target", "title", "description", "priority", "backing_papers",
+    "merged_from", "original_description", "original_title",
+}
+
 
 def _pr_completeness_score(pr: dict) -> tuple:
     """Rank a ``linked_prs`` entry's completeness for duplicate-{repo,
@@ -1773,10 +1783,20 @@ def _parse_legacy_description_blob(description: str) -> Optional[dict]:
     """Detect and parse the legacy embedded-JSON description shape.
 
     Returns the parsed dict when ``description`` is a JSON object
-    containing at least ``target`` and ``description`` keys (the shape
-    early ingestion wrote wholesale into the description field); ``None``
-    for anything else, including malformed JSON that merely happens to
-    start with ``{``.
+    matching the exact shape early ingestion wrote wholesale into the
+    description field; ``None`` for anything else, including malformed
+    JSON that merely happens to start with ``{``.
+
+    Deliberately narrow (Codex review on fr_developer_68b4db12's PR): a
+    looser ``"target" in parsed and "description" in parsed`` check
+    would also match a legitimate FR whose description happens to be an
+    API payload or config example shaped like
+    ``{"target": "...", "description": {...}}`` — store-wide sweeps
+    can't rely on "no such FR exists today" staying true. Requires
+    ``target``/``title``/``description`` to all be non-empty strings
+    (not merely present) and every key in the blob to be one this
+    early-ingestion shape is known to use, so an arbitrary
+    similarly-keyed technical description can't accidentally match.
     """
     stripped = (description or "").strip()
     if not stripped.startswith("{"):
@@ -1787,8 +1807,12 @@ def _parse_legacy_description_blob(description: str) -> Optional[dict]:
         return None
     if not isinstance(parsed, dict):
         return None
-    if "target" not in parsed or "description" not in parsed:
+    if not set(parsed.keys()) <= _LEGACY_BLOB_KNOWN_KEYS:
         return None
+    for key in ("target", "title", "description"):
+        value = parsed.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return None
     return parsed
 
 
